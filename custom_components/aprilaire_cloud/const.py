@@ -52,4 +52,3 @@ CONF_ACCOUNT_USER_ID = "account_user_id"
 CONF_ACCOUNT_EMAIL = "account_email"
 
 ATTRIBUTION = "Data provided by AprilAire Healthy Air"
-

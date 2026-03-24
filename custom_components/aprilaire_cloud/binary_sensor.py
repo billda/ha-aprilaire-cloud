@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
@@ -14,7 +14,7 @@ from homeassistant.helpers.entity import EntityCategory
 
 from .coordinator import AprilaireCloudDataUpdateCoordinator
 from .data import AprilaireCloudConfigEntry
-from .entity import AprilaireCloudEntity
+from .entity import AprilaireCloudEntity, setup_dynamic_platform_entities
 from .models import DeviceRecord
 
 
@@ -32,8 +32,12 @@ BINARY_SENSORS: tuple[AprilaireBinarySensorDescription, ...] = (
         key="filter_service",
         translation_key="filter_service",
         device_class=BinarySensorDeviceClass.PROBLEM,
-        value_fn=lambda device: device.dehumidifier_status.get("filterService", {}).get("needsService"),
-        exists_fn=lambda device: "needsService" in device.dehumidifier_status.get("filterService", {}),
+        value_fn=lambda device: device.dehumidifier_status.get("filterService", {}).get(
+            "needsService"
+        ),
+        exists_fn=lambda device: (
+            "needsService" in device.dehumidifier_status.get("filterService", {})
+        ),
     ),
     AprilaireBinarySensorDescription(
         key="alert_high_humidity",
@@ -96,27 +100,13 @@ BINARY_SENSORS: tuple[AprilaireBinarySensorDescription, ...] = (
 async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry, async_add_entities) -> None:
     """Set up AprilAire binary sensors."""
     coordinator = entry.runtime_data.coordinator
-    known_entities: set[tuple[str, str]] = set()
 
-    def _check_devices() -> None:
-        entities = []
-        for device_id, device in coordinator.data.devices.items():
-            if not device.supported:
-                continue
-            for description in BINARY_SENSORS:
-                if not description.exists_fn(device):
-                    continue
-                entity = AprilaireBinarySensorEntity(coordinator, device_id, description)
-                key = (device_id, entity.unique_id)
-                if key in known_entities:
-                    continue
-                known_entities.add(key)
-                entities.append(entity)
-        if entities:
-            async_add_entities(entities)
+    def _entities_for_device(device_id: str, device: DeviceRecord):
+        for description in BINARY_SENSORS:
+            if description.exists_fn(device):
+                yield AprilaireBinarySensorEntity(coordinator, device_id, description)
 
-    _check_devices()
-    entry.async_on_unload(coordinator.async_add_listener(_check_devices))
+    setup_dynamic_platform_entities(entry, async_add_entities, _entities_for_device)
 
 
 class AprilaireBinarySensorEntity(AprilaireCloudEntity, BinarySensorEntity):
@@ -144,4 +134,3 @@ class AprilaireBinarySensorEntity(AprilaireCloudEntity, BinarySensorEntity):
         if device is None:
             return None
         return self.entity_description.value_fn(device)
-

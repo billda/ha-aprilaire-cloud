@@ -18,9 +18,9 @@ if TYPE_CHECKING:
 class AprilaireCloudRuntimeData:
     """Runtime objects attached to a config entry."""
 
-    client: "AprilaireCloudApiClient"
-    coordinator: "AprilaireCloudDataUpdateCoordinator"
-    integration: "Integration"
+    client: AprilaireCloudApiClient
+    coordinator: AprilaireCloudDataUpdateCoordinator
+    integration: Integration
 
 
 AprilaireCloudConfigEntry = ConfigEntry[AprilaireCloudRuntimeData]

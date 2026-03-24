@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from homeassistant.helpers import device_registry as dr, entity_registry as er
+from typing import ClassVar
+
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 import custom_components.aprilaire_cloud as integration
@@ -61,7 +64,7 @@ class FakeClient:
 class FakeWebSocket:
     """Fake websocket that only pushes bootstrap data when asked."""
 
-    instances: dict[str, "FakeWebSocket"] = {}
+    instances: ClassVar[dict[str, FakeWebSocket]] = {}
 
     def __init__(
         self,
@@ -86,7 +89,7 @@ class FakeWebSocket:
             SocketState(location_id=self._location_id, connected=True, initial_sync_complete=False)
         )
 
-    async def async_wait_for_initial_sync(self, timeout: float) -> bool:
+    async def async_wait_for_initial_sync(self, wait_timeout: float) -> bool:
         """Push the initial state."""
         await self.push_messages(build_initial_messages())
         return True
@@ -112,9 +115,14 @@ async def test_setup_creates_entities_and_new_devices_surface_automatically(
 ) -> None:
     """Supported devices should be created at setup and after later discovery."""
     client = FakeClient()
+    FakeWebSocket.instances.clear()
 
-    monkeypatch.setattr(integration, "AprilaireCloudApiClient", lambda username, password, session: client)
-    monkeypatch.setattr("custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket", FakeWebSocket)
+    monkeypatch.setattr(
+        integration, "AprilaireCloudApiClient", lambda username, password, session: client
+    )
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket", FakeWebSocket
+    )
 
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -137,7 +145,76 @@ async def test_setup_creates_entities_and_new_devices_surface_automatically(
 
     client.hierarchy = build_hierarchy(include_second_device=True)
     await entry.runtime_data.coordinator.async_request_refresh()
-    await FakeWebSocket.instances[LOCATION_ID].push_messages(build_initial_messages(SECOND_DEVICE_ID))
+    await FakeWebSocket.instances[LOCATION_ID].push_messages(
+        build_initial_messages(SECOND_DEVICE_ID)
+    )
+    await hass.async_block_till_done()
+
+    assert any(
+        entity.unique_id and entity.unique_id.startswith(f"{SECOND_DEVICE_ID}_")
+        for entity in er.async_entries_for_config_entry(entity_registry, entry.entry_id)
+    )
+
+
+async def test_removed_devices_can_be_readded_without_reloading(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+) -> None:
+    """Dynamic discovery should handle remove and re-add cycles cleanly."""
+    client = FakeClient()
+    FakeWebSocket.instances.clear()
+
+    monkeypatch.setattr(
+        integration, "AprilaireCloudApiClient", lambda username, password, session: client
+    )
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket", FakeWebSocket
+    )
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title=USERNAME,
+        unique_id=build_user()["userId"],
+        data={"username": USERNAME, "password": PASSWORD},
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    entity_registry = er.async_get(hass)
+
+    client.hierarchy = build_hierarchy(include_second_device=True)
+    await entry.runtime_data.coordinator.async_refresh()
+    await FakeWebSocket.instances[LOCATION_ID].push_messages(
+        build_initial_messages(SECOND_DEVICE_ID)
+    )
+    await hass.async_block_till_done()
+
+    second_entity_ids = [
+        entity.entity_id
+        for entity in er.async_entries_for_config_entry(entity_registry, entry.entry_id)
+        if entity.unique_id and entity.unique_id.startswith(f"{SECOND_DEVICE_ID}_")
+    ]
+    assert second_entity_ids
+    assert any(
+        entity.unique_id and entity.unique_id.startswith(f"{SECOND_DEVICE_ID}_")
+        for entity in er.async_entries_for_config_entry(entity_registry, entry.entry_id)
+    )
+
+    client.hierarchy = build_hierarchy()
+    await entry.runtime_data.coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert SECOND_DEVICE_ID not in entry.runtime_data.coordinator.data.devices
+    assert all(hass.states.get(entity_id) is None for entity_id in second_entity_ids)
+
+    client.hierarchy = build_hierarchy(include_second_device=True)
+    await entry.runtime_data.coordinator.async_refresh()
+    await FakeWebSocket.instances[LOCATION_ID].push_messages(
+        build_initial_messages(SECOND_DEVICE_ID)
+    )
     await hass.async_block_till_done()
 
     assert any(

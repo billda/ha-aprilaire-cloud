@@ -2,22 +2,81 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from typing import Any
 
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from .api import AprilaireCloudApiError, AprilaireCloudRateLimitError
 from .const import ATTRIBUTION, DOMAIN, MANUFACTURER
 from .coordinator import AprilaireCloudDataUpdateCoordinator
+from .data import AprilaireCloudConfigEntry
 from .models import DeviceRecord
 
 
 def sensor_name_from_uid(device: DeviceRecord, uid: int, fallback: str) -> str:
     """Resolve a sensor display name from device settings."""
-    for sensor in device.device_settings.get("dehumidifier", {}).get("sensors", []):
+    for sensor in device.effective_device_settings.get("dehumidifier", {}).get("sensors", []):
         if sensor.get("uid") == uid:
             return sensor.get("dispName", fallback)
     return fallback
+
+
+def raise_ha_write_error(err: Exception) -> None:
+    """Raise a translated Home Assistant error for a typed integration failure."""
+    if isinstance(err, AprilaireCloudRateLimitError):
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="rate_limited",
+            translation_placeholders={"seconds": str(round(err.retry_after or 0))},
+        ) from err
+
+    if isinstance(err, AprilaireCloudApiError):
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="write_failed",
+        ) from err
+
+    raise err
+
+
+def setup_dynamic_platform_entities(
+    entry: AprilaireCloudConfigEntry,
+    async_add_entities: Callable[[Iterable[Any]], None],
+    entity_factory: Callable[[str, DeviceRecord], Iterable[Any]],
+) -> None:
+    """Set up dynamic entities for a platform with add/remove support."""
+    coordinator = entry.runtime_data.coordinator
+    active_entities: dict[str, Any] = {}
+
+    def _sync_entities() -> None:
+        desired_entities: dict[str, Any] = {}
+        for device_id, device in coordinator.data.devices.items():
+            if not device.supported:
+                continue
+            for entity in entity_factory(device_id, device):
+                desired_entities[entity.unique_id] = entity
+
+        removed_unique_ids = set(active_entities) - set(desired_entities)
+        for unique_id in removed_unique_ids:
+            entity = active_entities.pop(unique_id)
+            if entity.hass is not None:
+                coordinator.hass.async_create_task(entity.async_remove(force_remove=False))
+
+        new_entities = [
+            entity
+            for unique_id, entity in desired_entities.items()
+            if unique_id not in active_entities
+        ]
+        if new_entities:
+            for entity in new_entities:
+                active_entities[entity.unique_id] = entity
+            async_add_entities(new_entities)
+
+    _sync_entities()
+    entry.async_on_unload(coordinator.async_add_listener(_sync_entities))
 
 
 class AprilaireCloudEntity(CoordinatorEntity[AprilaireCloudDataUpdateCoordinator]):
@@ -26,7 +85,9 @@ class AprilaireCloudEntity(CoordinatorEntity[AprilaireCloudDataUpdateCoordinator
     _attr_attribution = ATTRIBUTION
     _attr_has_entity_name = True
 
-    def __init__(self, coordinator: AprilaireCloudDataUpdateCoordinator, device_id: str, key: str) -> None:
+    def __init__(
+        self, coordinator: AprilaireCloudDataUpdateCoordinator, device_id: str, key: str
+    ) -> None:
         """Initialize the entity."""
         super().__init__(coordinator)
         self._device_id = device_id
@@ -36,6 +97,14 @@ class AprilaireCloudEntity(CoordinatorEntity[AprilaireCloudDataUpdateCoordinator
     def device(self) -> DeviceRecord | None:
         """Return the current device record."""
         return self.coordinator.data.devices.get(self._device_id)
+
+    @property
+    def effective_device_settings(self) -> dict[str, Any]:
+        """Return the effective writable settings for the current device."""
+        device = self.device
+        if device is None:
+            return {}
+        return device.effective_device_settings
 
     @property
     def available(self) -> bool:
@@ -80,4 +149,3 @@ class AprilaireCloudEntity(CoordinatorEntity[AprilaireCloudDataUpdateCoordinator
             "access": device.hierarchy.access,
             "zone": device.hierarchy.zone,
         }
-

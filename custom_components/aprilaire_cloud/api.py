@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from base64 import urlsafe_b64decode
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-import json
 from socket import gaierror
 from typing import Any
 
@@ -45,6 +45,10 @@ class AprilaireCloudRateLimitError(AprilaireCloudApiError):
     """A request was throttled."""
 
     retry_after: float
+
+
+class AprilaireCloudWriteError(AprilaireCloudApiError):
+    """A requested write could not be confirmed."""
 
 
 def _sync_authenticate(username: str, password: str) -> dict[str, str]:
@@ -281,7 +285,7 @@ class AprilaireCloudApiClient:
                 )
         except AprilaireCloudApiError:
             raise
-        except (ClientError, asyncio.TimeoutError, gaierror) as err:
+        except (ClientError, TimeoutError, gaierror) as err:
             raise AprilaireCloudCommunicationError(str(err)) from err
 
     async def _async_handle_response(
@@ -325,6 +329,4 @@ class AprilaireCloudApiClient:
         try:
             return json.loads(text)
         except json.JSONDecodeError as err:
-            raise AprilaireCloudApiError(
-                f"{method} {url} returned invalid JSON"
-            ) from err
+            raise AprilaireCloudApiError(f"{method} {url} returned invalid JSON") from err

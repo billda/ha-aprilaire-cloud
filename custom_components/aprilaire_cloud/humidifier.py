@@ -8,36 +8,21 @@ from homeassistant.components.humidifier import (
     HumidifierEntity,
 )
 from homeassistant.const import PERCENTAGE
-from homeassistant.exceptions import HomeAssistantError
 
-from .const import DOMAIN
+from .api import AprilaireCloudApiError, AprilaireCloudRateLimitError
 from .coordinator import AprilaireCloudDataUpdateCoordinator
 from .data import AprilaireCloudConfigEntry
-from .entity import AprilaireCloudEntity
+from .entity import AprilaireCloudEntity, raise_ha_write_error, setup_dynamic_platform_entities
 
 
 async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry, async_add_entities) -> None:
     """Set up the AprilAire humidifier entities."""
     coordinator = entry.runtime_data.coordinator
-    known_devices: set[str] = set()
-
-    def _check_devices() -> None:
-        current_devices = {
-            device_id
-            for device_id, device in coordinator.data.devices.items()
-            if device.supported
-        }
-        new_devices = current_devices - known_devices
-        if not new_devices:
-            return
-        known_devices.update(new_devices)
-        async_add_entities(
-            AprilaireCloudHumidifierEntity(coordinator, device_id)
-            for device_id in sorted(new_devices)
-        )
-
-    _check_devices()
-    entry.async_on_unload(coordinator.async_add_listener(_check_devices))
+    setup_dynamic_platform_entities(
+        entry,
+        async_add_entities,
+        lambda device_id, device: [AprilaireCloudHumidifierEntity(coordinator, device_id)],
+    )
 
 
 class AprilaireCloudHumidifierEntity(AprilaireCloudEntity, HumidifierEntity):
@@ -68,18 +53,14 @@ class AprilaireCloudHumidifierEntity(AprilaireCloudEntity, HumidifierEntity):
     @property
     def target_humidity(self) -> float | None:
         """Return the humidity setpoint."""
-        device = self.device
-        if device is None:
-            return None
-        return device.device_settings.get("dehumidifier", {}).get("humiditySetpoint")
+        return self.effective_device_settings.get("dehumidifier", {}).get("humiditySetpoint")
 
     @property
     def is_on(self) -> bool | None:
         """Return whether the device is enabled."""
-        device = self.device
-        if device is None:
+        if not self.effective_device_settings:
             return None
-        return device.device_settings.get("dehumidifier", {}).get("mode") == "on"
+        return self.effective_device_settings.get("dehumidifier", {}).get("mode") == "on"
 
     @property
     def action(self) -> HumidifierAction | None:
@@ -100,34 +81,22 @@ class AprilaireCloudHumidifierEntity(AprilaireCloudEntity, HumidifierEntity):
         """Turn the device on."""
         try:
             await self.coordinator.async_set_mode(self._device_id, True)
-        except Exception as err:  # noqa: BLE001
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="write_failed",
-            ) from err
+        except (AprilaireCloudRateLimitError, AprilaireCloudApiError) as err:
+            raise_ha_write_error(err)
 
     async def async_turn_off(self, **kwargs) -> None:
         """Turn the device off."""
         try:
             await self.coordinator.async_set_mode(self._device_id, False)
-        except Exception as err:  # noqa: BLE001
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="write_failed",
-            ) from err
+        except (AprilaireCloudRateLimitError, AprilaireCloudApiError) as err:
+            raise_ha_write_error(err)
 
     async def async_set_humidity(self, humidity: int) -> None:
         """Set the target humidity."""
         try:
             await self.coordinator.async_set_target_humidity(self._device_id, humidity)
-        except Exception as err:  # noqa: BLE001
-            translation_key = "rate_limited" if err.__class__.__name__.endswith("RateLimitError") else "write_failed"
-            placeholders = {"seconds": str(round(getattr(err, "retry_after", 0) or 0))}
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key=translation_key,
-                translation_placeholders=placeholders,
-            ) from err
+        except (AprilaireCloudRateLimitError, AprilaireCloudApiError) as err:
+            raise_ha_write_error(err)
 
     @property
     def extra_state_attributes(self) -> dict[str, str | float | int | bool | None]:

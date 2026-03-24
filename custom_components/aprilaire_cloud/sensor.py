@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -11,12 +11,21 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.const import PERCENTAGE, SIGNAL_STRENGTH_DECIBELS_MILLIWATT, UnitOfTemperature, UnitOfTime
+from homeassistant.const import (
+    PERCENTAGE,
+    SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+    UnitOfTemperature,
+    UnitOfTime,
+)
 from homeassistant.helpers.entity import EntityCategory
 
 from .coordinator import AprilaireCloudDataUpdateCoordinator
 from .data import AprilaireCloudConfigEntry
-from .entity import AprilaireCloudEntity, sensor_name_from_uid
+from .entity import (
+    AprilaireCloudEntity,
+    sensor_name_from_uid,
+    setup_dynamic_platform_entities,
+)
 from .models import DeviceRecord
 
 
@@ -37,7 +46,11 @@ STATIC_SENSORS: tuple[AprilaireSensorDescription, ...] = (
         device_class=SensorDeviceClass.HUMIDITY,
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda device: next(
-            (sensor.get("reading") for sensor in device.dehumidifier_status.get("humSensors", []) if sensor.get("isControlling")),
+            (
+                sensor.get("reading")
+                for sensor in device.dehumidifier_status.get("humSensors", [])
+                if sensor.get("isControlling")
+            ),
             None,
         ),
     ),
@@ -48,7 +61,11 @@ STATIC_SENSORS: tuple[AprilaireSensorDescription, ...] = (
         device_class=SensorDeviceClass.TEMPERATURE,
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda device: next(
-            (sensor.get("reading") for sensor in device.dehumidifier_status.get("tempSensors", []) if sensor.get("isControlling")),
+            (
+                sensor.get("reading")
+                for sensor in device.dehumidifier_status.get("tempSensors", [])
+                if sensor.get("isControlling")
+            ),
             None,
         ),
     ),
@@ -57,8 +74,12 @@ STATIC_SENSORS: tuple[AprilaireSensorDescription, ...] = (
         translation_key="filter_life",
         native_unit_of_measurement=PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda device: device.dehumidifier_status.get("filterService", {}).get("remaining"),
-        exists_fn=lambda device: "remaining" in device.dehumidifier_status.get("filterService", {}),
+        value_fn=lambda device: device.dehumidifier_status.get("filterService", {}).get(
+            "remaining"
+        ),
+        exists_fn=lambda device: (
+            "remaining" in device.dehumidifier_status.get("filterService", {})
+        ),
     ),
     AprilaireSensorDescription(
         key="fan_runtime",
@@ -95,7 +116,6 @@ STATIC_SENSORS: tuple[AprilaireSensorDescription, ...] = (
 async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry, async_add_entities) -> None:
     """Set up AprilAire sensors."""
     coordinator = entry.runtime_data.coordinator
-    known_entities: set[tuple[str, str]] = set()
 
     def _entities_for_device(device_id: str, device: DeviceRecord):
         for description in STATIC_SENSORS:
@@ -110,22 +130,7 @@ async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry, async_add_en
                 continue
             yield AprilaireExtraTemperatureSensor(coordinator, device_id, int(uid))
 
-    def _check_devices() -> None:
-        entities = []
-        for device_id, device in coordinator.data.devices.items():
-            if not device.supported:
-                continue
-            for entity in _entities_for_device(device_id, device):
-                key = (device_id, entity.unique_id)
-                if key in known_entities:
-                    continue
-                known_entities.add(key)
-                entities.append(entity)
-        if entities:
-            async_add_entities(entities)
-
-    _check_devices()
-    entry.async_on_unload(coordinator.async_add_listener(_check_devices))
+    setup_dynamic_platform_entities(entry, async_add_entities, _entities_for_device)
 
 
 class AprilaireStaticSensorEntity(AprilaireCloudEntity, SensorEntity):
@@ -164,7 +169,9 @@ class AprilaireExtraTemperatureSensor(AprilaireCloudEntity, SensorEntity):
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_entity_registry_enabled_default = False
 
-    def __init__(self, coordinator: AprilaireCloudDataUpdateCoordinator, device_id: str, uid: int) -> None:
+    def __init__(
+        self, coordinator: AprilaireCloudDataUpdateCoordinator, device_id: str, uid: int
+    ) -> None:
         """Initialize the sensor."""
         self._uid = uid
         super().__init__(coordinator, device_id, f"temperature_{uid}")
@@ -187,4 +194,3 @@ class AprilaireExtraTemperatureSensor(AprilaireCloudEntity, SensorEntity):
             if sensor.get("uid") == self._uid:
                 return sensor.get("reading")
         return None
-

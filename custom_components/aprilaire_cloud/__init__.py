@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from homeassistant.exceptions import ConfigEntryAuthFailed
-from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import homeassistant.helpers.config_validation as cv
+from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
+from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.loader import async_get_loaded_integration
 
 from .api import AprilaireCloudApiClient
@@ -50,7 +50,8 @@ async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry) -> bool:
 async def async_unload_entry(hass, entry: AprilaireCloudConfigEntry) -> bool:
     """Unload a config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    await entry.runtime_data.coordinator.async_shutdown()
+    if unload_ok:
+        await entry.runtime_data.coordinator.async_shutdown()
     return unload_ok
 
 
@@ -59,7 +60,9 @@ async def async_reload_entry(hass, entry: AprilaireCloudConfigEntry) -> None:
     await hass.config_entries.async_reload(entry.entry_id)
 
 
-async def async_remove_config_entry_device(hass, entry: AprilaireCloudConfigEntry, device_entry) -> bool:
+async def async_remove_config_entry_device(
+    hass, entry: AprilaireCloudConfigEntry, device_entry
+) -> bool:
     """Allow removal of stale devices only."""
     current_device_ids = set(entry.runtime_data.coordinator.data.devices)
     return all(
