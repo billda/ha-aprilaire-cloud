@@ -5,7 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 from custom_components.aprilaire_cloud.models import SocketState
-from custom_components.aprilaire_cloud.websocket import AprilaireLocationWebSocket
+from custom_components.aprilaire_cloud.websocket import (
+    AprilaireLocationWebSocket,
+    AprilaireWebSocketProtocolError,
+    decode_websocket_text_frame,
+)
 
 from .common import LOCATION_ID
 
@@ -53,3 +57,16 @@ async def test_websocket_reconnect_state_resets_after_recovery() -> None:
     assert states[-1].initial_sync_complete is True
     assert states[-1].reconnect_attempt == 0
     assert states[-1].last_error is None
+
+
+def test_decode_websocket_text_frame_ignores_ack_frames_and_rejects_invalid_json() -> None:
+    """Ack frames should be ignored and invalid JSON should surface as a protocol error."""
+    assert decode_websocket_text_frame("ok") is None
+    assert decode_websocket_text_frame('"Subscribed"') is None
+
+    try:
+        decode_websocket_text_frame("not-json")
+    except AprilaireWebSocketProtocolError:
+        pass
+    else:
+        raise AssertionError("Expected invalid websocket JSON to raise a protocol error")

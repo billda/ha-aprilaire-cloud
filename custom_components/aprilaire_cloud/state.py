@@ -7,8 +7,8 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from .const import SUPPORTED_CONTROL_TYPE, SUPPORTED_REPORTING_TYPE, SUPPORTED_SCALE
 from .models import DeviceRecord, HierarchyDevice, HierarchyLocation, merge_settings_payload
+from .profiles import evaluate_profile
 
 _MISSING = object()
 
@@ -18,18 +18,20 @@ class DeviceWriteState:
     """Track pending and in-flight settings writes for one device."""
 
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    latest_request_id: int = 0
-    inflight_request_id: int | None = None
+    pending_paths: tuple[str, ...] = ()
+    inflight_paths: tuple[str, ...] = ()
     inflight_expected: dict[str, Any] = field(default_factory=dict)
+    last_confirmed_settings: dict[str, Any] = field(default_factory=dict)
     inflight_event: asyncio.Event | None = None
 
     @property
     def summary(self) -> dict[str, Any]:
         """Return a diagnostics-friendly summary."""
         return {
-            "latest_request_id": self.latest_request_id,
-            "inflight_request_id": self.inflight_request_id,
+            "pending_paths": list(self.pending_paths),
+            "inflight_paths": list(self.inflight_paths),
             "inflight_expected": deepcopy(self.inflight_expected),
+            "last_confirmed_settings": deepcopy(self.last_confirmed_settings),
             "waiting_for_confirmation": self.inflight_event is not None,
         }
 
@@ -47,6 +49,11 @@ def iter_leaf_paths(
         else:
             leaves.append((path, value))
     return leaves
+
+
+def format_leaf_paths(data: dict[str, Any]) -> tuple[str, ...]:
+    """Return sorted leaf paths as dotted strings."""
+    return tuple(sorted(".".join(path) for path, _ in iter_leaf_paths(data)))
 
 
 def get_nested_value(data: dict[str, Any], path: tuple[str, ...]) -> Any:
@@ -97,10 +104,13 @@ def apply_pending_device_settings(record: DeviceRecord, payload: dict[str, Any])
 
 def apply_confirmed_device_settings(record: DeviceRecord, settings: dict[str, Any]) -> DeviceRecord:
     """Update confirmed remote settings and clear matching optimistic overrides."""
+    confirmed_settings = merge_settings_payload(record.device_settings, settings)
     return replace(
         record,
-        device_settings=settings,
-        pending_device_settings=remove_matching_settings(record.pending_device_settings, settings),
+        device_settings=confirmed_settings,
+        pending_device_settings=remove_matching_settings(
+            record.pending_device_settings, confirmed_settings
+        ),
     )
 
 
@@ -119,33 +129,14 @@ def pending_payload_is_current(record: DeviceRecord, payload: dict[str, Any]) ->
 
 def evaluate_device_support(record: DeviceRecord) -> DeviceRecord:
     """Determine whether a device should be exposed to Home Assistant."""
-    setup_type = record.device_setup.get("type")
-    if setup_type != SUPPORTED_REPORTING_TYPE:
-        return replace(
-            record,
-            supported=False,
-            unsupported_reason="unsupported_equipment_type",
-        )
-
-    dehumidifier_setup = record.device_setup.get("dehumidifier", {})
-    dehumidifier_settings = record.device_settings.get("dehumidifier", {})
-
-    if not dehumidifier_setup:
-        return replace(record, supported=False, unsupported_reason="awaiting_device_setup")
-
-    if dehumidifier_setup.get("controlType") != SUPPORTED_CONTROL_TYPE:
-        return replace(record, supported=False, unsupported_reason="unsupported_control_type")
-
-    if dehumidifier_setup.get("scale") != SUPPORTED_SCALE:
-        return replace(record, supported=False, unsupported_reason="unsupported_scale")
-
-    if "humiditySetpoint" not in dehumidifier_settings:
-        return replace(record, supported=False, unsupported_reason="missing_humidity_setpoint")
-
-    if "drynessSetpoint" in dehumidifier_settings:
-        return replace(record, supported=False, unsupported_reason="dryness_setpoint_unsupported")
-
-    return replace(record, supported=True, unsupported_reason=None)
+    supported, reason, profile_key, supported_writes = evaluate_profile(record)
+    return replace(
+        record,
+        supported=supported,
+        unsupported_reason=reason,
+        profile_key=profile_key,
+        supported_writes=supported_writes,
+    )
 
 
 def apply_device_message(record: DeviceRecord, message: dict[str, Any]) -> DeviceRecord:

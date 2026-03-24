@@ -14,7 +14,28 @@ from custom_components.aprilaire_cloud.api import (
 )
 from custom_components.aprilaire_cloud.const import DOMAIN
 
-from .common import PASSWORD, USER_ID, USERNAME, build_hierarchy, build_user
+from .common import (
+    PASSWORD,
+    USER_ID,
+    USERNAME,
+    build_device_settings,
+    build_hierarchy,
+    build_initial_messages,
+    build_user,
+)
+
+
+def _mock_supported_device_discovery(monkeypatch, *, messages=None) -> None:
+    """Mock the extra device classification calls made by the config flow."""
+    monkeypatch.setattr(
+        AprilaireCloudApiClient,
+        "async_get_device_settings",
+        AsyncMock(return_value=build_device_settings()),
+    )
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.config_flow.async_collect_location_messages",
+        AsyncMock(return_value=messages or build_initial_messages()),
+    )
 
 
 async def test_user_flow_success(hass, enable_custom_integrations, monkeypatch) -> None:
@@ -28,6 +49,7 @@ async def test_user_flow_success(hass, enable_custom_integrations, monkeypatch) 
         "async_get_hierarchy",
         AsyncMock(return_value=build_hierarchy()),
     )
+    _mock_supported_device_discovery(monkeypatch)
 
     result = await hass.config_entries.flow.async_init(
         DOMAIN,
@@ -61,6 +83,7 @@ async def test_user_flow_duplicate_account_aborts(
         "async_get_hierarchy",
         AsyncMock(return_value=build_hierarchy()),
     )
+    _mock_supported_device_discovery(monkeypatch)
 
     result = await hass.config_entries.flow.async_init(
         DOMAIN,
@@ -94,6 +117,7 @@ async def test_reauth_updates_credentials(hass, enable_custom_integrations, monk
         "async_get_hierarchy",
         AsyncMock(return_value=build_hierarchy()),
     )
+    _mock_supported_device_discovery(monkeypatch)
 
     result = await hass.config_entries.flow.async_init(
         DOMAIN,
@@ -129,3 +153,102 @@ async def test_invalid_auth_is_reported(hass, enable_custom_integrations, monkey
 
     assert result["type"] == "form"
     assert result["errors"] == {"base": "invalid_auth"}
+
+
+async def test_no_supported_devices_is_reported(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+) -> None:
+    """Accounts without supported devices should stay on the setup form."""
+    monkeypatch.setattr(AprilaireCloudApiClient, "async_authenticate", AsyncMock())
+    monkeypatch.setattr(
+        AprilaireCloudApiClient, "async_get_user", AsyncMock(return_value=build_user())
+    )
+    monkeypatch.setattr(
+        AprilaireCloudApiClient,
+        "async_get_hierarchy",
+        AsyncMock(return_value=build_hierarchy()),
+    )
+    _mock_supported_device_discovery(
+        monkeypatch,
+        messages=build_initial_messages(control_type="external"),
+    )
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_USER},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_USERNAME: USERNAME, CONF_PASSWORD: PASSWORD},
+    )
+
+    assert result["type"] == "form"
+    assert result["errors"] == {"base": "no_supported_devices"}
+
+
+async def test_setup_does_not_false_negative_when_device_setup_arrives_late(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+) -> None:
+    """A partial websocket bootstrap must not block a valid supported account."""
+    monkeypatch.setattr(AprilaireCloudApiClient, "async_authenticate", AsyncMock())
+    monkeypatch.setattr(
+        AprilaireCloudApiClient, "async_get_user", AsyncMock(return_value=build_user())
+    )
+    monkeypatch.setattr(
+        AprilaireCloudApiClient,
+        "async_get_hierarchy",
+        AsyncMock(return_value=build_hierarchy()),
+    )
+    _mock_supported_device_discovery(
+        monkeypatch,
+        messages=build_initial_messages()[:2],
+    )
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_USER},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_USERNAME: USERNAME, CONF_PASSWORD: PASSWORD},
+    )
+
+    assert result["type"] == "create_entry"
+    assert result["title"] == USERNAME
+
+
+async def test_options_flow_updates_refresh_settings(
+    hass,
+    enable_custom_integrations,
+) -> None:
+    """Options flow should store refresh and diagnostics settings."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=USER_ID,
+        data={CONF_USERNAME: USERNAME, CONF_PASSWORD: PASSWORD},
+        title=USERNAME,
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["type"] == "form"
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {
+            "safety_refresh_minutes": 30,
+            "fallback_refresh_minutes": 3,
+            "enable_extra_diagnostics": True,
+        },
+    )
+
+    assert result["type"] == "create_entry"
+    assert result["data"] == {
+        "safety_refresh_minutes": 30,
+        "fallback_refresh_minutes": 3,
+        "enable_extra_diagnostics": True,
+    }

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from typing import Any
+from typing import Any, cast
 
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -14,14 +14,7 @@ from .const import ATTRIBUTION, DOMAIN, MANUFACTURER
 from .coordinator import AprilaireCloudDataUpdateCoordinator
 from .data import AprilaireCloudConfigEntry
 from .models import DeviceRecord
-
-
-def sensor_name_from_uid(device: DeviceRecord, uid: int, fallback: str) -> str:
-    """Resolve a sensor display name from device settings."""
-    for sensor in device.effective_device_settings.get("dehumidifier", {}).get("sensors", []):
-        if sensor.get("uid") == uid:
-            return sensor.get("dispName", fallback)
-    return fallback
+from .profiles import DeviceProfile, NormalizedDehumidifierState, get_profile, normalize_device
 
 
 def raise_ha_write_error(err: Exception) -> None:
@@ -113,6 +106,22 @@ class AprilaireCloudEntity(CoordinatorEntity[AprilaireCloudDataUpdateCoordinator
         return super().available and device is not None and device.supported
 
     @property
+    def profile(self) -> DeviceProfile | None:
+        """Return the resolved profile for the current device."""
+        device = self.device
+        if device is None:
+            return None
+        return get_profile(device.profile_key)
+
+    @property
+    def normalized_device(self) -> NormalizedDehumidifierState | None:
+        """Return normalized device state for supported devices."""
+        device = self.device
+        if device is None:
+            return None
+        return cast(NormalizedDehumidifierState | None, normalize_device(device))
+
+    @property
     def device_info(self) -> DeviceInfo:
         """Return device registry metadata."""
         device = self.device
@@ -138,14 +147,5 @@ class AprilaireCloudEntity(CoordinatorEntity[AprilaireCloudDataUpdateCoordinator
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Expose useful shared attributes."""
-        device = self.device
-        if device is None:
-            return {}
-        return {
-            "device_id": device.device_id,
-            "location": device.hierarchy.location_name,
-            "room": device.hierarchy.room_name,
-            "access": device.hierarchy.access,
-            "zone": device.hierarchy.zone,
-        }
+        """Expose shared attributes."""
+        return {}

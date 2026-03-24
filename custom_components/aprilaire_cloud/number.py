@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.const import PERCENTAGE
+from homeassistant.helpers.entity import EntityCategory
 
 from .api import AprilaireCloudApiError, AprilaireCloudRateLimitError
 from .coordinator import AprilaireCloudDataUpdateCoordinator
@@ -13,6 +14,7 @@ from .entity import (
     raise_ha_write_error,
     setup_dynamic_platform_entities,
 )
+from .profiles import get_profile
 
 ALERT_LIMIT_DESCRIPTIONS = {
     "highHum": {
@@ -29,11 +31,11 @@ async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry, async_add_en
     coordinator = entry.runtime_data.coordinator
 
     def _entities_for_device(device_id: str, device):
-        alert_limits = device.effective_device_settings.get("dehumidifier", {}).get(
-            "alertLimits",
-            {},
-        )
-        for key in alert_limits:
+        profile = get_profile(coordinator.data.devices[device_id].profile_key)
+        if profile is None:
+            return
+        entity_set = profile.entity_descriptions(coordinator.data.devices[device_id])
+        for key in entity_set.number_keys:
             if key in ALERT_LIMIT_DESCRIPTIONS:
                 yield AprilaireAlertLimitNumber(coordinator, device_id, key)
 
@@ -45,6 +47,7 @@ class AprilaireAlertLimitNumber(AprilaireCloudEntity, NumberEntity):
 
     _attr_mode = NumberMode.BOX
     _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(
         self, coordinator: AprilaireCloudDataUpdateCoordinator, device_id: str, limit_key: str
@@ -61,11 +64,10 @@ class AprilaireAlertLimitNumber(AprilaireCloudEntity, NumberEntity):
     @property
     def native_value(self) -> float | None:
         """Return the current limit value."""
-        return (
-            self.effective_device_settings.get("dehumidifier", {})
-            .get("alertLimits", {})
-            .get(self._limit_key)
-        )
+        normalized = self.normalized_device
+        if normalized is None:
+            return None
+        return normalized.alert_limits.get(self._limit_key)
 
     async def async_set_native_value(self, value: float) -> None:
         """Write a new alert threshold."""

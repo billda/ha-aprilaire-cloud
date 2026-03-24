@@ -13,6 +13,7 @@ from .api import AprilaireCloudApiError, AprilaireCloudRateLimitError
 from .coordinator import AprilaireCloudDataUpdateCoordinator
 from .data import AprilaireCloudConfigEntry
 from .entity import AprilaireCloudEntity, raise_ha_write_error, setup_dynamic_platform_entities
+from .profiles import get_profile
 
 
 async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry, async_add_entities) -> None:
@@ -21,7 +22,11 @@ async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry, async_add_en
     setup_dynamic_platform_entities(
         entry,
         async_add_entities,
-        lambda device_id, device: [AprilaireCloudHumidifierEntity(coordinator, device_id)],
+        lambda device_id, device: (
+            [AprilaireCloudHumidifierEntity(coordinator, device_id)]
+            if device.profile_key == "dehumidifier" and get_profile(device.profile_key) is not None
+            else []
+        ),
     )
 
 
@@ -42,35 +47,36 @@ class AprilaireCloudHumidifierEntity(AprilaireCloudEntity, HumidifierEntity):
     @property
     def current_humidity(self) -> float | None:
         """Return the controlling humidity sensor reading."""
-        device = self.device
-        if device is None:
+        normalized = self.normalized_device
+        if normalized is None:
             return None
-        for sensor in device.dehumidifier_status.get("humSensors", []):
-            if sensor.get("isControlling"):
-                return sensor.get("reading")
-        return None
+        return normalized.current_humidity
 
     @property
     def target_humidity(self) -> float | None:
         """Return the humidity setpoint."""
-        return self.effective_device_settings.get("dehumidifier", {}).get("humiditySetpoint")
+        normalized = self.normalized_device
+        if normalized is None:
+            return None
+        return normalized.target_humidity
 
     @property
     def is_on(self) -> bool | None:
         """Return whether the device is enabled."""
-        if not self.effective_device_settings:
+        normalized = self.normalized_device
+        if normalized is None:
             return None
-        return self.effective_device_settings.get("dehumidifier", {}).get("mode") == "on"
+        return normalized.mode == "on"
 
     @property
     def action(self) -> HumidifierAction | None:
         """Return the current operating action."""
-        device = self.device
-        if device is None:
+        normalized = self.normalized_device
+        if normalized is None:
             return None
         if self.is_on is False:
             return HumidifierAction.OFF
-        equipment_status = device.dehumidifier_status.get("equipmentStatus")
+        equipment_status = normalized.equipment_status
         if equipment_status in {"dehumidifying", "defrosting"}:
             return HumidifierAction.DRYING
         if equipment_status in {"inactive", "air-sampling"}:
@@ -102,8 +108,8 @@ class AprilaireCloudHumidifierEntity(AprilaireCloudEntity, HumidifierEntity):
     def extra_state_attributes(self) -> dict[str, str | float | int | bool | None]:
         """Expose raw AprilAire values that are useful for debugging."""
         attrs = dict(super().extra_state_attributes)
-        device = self.device
-        if device is not None:
-            attrs["equipment_status"] = device.dehumidifier_status.get("equipmentStatus")
+        normalized = self.normalized_device
+        if normalized is not None:
+            attrs["equipment_status"] = normalized.equipment_status
             attrs["setpoint_unit"] = PERCENTAGE
         return attrs

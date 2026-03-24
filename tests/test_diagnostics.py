@@ -45,7 +45,10 @@ async def test_diagnostics_include_runtime_state_and_redact_credentials(
         device,
         pending_device_settings={"dehumidifier": {"humiditySetpoint": 60}},
     )
-    write_state = DeviceWriteState(latest_request_id=2, inflight_request_id=2)
+    write_state = DeviceWriteState(
+        pending_paths=("dehumidifier.humiditySetpoint",),
+        inflight_paths=("dehumidifier.humiditySetpoint",),
+    )
     write_state.inflight_expected = {"dehumidifier": {"humiditySetpoint": 60}}
     write_state.inflight_event = asyncio.Event()
     coordinator._write_states[DEVICE_ID] = write_state
@@ -61,6 +64,12 @@ async def test_diagnostics_include_runtime_state_and_redact_credentials(
 
     assert diagnostics["entry"]["data"]["password"] == "**REDACTED**"
     assert diagnostics["entry"]["data"]["username"] == "**REDACTED**"
+    assert diagnostics["entry"]["title"].startswith("sha256:")
+    assert diagnostics["snapshot"]["user_id"].startswith("sha256:")
+    assert diagnostics["snapshot"]["email"].startswith("sha256:")
+    assert diagnostics["snapshot"]["locations"]["bcf1939c-1111-2222-3333-a80ac86d"][
+        "name"
+    ].startswith("sha256:")
     assert diagnostics["snapshot"]["devices"][DEVICE_ID]["pending_device_settings"] == {
         "dehumidifier": {"humiditySetpoint": 60}
     }
@@ -70,4 +79,7 @@ async def test_diagnostics_include_runtime_state_and_redact_credentials(
         ]
         == 60
     )
+    assert diagnostics["snapshot"]["write_states"][DEVICE_ID]["pending_paths"] == [
+        "dehumidifier.humiditySetpoint"
+    ]
     assert diagnostics["snapshot"]["write_states"][DEVICE_ID]["waiting_for_confirmation"] is True

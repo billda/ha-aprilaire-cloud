@@ -53,6 +53,8 @@ class DeviceRecord:
     sensor_hub_status: dict[str, Any] = field(default_factory=dict)
     supported: bool = False
     unsupported_reason: str | None = None
+    profile_key: str | None = None
+    supported_writes: tuple[str, ...] = ()
 
     @property
     def device_id(self) -> str:

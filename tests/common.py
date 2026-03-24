@@ -10,6 +10,7 @@ USER_ID = "user-123"
 DEVICE_ID = "BC8D7EEC97E2"
 SECOND_DEVICE_ID = "DEADBEEF0001"
 LOCATION_ID = "bcf1939c-1111-2222-3333-a80ac86d"
+SECOND_LOCATION_ID = "bcf1939c-4444-5555-6666-a80ac86d"
 
 
 def build_user() -> dict:
@@ -30,6 +31,26 @@ def build_hierarchy(include_second_device: bool = False) -> dict:
                 "timeZone": "America/New_York",
                 "rooms": [{"name": "Crawl Space", "devices": devices}],
             }
+        ]
+    }
+
+
+def build_two_location_hierarchy() -> dict:
+    """Return a sample hierarchy with one device in each location."""
+    return {
+        "locations": [
+            {
+                "locationId": LOCATION_ID,
+                "name": "Home",
+                "timeZone": "America/New_York",
+                "rooms": [{"name": "Crawl Space", "devices": [{"deviceId": DEVICE_ID}]}],
+            },
+            {
+                "locationId": SECOND_LOCATION_ID,
+                "name": "Cabin",
+                "timeZone": "America/New_York",
+                "rooms": [{"name": "Basement", "devices": [{"deviceId": SECOND_DEVICE_ID}]}],
+            },
         ]
     }
 
