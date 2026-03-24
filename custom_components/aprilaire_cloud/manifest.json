@@ -5,8 +5,8 @@
   "config_flow": true,
   "documentation": "https://github.com/billda/ha-aprilaire-cloud",
   "integration_type": "hub",
-  "issue_tracker": "https://github.com/billda/ha-aprilaire-cloud/issues",
   "iot_class": "cloud_push",
+  "issue_tracker": "https://github.com/billda/ha-aprilaire-cloud/issues",
   "loggers": ["custom_components.aprilaire_cloud", "pycognito"],
   "requirements": ["pycognito==2024.5.1"],
   "version": "0.1.0"
