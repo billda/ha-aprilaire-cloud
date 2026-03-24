@@ -1,11 +1,20 @@
 # AprilAire Cloud
 
+[![Release](https://img.shields.io/github/v/release/billda/ha-aprilaire-cloud?sort=semver)](https://github.com/billda/ha-aprilaire-cloud/releases)
+[![Validate](https://github.com/billda/ha-aprilaire-cloud/actions/workflows/validate.yml/badge.svg)](https://github.com/billda/ha-aprilaire-cloud/actions/workflows/validate.yml)
+[![Open in HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=billda&repository=ha-aprilaire-cloud&category=integration)
+
 Home Assistant custom integration for AprilAire Healthy Air cloud-connected dehumidifiers.
 
-This integration connects to the modern `aprilaire.io` cloud platform used by the AprilAire Healthy Air app. It is designed as a standard Home Assistant config-entry integration for HACS, with automatic device discovery, WebSocket-first updates, diagnostics support, and dynamic entity creation when new supported devices appear on the account.
+This integration connects to the modern `aprilaire.io` platform used by the AprilAire Healthy Air app. It is built as a standard Home Assistant config-entry integration for HACS, with automatic device discovery, WebSocket-first updates, diagnostics support, and dynamic entity creation when new supported devices appear on the account.
 
-> [!NOTE]
-> This project is focused on doing one thing well: exposing supported AprilAire cloud dehumidifiers in Home Assistant with a websocket-first update model and a clean config-entry setup.
+## Why This Exists
+
+I built this because I wanted my own AprilAire dehumidifier in Home Assistant and could not find an existing integration for AprilAire cloud-connected dehumidifiers anywhere on GitHub or the wider web.
+
+The `aprilaire.io` API does not appear to be publicly documented. I figured out the routes and message shapes by reverse engineering the Android APK, and I was honestly surprised by how full-featured the cloud API is once you get into it. It has been working well for me in my own Home Assistant instance with an AprilAire E100W, so I cleaned it up and published it in the hope that other AprilAire owners can use it, test it, and help improve it.
+
+This project is unofficial and is not affiliated with AprilAire.
 
 ## At A Glance
 
@@ -17,15 +26,17 @@ This integration connects to the modern `aprilaire.io` cloud platform used by th
 | Setup style | UI-only config entry |
 | Update model | WebSocket-first with bounded REST fallback |
 | Multi-device support | Yes, across multiple locations on one account |
+| Tested live | AprilAire E100W |
 
 ## Highlights
 
-- **Easy setup:** config-entry setup from the Home Assistant UI, with no YAML required
-- **Fast updates:** WebSocket-first updates for near real-time state changes
-- **Account-aware discovery:** automatically finds supported dehumidifiers on the configured AprilAire account
-- **Good HA behavior:** device registry support, reauth flow, diagnostics, and dynamic entity creation
-- **Safer operation:** token refresh, bounded REST fallback, rate-limit handling, and redacted diagnostics
-- **Better UX:** setup validation for unsupported accounts, repair issues for mixed accounts, and options for refresh tuning
+- UI-only setup through Home Assistant
+- WebSocket-first updates for near real-time state changes
+- Automatic discovery of supported dehumidifiers on the configured account
+- Support for multiple devices and multiple locations on one account
+- Standard Home Assistant behavior: device registry, config entries, reauth, diagnostics, dynamic entity creation
+- Conservative capability detection so unsupported devices are skipped instead of exposed in a misleading or partially broken way
+- Defensive auth refresh and rate-limit handling for an undocumented API
 
 ## What This Integration Supports
 
@@ -36,12 +47,9 @@ This integration supports AprilAire Healthy Air dehumidifiers available through 
 - `scale == %RH`
 - a writable `humiditySetpoint`
 
-The implementation is meant to work across multiple compatible AprilAire dehumidifier models on the same account, including multiple devices spread across multiple locations. The integration was built to discover devices by capability rather than by a hardcoded model allowlist.
+The integration is designed to discover devices by capability rather than by a hardcoded model allowlist. If you have a different AprilAire dehumidifier model that uses the same capability profile, there is a good chance it will work, but I need real-world testing reports to confirm broader model support.
 
-Live testing has been performed against a real AprilAire cloud account and a real cloud-connected AprilAire dehumidifier. The code is intentionally conservative about what it exposes: if a device does not match the supported capability profile, it is ignored rather than partially supported in a broken or misleading way.
-
-> [!TIP]
-> If your account authenticates successfully but Home Assistant still shows no devices, the most common reason is that the device uses an unsupported capability profile rather than bad credentials.
+Live validation has been performed against a real AprilAire cloud account and a real AprilAire E100W. If your device authenticates successfully but does not show up in Home Assistant, the most likely reason is that it exposes an unsupported capability profile rather than a bad login.
 
 ## Explicitly Out Of Scope
 
@@ -52,10 +60,9 @@ The following are not supported:
 - devices that use `drynessSetpoint`
 - devices using `remote`, `external`, or other non-internal control modes
 - devices using dew-point style control instead of `%RH`
-- manual YAML configuration
+- YAML configuration
 
-> [!WARNING]
-> This integration does not try to approximate unsupported AprilAire devices. Unsupported capability profiles are intentionally skipped rather than exposed in a misleading or partially broken way.
+Unsupported devices are intentionally ignored rather than approximated.
 
 ## Installation
 
@@ -72,6 +79,8 @@ Recommended for most users.
 7. Search for `AprilAire Cloud`.
 8. Enter the same email address and password you use in the AprilAire Healthy Air app.
 
+You can also use the My Home Assistant button above to open the repository directly in HACS.
+
 ### Manual
 
 1. Copy `custom_components/aprilaire_cloud` into your Home Assistant `custom_components` directory.
@@ -82,42 +91,21 @@ Recommended for most users.
 
 Setup is entirely UI-driven.
 
-### Configuration Options
-
-After setup, use the integration's `Configure` action to adjust:
-
-- safety refresh interval
-- fallback refresh interval while websocket connectivity is degraded
-- whether extra diagnostic entities should be enabled by default for newly created devices
-
-### What Setup Does
-
 During setup, the integration:
 
 1. Authenticates against AprilAire Cognito.
-2. Calls the AprilAire account API to validate the account.
+2. Validates the account through the AprilAire account API.
 3. Loads the AprilAire device hierarchy for the account.
-4. Creates a single Home Assistant config entry for that AprilAire cloud account.
+4. Creates one Home Assistant config entry for that AprilAire cloud account.
 5. Discovers and adds all supported dehumidifiers under that account.
 
-If the account authenticates successfully but contains no supported devices, setup stays on the form and explains the supported device profile. If the account contains a mix of supported and unsupported devices, setup continues and Home Assistant creates a repair issue summarizing what was skipped.
-
-The account `userId` is used as the unique config-entry identifier, which prevents the same AprilAire account from being added twice.
-
-## Credentials And Authentication
-
-- Credentials are stored in the Home Assistant config entry, not in YAML.
-- Access, ID, and refresh tokens are kept in memory only.
-- Tokens are refreshed automatically before expiry.
-- If the API returns `401 Unauthorized`, the integration attempts token recovery automatically.
-- If recovery fails, Home Assistant reauthentication is triggered using the standard config-entry reauth flow.
-- You can also update credentials later from the integration's standard reconfigure flow.
+The account `userId` is used as the config-entry unique ID so the same AprilAire account cannot be added twice.
 
 ## Device Discovery And Auto-Add Behavior
 
 One Home Assistant config entry represents one AprilAire cloud account.
 
-All supported dehumidifiers on that account are created automatically during setup. If you add another supported AprilAire dehumidifier to the same account later, Home Assistant will surface it automatically without requiring you to remove and re-add the integration.
+All supported dehumidifiers on that account are created automatically during setup. If you add another supported AprilAire dehumidifier to the same account later, Home Assistant should surface it automatically without requiring you to remove and re-add the integration.
 
 Discovery happens through:
 
@@ -125,24 +113,20 @@ Discovery happens through:
 - periodic hierarchy refreshes
 - WebSocket-driven refresh events
 
-Unsupported devices remain hidden rather than creating incomplete entities.
-
 ## Entities
 
-The exact set of entities depends on what each device reports through the AprilAire API.
-
-### Entity Overview
+The exact set of entities depends on what each device reports.
 
 | Entity type | Purpose |
 | --- | --- |
 | `humidifier` | Main dehumidifier control and target humidity |
-| `sensor` | Humidity, temperature, filter life, diagnostics |
+| `sensor` | Humidity, temperature, filter life, and diagnostics |
 | `binary_sensor` | Alerts and running-state diagnostics |
 | `number` | Writable alert thresholds when supported |
 
-### Primary Entity
+### Primary Control
 
-Each supported unit creates one primary `humidifier` entity using Home Assistant's dehumidifier device class.
+Each supported device creates one primary `humidifier` entity using Home Assistant's dehumidifier device class.
 
 Supported controls:
 
@@ -150,171 +134,88 @@ Supported controls:
 - turn the dehumidifier off
 - set target humidity
 
-Reported state includes:
+### Additional Entities
 
-- current controlling humidity
-- target humidity setpoint
-- operating action when available
-
-Action mapping is based on AprilAire `equipmentStatus`:
-
-- `dehumidifying` and `defrosting` map to drying
-- `inactive` and `air-sampling` map to idle
-- off mode maps to off
-
-### Sensor Entities
-
-Depending on the device payload, the integration may create:
+Depending on device payloads, the integration may expose:
 
 - current humidity
 - current temperature
 - filter life remaining
-- fan runtime hours
-- Wi-Fi RSSI
-- raw equipment status
-- additional non-controlling temperature sensors
-
-Diagnostic sensors such as Wi-Fi signal, fan runtime, equipment status, and extra temperature probes are disabled by default when they are likely to be noisy or low-value for most users.
-
-### Binary Sensor Entities
-
-Depending on the device payload, the integration may create:
-
 - filter service needed
-- high humidity alert
-- low humidity alert
-- high temperature alert
-- low temperature alert
-- compressor running
-- dehumidifier fan running
-- HVAC fan running
-
-Operational diagnostic binary sensors are disabled by default.
-
-### Number Entities
-
-When exposed by the API, the integration creates writable number entities for supported alert thresholds.
-
-Currently implemented:
-
-- high humidity alert limit
-
-## Device Information
-
-Each physical AprilAire unit is registered as a Home Assistant device with:
-
-- manufacturer: `AprilAire`
-- identifiers based on the AprilAire cloud `deviceId`
-- model from the cloud API
-- firmware version from the cloud API
-- hardware version when available
-- suggested area based on the AprilAire room assignment
-
-Device names are derived from the AprilAire hierarchy, typically using location name, room name, and model.
+- humidity and temperature alerts
+- Wi-Fi RSSI
+- fan runtime
+- raw equipment status
+- extra temperature sensors
+- writable high humidity alert limit
 
 ## Update Model
 
 This integration is `cloud_push` and uses WebSockets as the primary transport.
 
-### Update Flow
+The normal flow is:
 
 1. Open one WebSocket connection per AprilAire location.
 2. Subscribe to that location using the current ID token.
-3. Process push updates such as device status and device settings changes.
+3. Merge push updates such as status and settings changes into Home Assistant.
 4. Use slower REST refreshes only when needed for discovery, reconciliation, or degraded websocket health.
-
-This allows Home Assistant to reflect most state changes without waiting for a polling interval.
-
-### Safety Refresh
-
-A slower REST-based hierarchy refresh runs periodically to keep discovery and topology aligned with the account.
-
-### Fallback Refresh
-
-If one or more WebSocket connections become unhealthy, the integration temporarily falls back to bounded REST refreshes until push connectivity is restored.
 
 ### Writes
 
-Commands such as turning the device on or changing target humidity are sent with REST `PATCH` requests to the AprilAire settings endpoint. After a successful write, the integration waits for the corresponding WebSocket update. If a confirming push message does not arrive quickly, it performs one targeted REST reconciliation read.
+Commands such as turning the device on or changing target humidity are sent with REST `PATCH` requests to the AprilAire settings endpoint. The integration then waits for the corresponding WebSocket update and falls back to a targeted REST reconciliation read if a confirming push does not arrive quickly.
 
-## Rate Limiting
+### Authentication
 
-AprilAire's public rate limits are not documented, so the integration takes a defensive approach.
+- Credentials are stored in the Home Assistant config entry, not in YAML.
+- Access, ID, and refresh tokens are kept in memory only.
+- Tokens are refreshed automatically before expiry.
+- `401 Unauthorized` responses trigger automatic token recovery.
+- If recovery fails, Home Assistant reauthentication is triggered using the standard reauth flow.
+
+### Rate Limiting
+
+AprilAire's public rate limits are not documented, so the integration behaves defensively:
 
 - `429 Too Many Requests` responses are honored
 - `Retry-After` is parsed and clamped to a sane range
 - nonessential background REST activity backs off automatically
 - short user-initiated writes may be retried once if the throttle window is very small
-- longer throttling windows fail fast so Home Assistant can present a clear temporary error to the user
+- longer throttle windows fail fast so Home Assistant can show a clear temporary error
 
-WebSocket reconnect backoff is handled separately from REST API throttling.
+## Support
 
-## Supported Home Assistant Behavior
+For questions, setup help, compatibility reports, and general discussion:
 
-This integration uses standard Home Assistant patterns wherever possible:
+- [GitHub Discussions](https://github.com/billda/ha-aprilaire-cloud/discussions)
 
-- config entries
-- device registry
-- entity registry
-- reauth flow
-- reconfigure flow
-- diagnostics support
-- dynamic device and entity creation after setup
-- config-entry-only setup
+For actionable bugs and regressions:
 
-That means supported devices should appear in `Settings > Devices & services` and new supported devices added to the same AprilAire account should also surface automatically.
+- [GitHub Issues](https://github.com/billda/ha-aprilaire-cloud/issues)
 
-## Limitations
+If you file a bug, please include:
 
-- Support depends on reverse-engineered AprilAire cloud behavior rather than official vendor documentation.
-- Only devices with an internal `%RH` humidity setpoint are exposed.
-- Unsupported device capabilities are intentionally ignored rather than approximated.
-- Some entities only appear when the upstream API actually reports the relevant data.
+- your AprilAire model
+- firmware version if visible in Home Assistant
+- Home Assistant version
+- whether you have multiple devices or locations
+- what action failed
+- a diagnostics download from the integration if possible
 
-## Troubleshooting
+## Contributing
 
-### The integration adds no devices
+Contributions are welcome, especially:
 
-Possible reasons:
+- compatibility testing on additional AprilAire dehumidifier models
+- fixes for edge cases in auth, WebSocket handling, or writes
+- docs improvements
+- additional tests
 
-- the account has no devices on `aprilaire.io`
-- the account only has unsupported AprilAire equipment
-- the device uses `drynessSetpoint` instead of `humiditySetpoint`
-- the device uses a non-internal control mode
+Start with [CONTRIBUTING.md](CONTRIBUTING.md).
 
-### A device was added in the AprilAire app but does not show up immediately
+If you have a model that is not yet confirmed, please open a compatibility report even if it only partially works. That will help map out what AprilAire is exposing across the product line.
 
-The integration should discover it automatically, but discovery depends on either a refresh event or the next hierarchy refresh. If it does not appear after a reasonable interval, reload the integration once from Home Assistant.
+## HACS Default Status
 
-### State changes are delayed
+This repository is installable today as a HACS custom repository.
 
-If WebSocket connectivity is interrupted, the integration falls back to periodic REST refreshes until push connectivity returns. During that period, updates may feel less immediate.
-
-### Authentication stopped working
-
-The integration automatically refreshes tokens and will trigger Home Assistant reauthentication if credentials are no longer valid. Re-enter the same AprilAire Healthy Air account credentials when prompted.
-
-## Diagnostics
-
-The integration includes a Home Assistant diagnostics handler.
-
-Diagnostics are intended to help debug:
-
-- discovered locations
-- discovered devices
-- whether a device was considered supported
-- the current device snapshot
-- WebSocket connection state
-- registered Home Assistant devices and entities
-
-Sensitive values such as usernames, passwords, tokens, account identifiers, and location names are redacted or hashed in diagnostics output.
-
-## Development Notes
-
-- `.env` is for local developer testing only and must never be committed.
-- Reverse-engineering and API exploration scripts in this repository are development tools only and are not used by the production integration code.
-- The integration does not depend on those scripts at runtime.
-
-## Status
-
-This project is an independent Home Assistant custom integration and is not an official AprilAire product.
+I do plan to submit it to the HACS default listings, but not immediately. The current goal is to get a first round of real-world testing and feedback first, especially from owners of AprilAire dehumidifier models other than the E100W.
