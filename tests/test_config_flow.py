@@ -8,16 +8,21 @@ from homeassistant import config_entries
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.aprilaire_cloud.api import AprilaireCloudApiClient, AprilaireCloudAuthenticationError
+from custom_components.aprilaire_cloud.api import (
+    AprilaireCloudApiClient,
+    AprilaireCloudAuthenticationError,
+)
 from custom_components.aprilaire_cloud.const import DOMAIN
 
-from .common import PASSWORD, USERNAME, USER_ID, build_hierarchy, build_user
+from .common import PASSWORD, USER_ID, USERNAME, build_hierarchy, build_user
 
 
 async def test_user_flow_success(hass, enable_custom_integrations, monkeypatch) -> None:
     """A valid account should create a config entry."""
     monkeypatch.setattr(AprilaireCloudApiClient, "async_authenticate", AsyncMock())
-    monkeypatch.setattr(AprilaireCloudApiClient, "async_get_user", AsyncMock(return_value=build_user()))
+    monkeypatch.setattr(
+        AprilaireCloudApiClient, "async_get_user", AsyncMock(return_value=build_user())
+    )
     monkeypatch.setattr(
         AprilaireCloudApiClient,
         "async_get_hierarchy",
@@ -48,7 +53,9 @@ async def test_user_flow_duplicate_account_aborts(
     entry.add_to_hass(hass)
 
     monkeypatch.setattr(AprilaireCloudApiClient, "async_authenticate", AsyncMock())
-    monkeypatch.setattr(AprilaireCloudApiClient, "async_get_user", AsyncMock(return_value=build_user()))
+    monkeypatch.setattr(
+        AprilaireCloudApiClient, "async_get_user", AsyncMock(return_value=build_user())
+    )
     monkeypatch.setattr(
         AprilaireCloudApiClient,
         "async_get_hierarchy",
@@ -79,7 +86,9 @@ async def test_reauth_updates_credentials(hass, enable_custom_integrations, monk
     entry.add_to_hass(hass)
 
     monkeypatch.setattr(AprilaireCloudApiClient, "async_authenticate", AsyncMock())
-    monkeypatch.setattr(AprilaireCloudApiClient, "async_get_user", AsyncMock(return_value=build_user()))
+    monkeypatch.setattr(
+        AprilaireCloudApiClient, "async_get_user", AsyncMock(return_value=build_user())
+    )
     monkeypatch.setattr(
         AprilaireCloudApiClient,
         "async_get_hierarchy",

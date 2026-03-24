@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.const import PERCENTAGE
-from homeassistant.exceptions import HomeAssistantError
 
-from .const import DOMAIN
+from .api import AprilaireCloudApiError, AprilaireCloudRateLimitError
 from .coordinator import AprilaireCloudDataUpdateCoordinator
 from .data import AprilaireCloudConfigEntry
-from .entity import AprilaireCloudEntity
+from .entity import (
+    AprilaireCloudEntity,
+    raise_ha_write_error,
+    setup_dynamic_platform_entities,
+)
 
 ALERT_LIMIT_DESCRIPTIONS = {
     "highHum": {
@@ -24,27 +27,17 @@ ALERT_LIMIT_DESCRIPTIONS = {
 async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry, async_add_entities) -> None:
     """Set up AprilAire number entities."""
     coordinator = entry.runtime_data.coordinator
-    known_entities: set[tuple[str, str]] = set()
 
-    def _check_devices() -> None:
-        entities = []
-        for device_id, device in coordinator.data.devices.items():
-            if not device.supported:
-                continue
-            for key in device.device_settings.get("dehumidifier", {}).get("alertLimits", {}):
-                if key not in ALERT_LIMIT_DESCRIPTIONS:
-                    continue
-                entity = AprilaireAlertLimitNumber(coordinator, device_id, key)
-                registry_key = (device_id, entity.unique_id)
-                if registry_key in known_entities:
-                    continue
-                known_entities.add(registry_key)
-                entities.append(entity)
-        if entities:
-            async_add_entities(entities)
+    def _entities_for_device(device_id: str, device):
+        alert_limits = device.effective_device_settings.get("dehumidifier", {}).get(
+            "alertLimits",
+            {},
+        )
+        for key in alert_limits:
+            if key in ALERT_LIMIT_DESCRIPTIONS:
+                yield AprilaireAlertLimitNumber(coordinator, device_id, key)
 
-    _check_devices()
-    entry.async_on_unload(coordinator.async_add_listener(_check_devices))
+    setup_dynamic_platform_entities(entry, async_add_entities, _entities_for_device)
 
 
 class AprilaireAlertLimitNumber(AprilaireCloudEntity, NumberEntity):
@@ -53,7 +46,9 @@ class AprilaireAlertLimitNumber(AprilaireCloudEntity, NumberEntity):
     _attr_mode = NumberMode.BOX
     _attr_native_unit_of_measurement = PERCENTAGE
 
-    def __init__(self, coordinator: AprilaireCloudDataUpdateCoordinator, device_id: str, limit_key: str) -> None:
+    def __init__(
+        self, coordinator: AprilaireCloudDataUpdateCoordinator, device_id: str, limit_key: str
+    ) -> None:
         """Initialize the number."""
         self._limit_key = limit_key
         description = ALERT_LIMIT_DESCRIPTIONS[limit_key]
@@ -66,21 +61,17 @@ class AprilaireAlertLimitNumber(AprilaireCloudEntity, NumberEntity):
     @property
     def native_value(self) -> float | None:
         """Return the current limit value."""
-        device = self.device
-        if device is None:
-            return None
-        return device.device_settings.get("dehumidifier", {}).get("alertLimits", {}).get(self._limit_key)
+        return (
+            self.effective_device_settings.get("dehumidifier", {})
+            .get("alertLimits", {})
+            .get(self._limit_key)
+        )
 
     async def async_set_native_value(self, value: float) -> None:
         """Write a new alert threshold."""
         try:
-            await self.coordinator.async_set_alert_limit(self._device_id, self._limit_key, int(value))
-        except Exception as err:  # noqa: BLE001
-            translation_key = "rate_limited" if err.__class__.__name__.endswith("RateLimitError") else "write_failed"
-            placeholders = {"seconds": str(round(getattr(err, "retry_after", 0) or 0))}
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key=translation_key,
-                translation_placeholders=placeholders,
-            ) from err
-
+            await self.coordinator.async_set_alert_limit(
+                self._device_id, self._limit_key, int(value)
+            )
+        except (AprilaireCloudRateLimitError, AprilaireCloudApiError) as err:
+            raise_ha_write_error(err)

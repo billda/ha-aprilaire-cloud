@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
 from collections.abc import Iterable
-from dataclasses import replace
-from datetime import timedelta
+from copy import deepcopy
 from typing import Any
 
+from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from homeassistant.exceptions import ConfigEntryAuthFailed
 
 from .api import (
     AprilaireCloudApiClient,
@@ -19,6 +18,7 @@ from .api import (
     AprilaireCloudAuthenticationError,
     AprilaireCloudCommunicationError,
     AprilaireCloudRateLimitError,
+    AprilaireCloudWriteError,
 )
 from .const import (
     DEFAULT_FALLBACK_REFRESH_INTERVAL,
@@ -27,13 +27,22 @@ from .const import (
     LOGGER,
     MAX_PARALLEL_REST_REQUESTS,
     POST_WRITE_CONFIRM_TIMEOUT,
-    SUPPORTED_CONTROL_TYPE,
-    SUPPORTED_REPORTING_TYPE,
-    SUPPORTED_SCALE,
     WEBSOCKET_INITIAL_SYNC_TIMEOUT,
 )
 from .data import AprilaireCloudConfigEntry
-from .models import AprilaireSnapshot, DeviceRecord, HierarchyDevice, HierarchyLocation, SocketState, empty_snapshot
+from .models import AprilaireSnapshot, DeviceRecord, HierarchyLocation, SocketState
+from .state import (
+    DeviceWriteState,
+    apply_confirmed_device_settings,
+    apply_device_message,
+    apply_hierarchy,
+    apply_pending_device_settings,
+    apply_rest_refresh,
+    clear_pending_device_settings,
+    evaluate_device_support,
+    pending_payload_is_current,
+    settings_match_payload,
+)
 from .websocket import AprilaireLocationWebSocket
 
 
@@ -66,7 +75,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         self._socket_states: dict[str, SocketState] = {}
         self._websockets: dict[str, AprilaireLocationWebSocket] = {}
         self._refresh_event_task: asyncio.Task[None] | None = None
-        self._write_waiters: dict[str, set[asyncio.Event]] = defaultdict(set)
+        self._write_states: dict[str, DeviceWriteState] = {}
 
     async def _async_setup(self) -> None:
         """Perform one-time startup work."""
@@ -96,8 +105,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
                 if not record.device_settings or not record.dehumidifier_status
             ]
         )
-        self.async_set_updated_data(self._build_snapshot())
-        self._update_refresh_interval()
+        self._publish_snapshot()
 
     async def _async_update_data(self) -> AprilaireSnapshot:
         """Perform a slow safety refresh or a bounded REST fallback refresh."""
@@ -153,34 +161,27 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
                 continue
 
             record = self._devices[device_id]
-            if message_type == "DehumidifierStatus":
-                record = replace(record, dehumidifier_status=message)
-            elif message_type == "DeviceSettings":
-                record = replace(record, device_settings=message)
-            elif message_type == "DeviceSetup":
-                record = replace(record, device_setup=message)
-            elif message_type == "DeviceStatus":
-                record = replace(record, device_status=message)
-            elif message_type == "SensorHubStatus":
-                record = replace(record, sensor_hub_status=message)
-            else:
+            updated = apply_device_message(record, message)
+            if updated == record:
                 continue
-
-            updated = self._evaluate_device_support(record)
-            self._devices[device_id] = updated
+            self._devices[device_id] = evaluate_device_support(updated)
             changed = True
-            if message_type in {"DehumidifierStatus", "DeviceSettings"}:
-                self._notify_write_waiters(device_id)
+            if message_type == "DeviceSettings":
+                write_state = self._write_states.get(device_id)
+                if (
+                    write_state is not None
+                    and write_state.inflight_event is not None
+                    and settings_match_payload(message, write_state.inflight_expected)
+                ):
+                    write_state.inflight_event.set()
 
         if changed:
-            self.async_set_updated_data(self._build_snapshot())
-            self._update_refresh_interval()
+            self._publish_snapshot()
 
     async def async_socket_state_changed(self, state: SocketState) -> None:
         """Track websocket connection state."""
         self._socket_states[state.location_id] = state
-        self.async_set_updated_data(self._build_snapshot())
-        self._update_refresh_interval()
+        self._publish_snapshot()
 
     async def async_set_mode(self, device_id: str, enabled: bool) -> None:
         """Set the operating mode for a device."""
@@ -208,23 +209,64 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         device_id: str,
         payload: dict[str, Any],
     ) -> None:
-        """Write settings and wait briefly for websocket confirmation."""
-        waiter = asyncio.Event()
-        self._write_waiters[device_id].add(waiter)
-        try:
-            await self.client.async_patch_device_settings(device_id, payload)
-            try:
-                await asyncio.wait_for(waiter.wait(), timeout=POST_WRITE_CONFIRM_TIMEOUT)
-            except TimeoutError:
-                await self._async_rest_refresh_devices([device_id])
-                self.async_set_updated_data(self._build_snapshot())
-        finally:
-            self._write_waiters[device_id].discard(waiter)
+        """Write settings and wait briefly for a matching settings confirmation."""
+        if device_id not in self._devices:
+            return
 
-    def _notify_write_waiters(self, device_id: str) -> None:
-        """Release any callers waiting on a websocket confirmation."""
-        for waiter in tuple(self._write_waiters[device_id]):
-            waiter.set()
+        write_state = self._write_states.setdefault(device_id, DeviceWriteState())
+        write_state.latest_request_id += 1
+        request_id = write_state.latest_request_id
+
+        self._apply_pending_device_settings(device_id, payload)
+        self._publish_snapshot()
+
+        should_raise = False
+        try:
+            async with write_state.lock:
+                if not self._pending_payload_is_current(device_id, payload):
+                    return
+
+                inflight_event = asyncio.Event()
+                write_state.inflight_request_id = request_id
+                write_state.inflight_expected = deepcopy(payload)
+                write_state.inflight_event = inflight_event
+
+                await self.client.async_patch_device_settings(device_id, payload)
+                try:
+                    await asyncio.wait_for(
+                        inflight_event.wait(), timeout=POST_WRITE_CONFIRM_TIMEOUT
+                    )
+                    return
+                except TimeoutError:
+                    settings = await self._async_refresh_device_settings(device_id)
+                    self._publish_snapshot()
+                    if settings_match_payload(settings, payload):
+                        return
+
+                    should_raise = (
+                        request_id == write_state.latest_request_id
+                        and self._pending_payload_is_current(device_id, payload)
+                    )
+        except (AprilaireCloudApiError, AprilaireCloudCommunicationError):
+            should_raise = should_raise or (
+                request_id == write_state.latest_request_id
+                and self._pending_payload_is_current(device_id, payload)
+            )
+            if should_raise:
+                self._clear_pending_device_settings(device_id, payload)
+                self._publish_snapshot()
+                raise
+            return
+        finally:
+            if write_state.inflight_request_id == request_id:
+                write_state.inflight_request_id = None
+                write_state.inflight_expected = {}
+                write_state.inflight_event = None
+
+        if should_raise:
+            self._clear_pending_device_settings(device_id, payload)
+            self._publish_snapshot()
+            raise AprilaireCloudWriteError("AprilAire did not confirm updated settings")
 
     def _build_snapshot(self) -> AprilaireSnapshot:
         """Build an immutable snapshot for entities."""
@@ -236,72 +278,53 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
             socket_states=dict(self._socket_states),
         )
 
-    def _evaluate_device_support(self, record: DeviceRecord) -> DeviceRecord:
-        """Determine whether a device should be exposed to Home Assistant."""
-        setup_type = record.device_setup.get("type")
-        if setup_type != SUPPORTED_REPORTING_TYPE:
-            return replace(
-                record,
-                supported=False,
-                unsupported_reason="unsupported_equipment_type",
-            )
+    def _publish_snapshot(self) -> None:
+        """Publish the current snapshot to entities."""
+        self.async_set_updated_data(self._build_snapshot())
+        self._update_refresh_interval()
 
-        dehumidifier_setup = record.device_setup.get("dehumidifier", {})
-        dehumidifier_settings = record.device_settings.get("dehumidifier", {})
+    def _apply_pending_device_settings(self, device_id: str, payload: dict[str, Any]) -> None:
+        """Merge optimistic local settings into the pending override layer."""
+        record = self._devices.get(device_id)
+        if record is None:
+            return
+        self._devices[device_id] = evaluate_device_support(
+            apply_pending_device_settings(record, payload)
+        )
 
-        if not dehumidifier_setup:
-            return replace(record, supported=False, unsupported_reason="awaiting_device_setup")
+    def _apply_confirmed_device_settings(self, device_id: str, settings: dict[str, Any]) -> None:
+        """Update confirmed remote settings and clear any matching optimistic overrides."""
+        record = self._devices.get(device_id)
+        if record is None:
+            return
+        self._devices[device_id] = evaluate_device_support(
+            apply_confirmed_device_settings(record, settings)
+        )
 
-        if dehumidifier_setup.get("controlType") != SUPPORTED_CONTROL_TYPE:
-            return replace(record, supported=False, unsupported_reason="unsupported_control_type")
+    def _clear_pending_device_settings(self, device_id: str, payload: dict[str, Any]) -> None:
+        """Remove matching optimistic override paths from the pending layer."""
+        record = self._devices.get(device_id)
+        if record is None:
+            return
+        self._devices[device_id] = evaluate_device_support(
+            clear_pending_device_settings(record, payload)
+        )
 
-        if dehumidifier_setup.get("scale") != SUPPORTED_SCALE:
-            return replace(record, supported=False, unsupported_reason="unsupported_scale")
-
-        if "humiditySetpoint" not in dehumidifier_settings:
-            return replace(record, supported=False, unsupported_reason="missing_humidity_setpoint")
-
-        if "drynessSetpoint" in dehumidifier_settings:
-            return replace(record, supported=False, unsupported_reason="dryness_setpoint_unsupported")
-
-        return replace(record, supported=True, unsupported_reason=None)
+    def _pending_payload_is_current(self, device_id: str, payload: dict[str, Any]) -> bool:
+        """Return whether a request still matches the latest pending local override."""
+        record = self._devices.get(device_id)
+        if record is None:
+            return False
+        return pending_payload_is_current(record, payload)
 
     def _apply_hierarchy(self, hierarchy: dict[str, Any]) -> set[str]:
         """Merge hierarchy data and return removed device IDs."""
-        previous_device_ids = set(self._devices)
-        locations: dict[str, HierarchyLocation] = {}
-        devices: dict[str, DeviceRecord] = {}
-
-        for location in hierarchy.get("locations", []):
-            location_id = location["locationId"]
-            locations[location_id] = HierarchyLocation(
-                location_id=location_id,
-                name=location.get("name", location_id),
-                time_zone=location.get("timeZone"),
-            )
-            for room in location.get("rooms", []):
-                for device in room.get("devices", []):
-                    device_id = device["deviceId"]
-                    hierarchy_device = HierarchyDevice(
-                        device_id=device_id,
-                        location_id=location_id,
-                        location_name=location.get("name", location_id),
-                        room_name=room.get("name"),
-                        access=device.get("access"),
-                        zone=device.get("zone"),
-                    )
-                    existing = self._devices.get(device_id)
-                    if existing is None:
-                        devices[device_id] = DeviceRecord(hierarchy=hierarchy_device)
-                    else:
-                        devices[device_id] = replace(existing, hierarchy=hierarchy_device)
-
+        locations, devices, removed_ids = apply_hierarchy(hierarchy, self._devices)
         self._locations = locations
-        self._devices = {
-            device_id: self._evaluate_device_support(record)
-            for device_id, record in devices.items()
-        }
-        return previous_device_ids - set(self._devices)
+        self._devices = devices
+        for device_id in removed_ids:
+            self._write_states.pop(device_id, None)
+        return removed_ids
 
     def _needs_rest_fallback(self) -> bool:
         """Return whether websocket health requires REST fallback."""
@@ -309,7 +332,10 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
             return False
         if not self._socket_states:
             return True
-        if not all(state.connected and state.initial_sync_complete for state in self._socket_states.values()):
+        if not all(
+            state.connected and state.initial_sync_complete
+            for state in self._socket_states.values()
+        ):
             return True
         return any(
             not record.device_settings or not record.dehumidifier_status
@@ -362,7 +388,9 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
 
         semaphore = asyncio.Semaphore(MAX_PARALLEL_REST_REQUESTS)
 
-        async def _refresh_device(device_id: str) -> tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]:
+        async def _refresh_device(
+            device_id: str,
+        ) -> tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]:
             async with semaphore:
                 status, dehumidifier_status, settings = await asyncio.gather(
                     self.client.async_get_device_status(device_id),
@@ -375,23 +403,53 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         for device_id, status, dehumidifier_status, settings in results:
             if device_id not in self._devices:
                 continue
-            record = self._devices[device_id]
-            updated = replace(
-                record,
-                device_status=status,
-                dehumidifier_status=dehumidifier_status,
-                device_settings=settings,
+            self._devices[device_id] = evaluate_device_support(
+                apply_rest_refresh(
+                    self._devices[device_id],
+                    device_status=status,
+                    dehumidifier_status=dehumidifier_status,
+                    settings=settings,
+                )
             )
-            self._devices[device_id] = self._evaluate_device_support(updated)
+
+    async def _async_refresh_device_settings(self, device_id: str) -> dict[str, Any]:
+        """Refresh only the writable settings for one device."""
+        settings = await self.client.async_get_device_settings(device_id)
+        self._apply_confirmed_device_settings(device_id, settings)
+        return settings
 
     async def _async_cleanup_removed_devices(self, removed_ids: set[str]) -> None:
         """Remove stale entity registry entries for devices no longer in the hierarchy."""
         if not removed_ids:
             return
+        device_registry = dr.async_get(self.hass)
         entity_registry = er.async_get(self.hass)
-        for entry in er.async_entries_for_config_entry(entity_registry, self.config_entry.entry_id):
-            if entry.unique_id and any(entry.unique_id.startswith(f"{device_id}_") for device_id in removed_ids):
-                entity_registry.async_remove(entry.entity_id)
+        stale_registry_device_ids = {
+            device.id
+            for device in dr.async_entries_for_config_entry(
+                device_registry, self.config_entry.entry_id
+            )
+            if any(
+                identifier[0] == DOMAIN and identifier[1] in removed_ids
+                for identifier in device.identifiers
+            )
+        }
+
+        for registry_entry in er.async_entries_for_config_entry(
+            entity_registry,
+            self.config_entry.entry_id,
+        ):
+            if registry_entry.device_id in stale_registry_device_ids or (
+                registry_entry.unique_id
+                and any(
+                    registry_entry.unique_id.startswith(f"{device_id}_")
+                    for device_id in removed_ids
+                )
+            ):
+                entity_registry.async_remove(registry_entry.entity_id)
+
+        for registry_device_id in stale_registry_device_ids:
+            device_registry.async_remove_device(registry_device_id)
 
     def _schedule_refresh(self) -> None:
         """Debounce refresh-event triggered hierarchy reloads."""

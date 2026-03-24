@@ -5,7 +5,8 @@ from __future__ import annotations
 from typing import Any
 
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
-from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.redact import async_redact_data
 
 from .data import AprilaireCloudConfigEntry
@@ -45,6 +46,11 @@ async def async_get_config_entry_diagnostics(
             {
                 "user_id": coordinator.data.user_id,
                 "email": coordinator.data.email,
+                "rate_limited_until": (
+                    runtime_data.client.rate_limited_until.isoformat()
+                    if runtime_data.client.rate_limited_until is not None
+                    else None
+                ),
                 "locations": {
                     location_id: {
                         "name": location.name,
@@ -62,6 +68,8 @@ async def async_get_config_entry_diagnostics(
                         "firmware": device.device_status.get("firmwareRev"),
                         "device_setup": device.device_setup,
                         "device_settings": device.device_settings,
+                        "pending_device_settings": device.pending_device_settings,
+                        "effective_device_settings": device.effective_device_settings,
                         "dehumidifier_status": device.dehumidifier_status,
                     }
                     for device_id, device in coordinator.data.devices.items()
@@ -74,6 +82,10 @@ async def async_get_config_entry_diagnostics(
                         "last_error": state.last_error,
                     }
                     for location_id, state in coordinator.data.socket_states.items()
+                },
+                "write_states": {
+                    device_id: state.summary
+                    for device_id, state in coordinator._write_states.items()
                 },
             },
             TO_REDACT,
@@ -97,4 +109,3 @@ async def async_get_config_entry_diagnostics(
             for device in devices
         ],
     }
-

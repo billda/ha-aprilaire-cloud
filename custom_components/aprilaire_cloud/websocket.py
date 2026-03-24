@@ -3,18 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
-from contextlib import suppress
-from datetime import UTC, datetime
 import json
 import random
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from typing import Any
 
-from aiohttp import ClientError, ClientSession, WSMessage, WSMsgType
+from aiohttp import ClientSession, WSMessage, WSMsgType
 
 from .api import (
     AprilaireCloudApiClient,
-    AprilaireCloudAuthenticationError,
     AprilaireCloudCommunicationError,
 )
 from .const import (
@@ -56,7 +54,6 @@ class AprilaireLocationWebSocket:
         self._pong_event = asyncio.Event()
         self._initial_sync_event = asyncio.Event()
         self._reconnect_attempt = 0
-        self._connected = False
         self._last_error: str | None = None
 
     async def async_start(self) -> None:
@@ -64,7 +61,9 @@ class AprilaireLocationWebSocket:
         if self._runner_task is not None:
             return
         self._stop_event.clear()
-        self._runner_task = asyncio.create_task(self._async_run(), name=f"aprilaire_ws_{self._location_id}")
+        self._runner_task = asyncio.create_task(
+            self._async_run(), name=f"aprilaire_ws_{self._location_id}"
+        )
 
     async def async_stop(self) -> None:
         """Stop the websocket loop."""
@@ -76,10 +75,10 @@ class AprilaireLocationWebSocket:
             await self._runner_task
         self._runner_task = None
 
-    async def async_wait_for_initial_sync(self, timeout: float) -> bool:
+    async def async_wait_for_initial_sync(self, wait_timeout: float) -> bool:
         """Wait for the initial subscribe burst."""
         try:
-            await asyncio.wait_for(self._initial_sync_event.wait(), timeout=timeout)
+            await asyncio.wait_for(self._initial_sync_event.wait(), timeout=wait_timeout)
         except TimeoutError:
             return False
         return True
@@ -88,21 +87,21 @@ class AprilaireLocationWebSocket:
         """Maintain the websocket connection until stopped."""
         delay = WEBSOCKET_RECONNECT_MIN_SECONDS
         while not self._stop_event.is_set():
+            self._initial_sync_event.clear()
             try:
                 await self._async_connect_once()
                 delay = WEBSOCKET_RECONNECT_MIN_SECONDS
-                self._reconnect_attempt = 0
             except asyncio.CancelledError:
                 raise
-            except Exception as err:  # noqa: BLE001
-                self._last_error = str(err)
+            except Exception as err:
                 LOGGER.warning(
                     "AprilAire websocket for location %s disconnected: %s",
                     self._location_id,
                     err,
                 )
-                await self._publish_state(connected=False, initial_sync_complete=self._initial_sync_event.is_set())
-                self._reconnect_attempt += 1
+                await self._async_mark_disconnected(err)
+                if self._stop_event.is_set():
+                    break
                 sleep_for = min(delay, WEBSOCKET_RECONNECT_MAX_SECONDS) + random.uniform(0, 1)
                 await asyncio.sleep(sleep_for)
                 delay = min(delay * 2, WEBSOCKET_RECONNECT_MAX_SECONDS)
@@ -118,21 +117,25 @@ class AprilaireLocationWebSocket:
             receive_timeout=None,
         ) as ws:
             await self._async_send_subscribe(ws, token)
-            self._connected = True
-            await self._publish_state(connected=True, initial_sync_complete=self._initial_sync_event.is_set())
+            await self._publish_state(connected=True, initial_sync_complete=False)
 
             ping_task = asyncio.create_task(self._async_ping_loop(ws))
             try:
                 while not self._stop_event.is_set():
-                    timeout = None if self._initial_sync_event.is_set() else WEBSOCKET_INITIAL_SYNC_TIMEOUT
+                    timeout = (
+                        None
+                        if self._initial_sync_event.is_set()
+                        else WEBSOCKET_INITIAL_SYNC_TIMEOUT
+                    )
                     message = await ws.receive(timeout=timeout)
                     await self._async_handle_message(ws, message)
             finally:
                 ping_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await ping_task
-                self._connected = False
-                await self._publish_state(connected=False, initial_sync_complete=self._initial_sync_event.is_set())
+                if self._stop_event.is_set():
+                    self._initial_sync_event.clear()
+                    await self._publish_state(connected=False, initial_sync_complete=False)
 
     async def _async_ping_loop(self, ws) -> None:
         """Send the AprilAire application-level ping frames."""
@@ -185,9 +188,8 @@ class AprilaireLocationWebSocket:
             messages = data if isinstance(data, list) else [data]
             valid_messages = [item for item in messages if isinstance(item, dict)]
             if valid_messages:
-                self._initial_sync_event.set()
                 await self._message_callback(self._location_id, valid_messages)
-                await self._publish_state(connected=True, initial_sync_complete=True)
+                await self._async_mark_healthy()
             return
 
         if message.type in {WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED}:
@@ -215,3 +217,16 @@ class AprilaireLocationWebSocket:
             )
         )
 
+    async def _async_mark_healthy(self) -> None:
+        """Mark the websocket as healthy after a successful subscribe/message flow."""
+        self._initial_sync_event.set()
+        self._reconnect_attempt = 0
+        self._last_error = None
+        await self._publish_state(connected=True, initial_sync_complete=True)
+
+    async def _async_mark_disconnected(self, err: Exception) -> None:
+        """Mark the websocket as disconnected and entering reconnect mode."""
+        self._last_error = str(err)
+        self._reconnect_attempt += 1
+        self._initial_sync_event.clear()
+        await self._publish_state(connected=False, initial_sync_complete=False)
