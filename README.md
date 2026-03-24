@@ -4,18 +4,28 @@ Home Assistant custom integration for AprilAire Healthy Air cloud-connected dehu
 
 This integration connects to the modern `aprilaire.io` cloud platform used by the AprilAire Healthy Air app. It is designed as a standard Home Assistant config-entry integration for HACS, with automatic device discovery, WebSocket-first updates, diagnostics support, and dynamic entity creation when new supported devices appear on the account.
 
-## Features
+> [!NOTE]
+> This project is focused on doing one thing well: exposing supported AprilAire cloud dehumidifiers in Home Assistant with a websocket-first update model and a clean config-entry setup.
 
-- Config-entry setup from the Home Assistant UI
-- No YAML configuration
-- WebSocket-first updates for near real-time state changes
-- Automatic token refresh and reauthentication support
-- Automatic discovery of supported dehumidifiers on the configured AprilAire account
-- Automatic surfacing of newly added supported devices after setup
-- Home Assistant device registry support
-- Diagnostics download with credentials and tokens redacted
-- Built-in REST backoff when the AprilAire API signals rate limiting
-- Dynamic creation of supported entities based on device capabilities
+## At A Glance
+
+| Area | Details |
+| --- | --- |
+| Platform | Home Assistant custom integration via HACS |
+| Cloud | `aprilaire.io` |
+| Device focus | Supported AprilAire Healthy Air dehumidifiers |
+| Setup style | UI-only config entry |
+| Update model | WebSocket-first with bounded REST fallback |
+| Multi-device support | Yes, across multiple locations on one account |
+
+## Highlights
+
+- **Easy setup:** config-entry setup from the Home Assistant UI, with no YAML required
+- **Fast updates:** WebSocket-first updates for near real-time state changes
+- **Account-aware discovery:** automatically finds supported dehumidifiers on the configured AprilAire account
+- **Good HA behavior:** device registry support, reauth flow, diagnostics, and dynamic entity creation
+- **Safer operation:** token refresh, bounded REST fallback, rate-limit handling, and redacted diagnostics
+- **Better UX:** setup validation for unsupported accounts, repair issues for mixed accounts, and options for refresh tuning
 
 ## What This Integration Supports
 
@@ -30,6 +40,9 @@ The implementation is meant to work across multiple compatible AprilAire dehumid
 
 Live testing has been performed against a real AprilAire cloud account and a real cloud-connected AprilAire dehumidifier. The code is intentionally conservative about what it exposes: if a device does not match the supported capability profile, it is ignored rather than partially supported in a broken or misleading way.
 
+> [!TIP]
+> If your account authenticates successfully but Home Assistant still shows no devices, the most common reason is that the device uses an unsupported capability profile rather than bad credentials.
+
 ## Explicitly Out Of Scope
 
 The following are not supported:
@@ -41,9 +54,14 @@ The following are not supported:
 - devices using dew-point style control instead of `%RH`
 - manual YAML configuration
 
+> [!WARNING]
+> This integration does not try to approximate unsupported AprilAire devices. Unsupported capability profiles are intentionally skipped rather than exposed in a misleading or partially broken way.
+
 ## Installation
 
 ### HACS
+
+Recommended for most users.
 
 1. Open HACS in Home Assistant.
 2. Add this repository as a custom repository of type `Integration`.
@@ -64,6 +82,16 @@ The following are not supported:
 
 Setup is entirely UI-driven.
 
+### Configuration Options
+
+After setup, use the integration's `Configure` action to adjust:
+
+- safety refresh interval
+- fallback refresh interval while websocket connectivity is degraded
+- whether extra diagnostic entities should be enabled by default for newly created devices
+
+### What Setup Does
+
 During setup, the integration:
 
 1. Authenticates against AprilAire Cognito.
@@ -71,6 +99,8 @@ During setup, the integration:
 3. Loads the AprilAire device hierarchy for the account.
 4. Creates a single Home Assistant config entry for that AprilAire cloud account.
 5. Discovers and adds all supported dehumidifiers under that account.
+
+If the account authenticates successfully but contains no supported devices, setup stays on the form and explains the supported device profile. If the account contains a mix of supported and unsupported devices, setup continues and Home Assistant creates a repair issue summarizing what was skipped.
 
 The account `userId` is used as the unique config-entry identifier, which prevents the same AprilAire account from being added twice.
 
@@ -101,6 +131,15 @@ Unsupported devices remain hidden rather than creating incomplete entities.
 
 The exact set of entities depends on what each device reports through the AprilAire API.
 
+### Entity Overview
+
+| Entity type | Purpose |
+| --- | --- |
+| `humidifier` | Main dehumidifier control and target humidity |
+| `sensor` | Humidity, temperature, filter life, diagnostics |
+| `binary_sensor` | Alerts and running-state diagnostics |
+| `number` | Writable alert thresholds when supported |
+
 ### Primary Entity
 
 Each supported unit creates one primary `humidifier` entity using Home Assistant's dehumidifier device class.
@@ -123,7 +162,7 @@ Action mapping is based on AprilAire `equipmentStatus`:
 - `inactive` and `air-sampling` map to idle
 - off mode maps to off
 
-### Sensors
+### Sensor Entities
 
 Depending on the device payload, the integration may create:
 
@@ -137,7 +176,7 @@ Depending on the device payload, the integration may create:
 
 Diagnostic sensors such as Wi-Fi signal, fan runtime, equipment status, and extra temperature probes are disabled by default when they are likely to be noisy or low-value for most users.
 
-### Binary Sensors
+### Binary Sensor Entities
 
 Depending on the device payload, the integration may create:
 
@@ -177,11 +216,12 @@ Device names are derived from the AprilAire hierarchy, typically using location 
 
 This integration is `cloud_push` and uses WebSockets as the primary transport.
 
-### Primary Update Path
+### Update Flow
 
-- Open one WebSocket connection per AprilAire location
-- Subscribe to that location using the current ID token
-- Process push updates such as device status and device settings changes
+1. Open one WebSocket connection per AprilAire location.
+2. Subscribe to that location using the current ID token.
+3. Process push updates such as device status and device settings changes.
+4. Use slower REST refreshes only when needed for discovery, reconciliation, or degraded websocket health.
 
 This allows Home Assistant to reflect most state changes without waiting for a polling interval.
 
@@ -219,7 +259,7 @@ This integration uses standard Home Assistant patterns wherever possible:
 - reauth flow
 - reconfigure flow
 - diagnostics support
-- dynamic device/entity creation after setup
+- dynamic device and entity creation after setup
 - config-entry-only setup
 
 That means supported devices should appear in `Settings > Devices & services` and new supported devices added to the same AprilAire account should also surface automatically.
@@ -267,7 +307,7 @@ Diagnostics are intended to help debug:
 - WebSocket connection state
 - registered Home Assistant devices and entities
 
-Sensitive values such as usernames, passwords, and tokens are redacted from diagnostics output.
+Sensitive values such as usernames, passwords, tokens, account identifiers, and location names are redacted or hashed in diagnostics output.
 
 ## Development Notes
 

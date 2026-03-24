@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
@@ -23,6 +24,14 @@ TO_REDACT = {
 }
 
 
+def _hash_value(value: str | None) -> str | None:
+    """Return a stable hash for user-identifying strings."""
+    if value is None:
+        return None
+    digest = hashlib.sha256(value.encode()).hexdigest()[:12]
+    return f"sha256:{digest}"
+
+
 async def async_get_config_entry_diagnostics(
     hass,
     entry: AprilaireCloudConfigEntry,
@@ -37,15 +46,15 @@ async def async_get_config_entry_diagnostics(
     return {
         "entry": {
             "entry_id": entry.entry_id,
-            "title": entry.title,
-            "unique_id": entry.unique_id,
+            "title": _hash_value(entry.title),
+            "unique_id": _hash_value(entry.unique_id),
             "state": str(entry.state),
             "data": async_redact_data(dict(entry.data), TO_REDACT),
         },
         "snapshot": async_redact_data(
             {
-                "user_id": coordinator.data.user_id,
-                "email": coordinator.data.email,
+                "user_id": _hash_value(coordinator.data.user_id),
+                "email": _hash_value(coordinator.data.email),
                 "rate_limited_until": (
                     runtime_data.client.rate_limited_until.isoformat()
                     if runtime_data.client.rate_limited_until is not None
@@ -53,7 +62,7 @@ async def async_get_config_entry_diagnostics(
                 ),
                 "locations": {
                     location_id: {
-                        "name": location.name,
+                        "name": _hash_value(location.name),
                         "time_zone": location.time_zone,
                     }
                     for location_id, location in coordinator.data.locations.items()
@@ -62,8 +71,10 @@ async def async_get_config_entry_diagnostics(
                     device_id: {
                         "supported": device.supported,
                         "unsupported_reason": device.unsupported_reason,
-                        "location": device.hierarchy.location_name,
-                        "room": device.hierarchy.room_name,
+                        "profile_key": device.profile_key,
+                        "supported_writes": list(device.supported_writes),
+                        "location": _hash_value(device.hierarchy.location_name),
+                        "room": _hash_value(device.hierarchy.room_name),
                         "model": device.device_status.get("model"),
                         "firmware": device.device_status.get("firmwareRev"),
                         "device_setup": device.device_setup,
@@ -87,13 +98,17 @@ async def async_get_config_entry_diagnostics(
                     device_id: state.summary
                     for device_id, state in coordinator._write_states.items()
                 },
+                "cached_unknown_device_messages": {
+                    device_id: len(messages)
+                    for device_id, messages in coordinator._unknown_device_messages.items()
+                },
             },
             TO_REDACT,
         ),
         "device_registry": [
             {
                 "id": device.id,
-                "name": device.name,
+                "name": _hash_value(device.name),
                 "model": device.model,
                 "manufacturer": device.manufacturer,
                 "sw_version": device.sw_version,

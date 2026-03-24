@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -10,6 +11,7 @@ from homeassistant.helpers.update_coordinator import UpdateFailed
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.aprilaire_cloud.api import (
+    AprilaireCloudCommunicationError,
     AprilaireCloudRateLimitError,
     AprilaireCloudWriteError,
 )
@@ -21,11 +23,14 @@ from .common import (
     DEVICE_ID,
     LOCATION_ID,
     PASSWORD,
+    SECOND_DEVICE_ID,
+    SECOND_LOCATION_ID,
     USERNAME,
     build_dehumidifier_status,
     build_device_settings,
     build_hierarchy,
     build_initial_messages,
+    build_two_location_hierarchy,
     build_user,
     deep_copy,
 )
@@ -45,6 +50,11 @@ class FakeClient:
         self.patch_started = asyncio.Event()
         self.patch_release: asyncio.Event | None = None
         self.patch_side_effect: Exception | None = None
+        self.patch_side_effects: list[Exception | None] = []
+        self.rest_failures: dict[tuple[str, str], Exception] = {}
+        self.requested_status_ids: list[str] = []
+        self.requested_dehumidifier_ids: list[str] = []
+        self.requested_settings_ids: list[str] = []
 
     async def async_get_user(self) -> dict:
         """Return a fake account."""
@@ -58,14 +68,23 @@ class FakeClient:
 
     async def async_get_device_status(self, device_id: str) -> dict:
         """Return status."""
+        self.requested_status_ids.append(device_id)
+        if ("device_status", device_id) in self.rest_failures:
+            raise self.rest_failures[("device_status", device_id)]
         return build_initial_messages(device_id)[3]
 
     async def async_get_dehumidifier_status(self, device_id: str) -> dict:
         """Return dehumidifier status."""
+        self.requested_dehumidifier_ids.append(device_id)
+        if ("dehumidifier_status", device_id) in self.rest_failures:
+            raise self.rest_failures[("dehumidifier_status", device_id)]
         return build_dehumidifier_status(device_id)
 
     async def async_get_device_settings(self, device_id: str) -> dict:
         """Return device settings."""
+        self.requested_settings_ids.append(device_id)
+        if ("device_settings", device_id) in self.rest_failures:
+            raise self.rest_failures[("device_settings", device_id)]
         return deep_copy(self.device_settings)
 
     async def async_patch_device_settings(self, device_id: str, payload: dict) -> None:
@@ -74,6 +93,10 @@ class FakeClient:
         self.patch_started.set()
         if self.patch_release is not None:
             await self.patch_release.wait()
+        if self.patch_side_effects:
+            side_effect = self.patch_side_effects.pop(0)
+            if side_effect is not None:
+                raise side_effect
         if self.patch_side_effect is not None:
             raise self.patch_side_effect
         return None
@@ -117,6 +140,19 @@ class FakeWebSocket:
     async def async_stop(self) -> None:
         """Stop the websocket."""
         return None
+
+
+class MultiLocationFakeWebSocket(FakeWebSocket):
+    """Fake websocket that boots the matching device for each location."""
+
+    async def async_wait_for_initial_sync(self, wait_timeout: float) -> bool:
+        """Inject bootstrap data for the matching location."""
+        device_id = DEVICE_ID if self._location_id == LOCATION_ID else SECOND_DEVICE_ID
+        await self._message_callback(self._location_id, build_initial_messages(device_id))
+        await self._state_callback(
+            SocketState(location_id=self._location_id, connected=True, initial_sync_complete=True)
+        )
+        return True
 
 
 async def bootstrap_coordinator(coordinator: AprilaireCloudDataUpdateCoordinator) -> None:
@@ -267,6 +303,36 @@ async def test_single_humidity_write_is_optimistic_and_requires_device_settings_
     )
 
 
+async def test_successful_write_clears_internal_write_state(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """Successful writes should not leave stale write-state bookkeeping behind."""
+    client = FakeClient()
+    client.patch_release = asyncio.Event()
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket", FakeWebSocket
+    )
+
+    coordinator = AprilaireCloudDataUpdateCoordinator(
+        hass, config_entry=config_entry, client=client
+    )
+    await bootstrap_coordinator(coordinator)
+
+    task = asyncio.create_task(coordinator.async_set_target_humidity(DEVICE_ID, 55))
+    await asyncio.wait_for(client.patch_started.wait(), timeout=1)
+
+    client.patch_release.set()
+    await hass.async_block_till_done()
+    await coordinator.async_process_messages(LOCATION_ID, [build_device_settings(humidity=55)])
+    await asyncio.wait_for(task, timeout=1)
+    await asyncio.sleep(0)
+
+    assert DEVICE_ID not in coordinator._write_states
+
+
 async def test_rapid_humidity_writes_are_last_write_wins(
     hass,
     enable_custom_integrations,
@@ -324,6 +390,225 @@ async def test_rapid_humidity_writes_are_last_write_wins(
             "humiditySetpoint"
         ]
         == 50
+    )
+
+
+async def test_failed_older_write_reverts_only_its_own_paths(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """A failed older write should not clear a newer unrelated optimistic change."""
+    client = FakeClient()
+    client.patch_release = asyncio.Event()
+    client.patch_side_effects = [AprilaireCloudCommunicationError("write failed"), None]
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket", FakeWebSocket
+    )
+
+    coordinator = AprilaireCloudDataUpdateCoordinator(
+        hass, config_entry=config_entry, client=client
+    )
+    await bootstrap_coordinator(coordinator)
+
+    first = asyncio.create_task(coordinator.async_set_target_humidity(DEVICE_ID, 55))
+    await asyncio.wait_for(client.patch_started.wait(), timeout=1)
+
+    second = asyncio.create_task(coordinator.async_set_alert_limit(DEVICE_ID, "highHum", 70))
+    await asyncio.sleep(0)
+
+    assert (
+        coordinator.data.devices[DEVICE_ID].effective_device_settings["dehumidifier"][
+            "humiditySetpoint"
+        ]
+        == 55
+    )
+    assert (
+        coordinator.data.devices[DEVICE_ID].effective_device_settings["dehumidifier"][
+            "alertLimits"
+        ]["highHum"]
+        == 70
+    )
+
+    client.patch_release.set()
+    with pytest.raises(AprilaireCloudCommunicationError):
+        await first
+
+    settings = build_device_settings(humidity=52)
+    settings["dehumidifier"]["alertLimits"]["highHum"] = 70
+    await coordinator.async_process_messages(LOCATION_ID, [settings])
+    await asyncio.wait_for(second, timeout=1)
+
+    assert (
+        coordinator.data.devices[DEVICE_ID].effective_device_settings["dehumidifier"][
+            "humiditySetpoint"
+        ]
+        == 52
+    )
+    assert (
+        coordinator.data.devices[DEVICE_ID].effective_device_settings["dehumidifier"][
+            "alertLimits"
+        ]["highHum"]
+        == 70
+    )
+
+
+async def test_partial_device_settings_confirmation_clears_only_matching_pending_paths(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """Partial DeviceSettings payloads should preserve unrelated confirmed settings."""
+    client = FakeClient()
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket", FakeWebSocket
+    )
+
+    coordinator = AprilaireCloudDataUpdateCoordinator(
+        hass, config_entry=config_entry, client=client
+    )
+    await bootstrap_coordinator(coordinator)
+
+    device = coordinator.data.devices[DEVICE_ID]
+    coordinator._devices[DEVICE_ID] = replace(
+        device,
+        pending_device_settings={
+            "dehumidifier": {"humiditySetpoint": 60, "alertLimits": {"highHum": 70}}
+        },
+    )
+    coordinator._sync_write_state(DEVICE_ID, confirmed_settings=None)
+
+    await coordinator.async_process_messages(
+        LOCATION_ID,
+        [
+            {
+                "_type": "DeviceSettings",
+                "deviceId": DEVICE_ID,
+                "dehumidifier": {"humiditySetpoint": 60},
+            }
+        ],
+    )
+
+    assert coordinator.data.devices[DEVICE_ID].pending_device_settings == {
+        "dehumidifier": {"alertLimits": {"highHum": 70}}
+    }
+    assert (
+        coordinator.data.devices[DEVICE_ID].device_settings["dehumidifier"]["alertLimits"][
+            "highHum"
+        ]
+        == 65
+    )
+
+
+async def test_fallback_refresh_only_targets_devices_in_unhealthy_locations(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """REST fallback should only refresh devices whose location socket is unhealthy."""
+    client = FakeClient()
+    client._hierarchy = build_two_location_hierarchy()
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket",
+        MultiLocationFakeWebSocket,
+    )
+
+    coordinator = AprilaireCloudDataUpdateCoordinator(
+        hass, config_entry=config_entry, client=client
+    )
+    await bootstrap_coordinator(coordinator)
+
+    client.requested_status_ids.clear()
+    client.requested_dehumidifier_ids.clear()
+    client.requested_settings_ids.clear()
+
+    await coordinator.async_socket_state_changed(
+        SocketState(
+            location_id=SECOND_LOCATION_ID,
+            connected=False,
+            initial_sync_complete=False,
+        )
+    )
+
+    await coordinator._async_update_data()
+
+    assert client.requested_status_ids == [SECOND_DEVICE_ID]
+    assert client.requested_dehumidifier_ids == [SECOND_DEVICE_ID]
+    assert client.requested_settings_ids == [SECOND_DEVICE_ID]
+
+
+async def test_partial_rest_refresh_failure_keeps_successful_devices_updated(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """A failed device refresh should not prevent sibling devices from updating."""
+    client = FakeClient()
+    client._hierarchy = build_hierarchy(include_second_device=True)
+    client.rest_failures[("device_status", SECOND_DEVICE_ID)] = AprilaireCloudCommunicationError(
+        "status unavailable"
+    )
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket",
+        MultiLocationFakeWebSocket,
+    )
+
+    coordinator = AprilaireCloudDataUpdateCoordinator(
+        hass, config_entry=config_entry, client=client
+    )
+    await bootstrap_coordinator(coordinator)
+
+    await coordinator.async_socket_state_changed(
+        SocketState(
+            location_id=LOCATION_ID,
+            connected=False,
+            initial_sync_complete=False,
+        )
+    )
+
+    await coordinator._async_update_data()
+
+    assert DEVICE_ID in client.requested_status_ids
+    assert SECOND_DEVICE_ID in client.requested_status_ids
+    assert coordinator.data.devices[DEVICE_ID].device_settings["dehumidifier"]["humiditySetpoint"] == 52
+
+
+async def test_unknown_device_messages_are_replayed_after_discovery(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """Messages for unknown devices should be replayed after a hierarchy refresh discovers them."""
+    client = FakeClient()
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket", FakeWebSocket
+    )
+
+    coordinator = AprilaireCloudDataUpdateCoordinator(
+        hass, config_entry=config_entry, client=client
+    )
+    await bootstrap_coordinator(coordinator)
+
+    await coordinator.async_process_messages(
+        LOCATION_ID,
+        build_initial_messages(SECOND_DEVICE_ID),
+    )
+
+    assert SECOND_DEVICE_ID in coordinator._unknown_device_messages
+
+    coordinator._apply_hierarchy(build_hierarchy(include_second_device=True))
+    coordinator._publish_snapshot()
+
+    assert SECOND_DEVICE_ID in coordinator.data.devices
+    assert (
+        coordinator.data.devices[SECOND_DEVICE_ID]
+        .device_settings["dehumidifier"]["humiditySetpoint"]
+        == 52
     )
 
 

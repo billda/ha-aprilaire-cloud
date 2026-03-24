@@ -17,6 +17,7 @@ from .api import (
 )
 from .const import (
     LOGGER,
+    WEBSOCKET_INITIAL_IDLE_TIMEOUT,
     WEBSOCKET_INITIAL_SYNC_TIMEOUT,
     WEBSOCKET_PING_INITIAL_DELAY_SECONDS,
     WEBSOCKET_PING_INTERVAL_SECONDS,
@@ -29,6 +30,95 @@ from .models import SocketState
 
 MessageCallback = Callable[[str, list[dict[str, Any]]], Awaitable[None]]
 StateCallback = Callable[[SocketState], Awaitable[None]]
+
+
+class AprilaireWebSocketProtocolError(AprilaireCloudCommunicationError):
+    """Raised when the websocket protocol is not understood."""
+
+
+def decode_websocket_text_frame(raw_text: str) -> list[dict[str, Any]] | None:
+    """Decode a websocket text frame into protocol messages."""
+    raw_text = raw_text.strip()
+    if not raw_text or raw_text in {"pong", '"pong"', "ok", '"ok"'}:
+        return None
+
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError as err:
+        raise AprilaireWebSocketProtocolError("Invalid websocket JSON payload") from err
+
+    if isinstance(data, dict) and data.get("message") in {"Forbidden", "Subscribed"}:
+        return [data]
+
+    messages = data if isinstance(data, list) else [data]
+    valid_messages = [item for item in messages if isinstance(item, dict)]
+    return valid_messages or None
+
+
+async def async_collect_location_messages(
+    *,
+    client: AprilaireCloudApiClient,
+    session: ClientSession,
+    location_id: str,
+    initial_timeout: float = WEBSOCKET_INITIAL_SYNC_TIMEOUT,
+    idle_timeout: float = WEBSOCKET_INITIAL_IDLE_TIMEOUT,
+) -> list[dict[str, Any]]:
+    """Collect the initial websocket message burst for a location."""
+    token = await client.async_get_id_token()
+    messages: list[dict[str, Any]] = []
+    loop = asyncio.get_running_loop()
+    overall_deadline = loop.time() + initial_timeout
+    settle_deadline: float | None = None
+
+    async with session.ws_connect(
+        WEBSOCKET_URL,
+        heartbeat=None,
+        autoping=False,
+        receive_timeout=None,
+    ) as ws:
+        await ws.send_json(
+            {"action": "subscribe", "message": {"token": token, "locationId": location_id}}
+        )
+
+        while True:
+            now = loop.time()
+            timeout = max(0.0, overall_deadline - now)
+            if settle_deadline is not None:
+                timeout = min(timeout, max(0.0, settle_deadline - now))
+            if timeout <= 0:
+                break
+
+            try:
+                message = await ws.receive(timeout=timeout)
+            except TimeoutError:
+                break
+
+            if message.type is WSMsgType.TEXT:
+                decoded = decode_websocket_text_frame(message.data)
+                if decoded is None:
+                    continue
+                if len(decoded) == 1 and decoded[0].get("message") == "Forbidden":
+                    token = await client.async_get_id_token(force_refresh=True)
+                    await ws.send_json(
+                        {
+                            "action": "subscribe",
+                            "message": {"token": token, "locationId": location_id},
+                        }
+                    )
+                    continue
+                if len(decoded) == 1 and decoded[0].get("message") == "Subscribed":
+                    continue
+                messages.extend(decoded)
+                settle_deadline = loop.time() + idle_timeout
+                continue
+
+            if message.type in {WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED}:
+                break
+
+            if message.type is WSMsgType.ERROR:
+                raise AprilaireCloudCommunicationError(str(ws.exception()))
+
+    return messages
 
 
 class AprilaireLocationWebSocket:
@@ -175,8 +265,10 @@ class AprilaireLocationWebSocket:
                 self._pong_event.set()
                 return
 
-            data = json.loads(raw_text)
-            if isinstance(data, dict) and data.get("message") == "Forbidden":
+            decoded = decode_websocket_text_frame(raw_text)
+            if decoded is None:
+                return
+            if len(decoded) == 1 and decoded[0].get("message") == "Forbidden":
                 LOGGER.debug(
                     "AprilAire websocket for location %s requested re-subscribe",
                     self._location_id,
@@ -184,12 +276,11 @@ class AprilaireLocationWebSocket:
                 token = await self._client.async_get_id_token(force_refresh=True)
                 await self._async_send_subscribe(ws, token)
                 return
+            if len(decoded) == 1 and decoded[0].get("message") == "Subscribed":
+                return
 
-            messages = data if isinstance(data, list) else [data]
-            valid_messages = [item for item in messages if isinstance(item, dict)]
-            if valid_messages:
-                await self._message_callback(self._location_id, valid_messages)
-                await self._async_mark_healthy()
+            await self._message_callback(self._location_id, decoded)
+            await self._async_mark_healthy()
             return
 
         if message.type in {WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED}:

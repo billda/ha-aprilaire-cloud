@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import voluptuous as vol
@@ -14,7 +15,29 @@ from .api import (
     AprilaireCloudAuthenticationError,
     AprilaireCloudCommunicationError,
 )
-from .const import CONF_ACCOUNT_EMAIL, CONF_ACCOUNT_USER_ID, DOMAIN
+from .const import (
+    CONF_ACCOUNT_EMAIL,
+    CONF_ACCOUNT_USER_ID,
+    CONF_ENABLE_EXTRA_DIAGNOSTICS,
+    CONF_FALLBACK_REFRESH_MINUTES,
+    CONF_SAFETY_REFRESH_MINUTES,
+    DEFAULT_ENABLE_EXTRA_DIAGNOSTICS,
+    DEFAULT_FALLBACK_REFRESH_MINUTES,
+    DEFAULT_SAFETY_REFRESH_MINUTES,
+    DOMAIN,
+    MAX_FALLBACK_REFRESH_MINUTES,
+    MAX_SAFETY_REFRESH_MINUTES,
+    MIN_FALLBACK_REFRESH_MINUTES,
+    MIN_SAFETY_REFRESH_MINUTES,
+)
+from .profiles import SupportedDeviceSummary, summarize_supported_devices
+from .state import (
+    apply_confirmed_device_settings,
+    apply_device_message,
+    apply_hierarchy,
+    evaluate_device_support,
+)
+from .websocket import async_collect_location_messages
 
 STEP_USER_SCHEMA = vol.Schema(
     {
@@ -28,6 +51,13 @@ class AprilaireCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle the AprilAire Cloud config flow."""
 
     VERSION = 1
+
+    @staticmethod
+    def async_get_options_flow(
+        config_entry: config_entries.ConfigEntry,
+    ) -> config_entries.OptionsFlow:
+        """Return the options flow handler."""
+        return AprilaireCloudOptionsFlow(config_entry)
 
     async def async_step_user(
         self,
@@ -102,7 +132,14 @@ class AprilaireCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
         await client.async_authenticate()
         user = await client.async_get_user()
-        await client.async_get_hierarchy()
+        hierarchy = await client.async_get_hierarchy()
+        summary, classification_complete = await self._async_get_supported_device_summary(
+            client, hierarchy
+        )
+        if summary.total_devices == 0 or (
+            classification_complete and summary.supported_devices == 0
+        ):
+            raise AprilaireCloudNoSupportedDevicesError
         return {
             CONF_ACCOUNT_USER_ID: str(user["userId"]),
             CONF_ACCOUNT_EMAIL: user.get("email", user_input[CONF_USERNAME]),
@@ -119,6 +156,8 @@ class AprilaireCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return None, {"base": "invalid_auth"}
         except AprilaireCloudCommunicationError:
             return None, {"base": "cannot_connect"}
+        except AprilaireCloudNoSupportedDevicesError:
+            return None, {"base": "no_supported_devices"}
         except Exception:
             return None, {"base": "unknown"}
 
@@ -162,3 +201,118 @@ class AprilaireCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
         await self.hass.config_entries.async_reload(entry.entry_id)
         return self.async_abort(reason=success_abort_reason)
+
+    async def _async_get_supported_device_summary(
+        self,
+        client: AprilaireCloudApiClient,
+        hierarchy: dict[str, Any],
+    ) -> tuple[SupportedDeviceSummary, bool]:
+        """Classify supported devices for the account."""
+        _, devices, _ = apply_hierarchy(hierarchy, {})
+        if not devices:
+            return SupportedDeviceSummary(), True
+
+        device_ids = list(devices)
+        settings_results = await asyncio.gather(
+            *(client.async_get_device_settings(device_id) for device_id in device_ids),
+            return_exceptions=True,
+        )
+        for device_id, settings in zip(device_ids, settings_results, strict=True):
+            if isinstance(settings, Exception):
+                continue
+            devices[device_id] = evaluate_device_support(
+                apply_confirmed_device_settings(devices[device_id], settings)
+            )
+
+        location_ids = list({record.hierarchy.location_id for record in devices.values()})
+        location_results = await asyncio.gather(
+            *(
+                async_collect_location_messages(
+                    client=client,
+                    session=client.session,
+                    location_id=location_id,
+                )
+                for location_id in location_ids
+            ),
+            return_exceptions=True,
+        )
+        websocket_complete = True
+        for messages in location_results:
+            if isinstance(messages, Exception):
+                websocket_complete = False
+                continue
+            for message in messages:
+                device_id = message.get("deviceId")
+                if device_id is None or device_id not in devices:
+                    continue
+                devices[device_id] = evaluate_device_support(
+                    apply_device_message(devices[device_id], message)
+                )
+
+        summary = summarize_supported_devices(list(devices.values()))
+        classification_complete = (
+            websocket_complete and summary.pending_classification_devices == 0
+        )
+        return summary, classification_complete
+
+
+class AprilaireCloudNoSupportedDevicesError(Exception):
+    """Raised when an account has no supported AprilAire devices."""
+
+
+class AprilaireCloudOptionsFlow(config_entries.OptionsFlowWithReload):
+    """Options flow for AprilAire Cloud."""
+
+    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
+        """Initialize the options flow."""
+        self._config_entry = config_entry
+
+    async def async_step_init(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> config_entries.ConfigFlowResult:
+        """Manage integration options."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        options = self._config_entry.options
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_SAFETY_REFRESH_MINUTES,
+                        default=options.get(
+                            CONF_SAFETY_REFRESH_MINUTES,
+                            DEFAULT_SAFETY_REFRESH_MINUTES,
+                        ),
+                    ): vol.All(
+                        vol.Coerce(int),
+                        vol.Range(
+                            min=MIN_SAFETY_REFRESH_MINUTES,
+                            max=MAX_SAFETY_REFRESH_MINUTES,
+                        ),
+                    ),
+                    vol.Required(
+                        CONF_FALLBACK_REFRESH_MINUTES,
+                        default=options.get(
+                            CONF_FALLBACK_REFRESH_MINUTES,
+                            DEFAULT_FALLBACK_REFRESH_MINUTES,
+                        ),
+                    ): vol.All(
+                        vol.Coerce(int),
+                        vol.Range(
+                            min=MIN_FALLBACK_REFRESH_MINUTES,
+                            max=MAX_FALLBACK_REFRESH_MINUTES,
+                        ),
+                    ),
+                    vol.Required(
+                        CONF_ENABLE_EXTRA_DIAGNOSTICS,
+                        default=options.get(
+                            CONF_ENABLE_EXTRA_DIAGNOSTICS,
+                            DEFAULT_ENABLE_EXTRA_DIAGNOSTICS,
+                        ),
+                    ): bool,
+                }
+            ),
+        )

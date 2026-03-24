@@ -15,95 +15,87 @@ from homeassistant.helpers.entity import EntityCategory
 from .coordinator import AprilaireCloudDataUpdateCoordinator
 from .data import AprilaireCloudConfigEntry
 from .entity import AprilaireCloudEntity, setup_dynamic_platform_entities
-from .models import DeviceRecord
+from .profiles import NormalizedDehumidifierState, get_profile
 
 
 @dataclass(frozen=True, kw_only=True)
 class AprilaireBinarySensorDescription(BinarySensorEntityDescription):
     """Description for an AprilAire binary sensor."""
 
-    value_fn: Callable[[DeviceRecord], bool | None]
-    exists_fn: Callable[[DeviceRecord], bool] = lambda device: True
+    value_fn: Callable[[NormalizedDehumidifierState], bool | None]
     enabled_default: bool = True
 
 
-BINARY_SENSORS: tuple[AprilaireBinarySensorDescription, ...] = (
-    AprilaireBinarySensorDescription(
+BINARY_SENSORS: dict[str, AprilaireBinarySensorDescription] = {
+    "filter_service": AprilaireBinarySensorDescription(
         key="filter_service",
         translation_key="filter_service",
         device_class=BinarySensorDeviceClass.PROBLEM,
-        value_fn=lambda device: device.dehumidifier_status.get("filterService", {}).get(
-            "needsService"
-        ),
-        exists_fn=lambda device: (
-            "needsService" in device.dehumidifier_status.get("filterService", {})
-        ),
+        value_fn=lambda normalized: normalized.filter_needs_service,
     ),
-    AprilaireBinarySensorDescription(
+    "alert_high_humidity": AprilaireBinarySensorDescription(
         key="alert_high_humidity",
         translation_key="alert_high_humidity",
         device_class=BinarySensorDeviceClass.PROBLEM,
-        value_fn=lambda device: device.dehumidifier_status.get("alerts", {}).get("highHum"),
-        exists_fn=lambda device: "highHum" in device.dehumidifier_status.get("alerts", {}),
+        value_fn=lambda normalized: normalized.alert_high_humidity,
     ),
-    AprilaireBinarySensorDescription(
+    "alert_low_humidity": AprilaireBinarySensorDescription(
         key="alert_low_humidity",
         translation_key="alert_low_humidity",
         device_class=BinarySensorDeviceClass.PROBLEM,
-        value_fn=lambda device: device.dehumidifier_status.get("alerts", {}).get("lowHum"),
-        exists_fn=lambda device: "lowHum" in device.dehumidifier_status.get("alerts", {}),
+        value_fn=lambda normalized: normalized.alert_low_humidity,
     ),
-    AprilaireBinarySensorDescription(
+    "alert_high_temperature": AprilaireBinarySensorDescription(
         key="alert_high_temperature",
         translation_key="alert_high_temperature",
         device_class=BinarySensorDeviceClass.PROBLEM,
-        value_fn=lambda device: device.dehumidifier_status.get("alerts", {}).get("highTemp"),
-        exists_fn=lambda device: "highTemp" in device.dehumidifier_status.get("alerts", {}),
+        value_fn=lambda normalized: normalized.alert_high_temperature,
     ),
-    AprilaireBinarySensorDescription(
+    "alert_low_temperature": AprilaireBinarySensorDescription(
         key="alert_low_temperature",
         translation_key="alert_low_temperature",
         device_class=BinarySensorDeviceClass.PROBLEM,
-        value_fn=lambda device: device.dehumidifier_status.get("alerts", {}).get("lowTemp"),
-        exists_fn=lambda device: "lowTemp" in device.dehumidifier_status.get("alerts", {}),
+        value_fn=lambda normalized: normalized.alert_low_temperature,
     ),
-    AprilaireBinarySensorDescription(
+    "compressor": AprilaireBinarySensorDescription(
         key="compressor",
         translation_key="compressor",
         device_class=BinarySensorDeviceClass.RUNNING,
         entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda device: device.dehumidifier_status.get("isCompOn"),
-        exists_fn=lambda device: "isCompOn" in device.dehumidifier_status,
+        value_fn=lambda normalized: normalized.compressor_on,
         enabled_default=False,
     ),
-    AprilaireBinarySensorDescription(
+    "dehumidifier_fan": AprilaireBinarySensorDescription(
         key="dehumidifier_fan",
         translation_key="dehumidifier_fan",
         device_class=BinarySensorDeviceClass.RUNNING,
         entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda device: device.dehumidifier_status.get("isDehumFanOn"),
-        exists_fn=lambda device: "isDehumFanOn" in device.dehumidifier_status,
+        value_fn=lambda normalized: normalized.dehumidifier_fan_on,
         enabled_default=False,
     ),
-    AprilaireBinarySensorDescription(
+    "hvac_fan": AprilaireBinarySensorDescription(
         key="hvac_fan",
         translation_key="hvac_fan",
         device_class=BinarySensorDeviceClass.RUNNING,
         entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda device: device.dehumidifier_status.get("isHvacFanOn"),
-        exists_fn=lambda device: "isHvacFanOn" in device.dehumidifier_status,
+        value_fn=lambda normalized: normalized.hvac_fan_on,
         enabled_default=False,
     ),
-)
+}
 
 
 async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry, async_add_entities) -> None:
     """Set up AprilAire binary sensors."""
     coordinator = entry.runtime_data.coordinator
 
-    def _entities_for_device(device_id: str, device: DeviceRecord):
-        for description in BINARY_SENSORS:
-            if description.exists_fn(device):
+    def _entities_for_device(device_id: str, device):
+        profile = get_profile(coordinator.data.devices[device_id].profile_key)
+        if profile is None:
+            return
+        entity_set = profile.entity_descriptions(coordinator.data.devices[device_id])
+        for key in entity_set.binary_sensor_keys:
+            description = BINARY_SENSORS.get(key)
+            if description is not None:
                 yield AprilaireBinarySensorEntity(coordinator, device_id, description)
 
     setup_dynamic_platform_entities(entry, async_add_entities, _entities_for_device)
@@ -125,12 +117,15 @@ class AprilaireBinarySensorEntity(AprilaireCloudEntity, BinarySensorEntity):
         self.entity_description = description
         self._attr_translation_key = description.translation_key
         self._attr_entity_category = description.entity_category
-        self._attr_entity_registry_enabled_default = description.enabled_default
+        self._attr_entity_registry_enabled_default = description.enabled_default or (
+            description.entity_category is EntityCategory.DIAGNOSTIC
+            and coordinator.extra_diagnostics_enabled
+        )
 
     @property
     def is_on(self) -> bool | None:
         """Return whether the binary sensor is on."""
-        device = self.device
-        if device is None:
+        normalized = self.normalized_device
+        if normalized is None:
             return None
-        return self.entity_description.value_fn(device)
+        return self.entity_description.value_fn(normalized)

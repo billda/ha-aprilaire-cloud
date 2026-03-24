@@ -52,13 +52,15 @@ async def test_humidifier_action_and_sensor_values(
     current_humidity_sensor = AprilaireStaticSensorEntity(
         coordinator,
         coordinator.data.supported_device_ids[0],
-        STATIC_SENSORS[0],
+        STATIC_SENSORS["current_humidity"],
     )
 
     assert humidifier.is_on is True
     assert humidifier.target_humidity == 52
     assert humidifier.action is HumidifierAction.IDLE
     assert current_humidity_sensor.native_value == 49
+    assert "location" not in humidifier.extra_state_attributes
+    assert humidifier.extra_state_attributes["equipment_status"] == "inactive"
 
 
 async def test_entities_read_effective_pending_settings(
@@ -103,6 +105,7 @@ async def test_entities_read_effective_pending_settings(
     assert humidifier.target_humidity == 60
     assert humidifier.is_on is False
     assert alert_limit.native_value == 70
+    assert alert_limit.entity_category.value == "config"
 
 
 def test_typed_write_errors_map_to_home_assistant_errors() -> None:
