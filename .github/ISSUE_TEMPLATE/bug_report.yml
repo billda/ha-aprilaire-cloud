@@ -1,0 +1,66 @@
+name: Bug report
+description: Report a reproducible problem with the AprilAire Cloud integration
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug.
+
+        Please include as much concrete detail as you can, especially your AprilAire model, Home Assistant version, and diagnostics.
+  - type: input
+    id: model
+    attributes:
+      label: AprilAire model
+      description: For example, E100W
+      placeholder: E100W
+    validations:
+      required: true
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware version
+      description: If visible in Home Assistant or the AprilAire app
+  - type: input
+    id: ha_version
+    attributes:
+      label: Home Assistant version
+      placeholder: 2026.3.3
+    validations:
+      required: true
+  - type: input
+    id: hacs_version
+    attributes:
+      label: HACS version
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the actual behavior you saw
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Add the integration
+        2. Change target humidity
+        3. Watch the entity state
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics and logs
+      description: Attach or paste diagnostics and any relevant logs. Please redact secrets before posting logs manually.
+    validations:
+      required: true

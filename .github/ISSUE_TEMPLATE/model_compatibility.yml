@@ -1,0 +1,60 @@
+name: Model compatibility report
+description: Report how the integration behaves with a specific AprilAire dehumidifier model
+title: "[Compatibility]: "
+labels:
+  - device support
+  - needs tester
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Compatibility reports are especially helpful right now.
+
+        Even if a device only partly works, please report it.
+  - type: input
+    id: model
+    attributes:
+      label: AprilAire model
+      placeholder: E100W
+    validations:
+      required: true
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware version
+  - type: dropdown
+    id: discovery
+    attributes:
+      label: Was the device discovered?
+      options:
+        - Yes
+        - No
+        - Partially
+    validations:
+      required: true
+  - type: textarea
+    id: working_features
+    attributes:
+      label: What works?
+      placeholder: |
+        - Login succeeds
+        - Device shows up
+        - Humidity sensors update
+        - Target humidity changes work
+    validations:
+      required: true
+  - type: textarea
+    id: broken_features
+    attributes:
+      label: What does not work?
+      placeholder: |
+        - Device is skipped
+        - On/off control fails
+        - State is stale
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics or observations
+      description: Include diagnostics, logs, or anything unusual you noticed
