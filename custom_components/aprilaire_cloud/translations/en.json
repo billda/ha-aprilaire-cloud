@@ -1,0 +1,104 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect AprilAire Cloud",
+        "data": {
+          "username": "Email",
+          "password": "Password"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reconnect AprilAire Cloud",
+        "data": {
+          "username": "Email",
+          "password": "Password"
+        }
+      },
+      "reconfigure": {
+        "title": "Update AprilAire Cloud credentials",
+        "data": {
+          "username": "Email",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to AprilAire Cloud.",
+      "invalid_auth": "Invalid AprilAire Cloud credentials.",
+      "unknown": "Unexpected error.",
+      "wrong_account": "These credentials belong to a different AprilAire account."
+    },
+    "abort": {
+      "already_configured": "This AprilAire account is already configured.",
+      "reauth_successful": "Reauthentication successful.",
+      "reconfigure_successful": "Configuration updated."
+    }
+  },
+  "entity": {
+    "humidifier": {
+      "dehumidifier": {
+        "name": "Dehumidifier"
+      }
+    },
+    "sensor": {
+      "current_humidity": {
+        "name": "Current humidity"
+      },
+      "current_temperature": {
+        "name": "Current temperature"
+      },
+      "filter_life": {
+        "name": "Filter life"
+      },
+      "fan_runtime": {
+        "name": "Fan runtime"
+      },
+      "wifi_signal": {
+        "name": "Wi-Fi signal"
+      },
+      "equipment_status": {
+        "name": "Equipment status"
+      }
+    },
+    "binary_sensor": {
+      "filter_service": {
+        "name": "Filter service"
+      },
+      "alert_high_humidity": {
+        "name": "High humidity alert"
+      },
+      "alert_low_humidity": {
+        "name": "Low humidity alert"
+      },
+      "alert_high_temperature": {
+        "name": "High temperature alert"
+      },
+      "alert_low_temperature": {
+        "name": "Low temperature alert"
+      },
+      "compressor": {
+        "name": "Compressor"
+      },
+      "dehumidifier_fan": {
+        "name": "Dehumidifier fan"
+      },
+      "hvac_fan": {
+        "name": "HVAC fan"
+      }
+    },
+    "number": {
+      "alert_limit_high_humidity": {
+        "name": "High humidity threshold"
+      }
+    }
+  },
+  "exceptions": {
+    "rate_limited": {
+      "message": "AprilAire Cloud is throttling requests. Retry in {seconds} seconds."
+    },
+    "write_failed": {
+      "message": "The requested AprilAire change could not be applied."
+    }
+  }
+}
