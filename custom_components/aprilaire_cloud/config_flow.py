@@ -25,6 +25,7 @@ from .const import (
     DEFAULT_FALLBACK_REFRESH_MINUTES,
     DEFAULT_SAFETY_REFRESH_MINUTES,
     DOMAIN,
+    LOGGER,
     MAX_FALLBACK_REFRESH_MINUTES,
     MAX_SAFETY_REFRESH_MINUTES,
     MIN_FALLBACK_REFRESH_MINUTES,
@@ -218,7 +219,7 @@ class AprilaireCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return_exceptions=True,
         )
         for device_id, settings in zip(device_ids, settings_results, strict=True):
-            if isinstance(settings, Exception):
+            if isinstance(settings, BaseException):
                 continue
             devices[device_id] = evaluate_device_support(
                 apply_confirmed_device_settings(devices[device_id], settings)
@@ -238,18 +239,24 @@ class AprilaireCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
         websocket_complete = True
         for messages in location_results:
-            if isinstance(messages, Exception):
+            if isinstance(messages, BaseException):
                 websocket_complete = False
                 continue
             for message in messages:
-                device_id = message.get("deviceId")
-                if device_id is None or device_id not in devices:
+                msg_device_id: str | None = message.get("deviceId")
+                if msg_device_id is None or msg_device_id not in devices:
                     continue
-                devices[device_id] = evaluate_device_support(
-                    apply_device_message(devices[device_id], message)
+                devices[msg_device_id] = evaluate_device_support(
+                    apply_device_message(devices[msg_device_id], message)
                 )
 
         summary = summarize_supported_devices(list(devices.values()))
+        LOGGER.debug(
+            "Device classification: %d supported, %d unsupported, %d pending",
+            summary.supported_devices,
+            summary.unsupported_devices,
+            summary.pending_classification_devices,
+        )
         classification_complete = (
             websocket_complete and summary.pending_classification_devices == 0
         )

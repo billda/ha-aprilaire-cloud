@@ -48,17 +48,23 @@ async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry) -> bool:
 
 async def async_unload_entry(hass, entry: AprilaireCloudConfigEntry) -> bool:
     """Unload a config entry."""
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    unload_ok: bool = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
         await entry.runtime_data.coordinator.async_shutdown()
     return unload_ok
+
 
 async def async_remove_config_entry_device(
     hass, entry: AprilaireCloudConfigEntry, device_entry
 ) -> bool:
     """Allow removal of stale devices only."""
-    current_device_ids = set(entry.runtime_data.coordinator.data.devices)
+    coordinator = entry.runtime_data.coordinator
+    current_device_ids = set(coordinator.data.devices)
+    current_location_ids = {
+        f"location_{location_id}" for location_id in coordinator.data.locations
+    }
+    live_identifiers = current_device_ids | current_location_ids
     return all(
-        identifier[0] != DOMAIN or identifier[1] not in current_device_ids
+        identifier[0] != DOMAIN or identifier[1] not in live_identifiers
         for identifier in device_entry.identifiers
     )

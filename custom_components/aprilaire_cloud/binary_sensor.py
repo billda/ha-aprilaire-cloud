@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
@@ -11,10 +12,13 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntityDescription,
 )
 from homeassistant.helpers.entity import EntityCategory
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from .const import ATTRIBUTION, DOMAIN, MANUFACTURER
 from .coordinator import AprilaireCloudDataUpdateCoordinator
 from .data import AprilaireCloudConfigEntry
 from .entity import AprilaireCloudEntity, setup_dynamic_platform_entities
+from .models import SocketState
 from .profiles import NormalizedDehumidifierState, get_profile
 
 
@@ -100,6 +104,30 @@ async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry, async_add_en
 
     setup_dynamic_platform_entities(entry, async_add_entities, _entities_for_device)
 
+    active_ws_entities: dict[str, AprilaireWebSocketStatusEntity] = {}
+
+    def _sync_ws_entities() -> None:
+        wanted = set(coordinator.data.locations)
+        current = set(active_ws_entities)
+
+        removed = current - wanted
+        for location_id in removed:
+            entity = active_ws_entities.pop(location_id)
+            if entity.hass is not None:
+                coordinator.hass.async_create_task(entity.async_remove(force_remove=False))
+
+        new_entities = []
+        for location_id in wanted - current:
+            entity = AprilaireWebSocketStatusEntity(coordinator, location_id)
+            active_ws_entities[location_id] = entity
+            new_entities.append(entity)
+
+        if new_entities:
+            async_add_entities(new_entities)
+
+    _sync_ws_entities()
+    entry.async_on_unload(coordinator.async_add_listener(_sync_ws_entities))
+
 
 class AprilaireBinarySensorEntity(AprilaireCloudEntity, BinarySensorEntity):
     """An AprilAire binary sensor."""
@@ -129,3 +157,66 @@ class AprilaireBinarySensorEntity(AprilaireCloudEntity, BinarySensorEntity):
         if normalized is None:
             return None
         return self.entity_description.value_fn(normalized)
+
+
+class AprilaireWebSocketStatusEntity(
+    CoordinatorEntity[AprilaireCloudDataUpdateCoordinator], BinarySensorEntity
+):
+    """Binary sensor for WebSocket connection status per location."""
+
+    _attr_attribution = ATTRIBUTION
+    _attr_has_entity_name = True
+    _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_translation_key = "websocket_connection"
+
+    def __init__(
+        self,
+        coordinator: AprilaireCloudDataUpdateCoordinator,
+        location_id: str,
+    ) -> None:
+        """Initialize the entity."""
+        super().__init__(coordinator)
+        self._location_id = location_id
+        self._attr_unique_id = f"{location_id}_websocket_connection"
+        self._attr_entity_registry_enabled_default = coordinator.extra_diagnostics_enabled
+
+    @property
+    def _socket_state(self) -> SocketState | None:
+        """Return the current socket state for this location."""
+        return self.coordinator.data.socket_states.get(self._location_id)
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return whether the WebSocket is connected and synced."""
+        state = self._socket_state
+        if state is None:
+            return None
+        return state.connected and state.initial_sync_complete
+
+    @property
+    def available(self) -> bool:
+        """Return whether the entity is available."""
+        return super().available and self._socket_state is not None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Expose reconnect and error details."""
+        state = self._socket_state
+        if state is None:
+            return {}
+        return {
+            "reconnect_attempt": state.reconnect_attempt,
+            "last_error": state.last_error,
+        }
+
+    @property
+    def device_info(self):
+        """Return device info linking to the first device in this location."""
+        location = self.coordinator.data.locations.get(self._location_id)
+        name = location.name if location else self._location_id
+        return {
+            "identifiers": {(DOMAIN, f"location_{self._location_id}")},
+            "manufacturer": MANUFACTURER,
+            "name": f"{name} Cloud Connection",
+        }

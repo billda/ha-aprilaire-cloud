@@ -10,6 +10,14 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.redact import async_redact_data
 
+from .const import (
+    CONF_ENABLE_EXTRA_DIAGNOSTICS,
+    CONF_FALLBACK_REFRESH_MINUTES,
+    CONF_SAFETY_REFRESH_MINUTES,
+    DEFAULT_ENABLE_EXTRA_DIAGNOSTICS,
+    DEFAULT_FALLBACK_REFRESH_MINUTES,
+    DEFAULT_SAFETY_REFRESH_MINUTES,
+)
 from .data import AprilaireCloudConfigEntry
 
 TO_REDACT = {
@@ -94,13 +102,29 @@ async def async_get_config_entry_diagnostics(
                     }
                     for location_id, state in coordinator.data.socket_states.items()
                 },
-                "write_states": {
-                    device_id: state.summary
-                    for device_id, state in coordinator._write_states.items()
+                "write_states": coordinator.write_state_summaries,
+                "cached_unknown_device_messages": coordinator.unknown_device_message_counts,
+                "last_rest_refresh": (
+                    coordinator.last_rest_refresh_at.isoformat()
+                    if coordinator.last_rest_refresh_at is not None
+                    else None
+                ),
+                "last_websocket_message": {
+                    location_id: ts.isoformat()
+                    for location_id, ts in coordinator.last_websocket_message_at.items()
                 },
-                "cached_unknown_device_messages": {
-                    device_id: len(messages)
-                    for device_id, messages in coordinator._unknown_device_messages.items()
+                "current_refresh_mode": coordinator.current_refresh_mode,
+                "current_refresh_interval_seconds": coordinator.current_refresh_interval_seconds,
+                "config_options": {
+                    "safety_refresh_minutes": entry.options.get(
+                        CONF_SAFETY_REFRESH_MINUTES, DEFAULT_SAFETY_REFRESH_MINUTES
+                    ),
+                    "fallback_refresh_minutes": entry.options.get(
+                        CONF_FALLBACK_REFRESH_MINUTES, DEFAULT_FALLBACK_REFRESH_MINUTES
+                    ),
+                    "enable_extra_diagnostics": entry.options.get(
+                        CONF_ENABLE_EXTRA_DIAGNOSTICS, DEFAULT_ENABLE_EXTRA_DIAGNOSTICS
+                    ),
                 },
             },
             TO_REDACT,

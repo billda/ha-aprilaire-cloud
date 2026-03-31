@@ -18,6 +18,8 @@ jobs:
           pip install -r requirements_test.txt
       - name: Run Ruff
         run: ruff check .
+      - name: Run mypy
+        run: mypy custom_components/aprilaire_cloud
 
   test:
     runs-on: ubuntu-latest

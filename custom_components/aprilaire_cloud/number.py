@@ -16,7 +16,7 @@ from .entity import (
 )
 from .profiles import get_profile
 
-ALERT_LIMIT_DESCRIPTIONS = {
+ALERT_LIMIT_DESCRIPTIONS: dict[str, dict[str, str | float]] = {
     "highHum": {
         "key": "alert_limit_high_humidity",
         "translation_key": "alert_limit_high_humidity",
@@ -55,11 +55,11 @@ class AprilaireAlertLimitNumber(AprilaireCloudEntity, NumberEntity):
         """Initialize the number."""
         self._limit_key = limit_key
         description = ALERT_LIMIT_DESCRIPTIONS[limit_key]
-        self._attr_translation_key = description["translation_key"]
-        self._attr_native_min_value = description["min"]
-        self._attr_native_max_value = description["max"]
+        self._attr_translation_key = str(description["translation_key"])
+        self._attr_native_min_value = float(description["min"])
+        self._attr_native_max_value = float(description["max"])
         self._attr_native_step = 1
-        super().__init__(coordinator, device_id, description["key"])
+        super().__init__(coordinator, device_id, str(description["key"]))
 
     @property
     def native_value(self) -> float | None:

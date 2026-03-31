@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from socket import gaierror
 from typing import Any
 
-from aiohttp import ClientError, ClientResponse, ClientSession
+from aiohttp import ClientError, ClientResponse, ClientSession, ClientTimeout
 from pycognito import Cognito
 
 from .const import (
@@ -173,7 +173,9 @@ class AprilaireCloudApiClient:
                 except Exception as err:
                     LOGGER.debug("Refresh token flow failed, falling back to full login: %s", err)
                 else:
+                    LOGGER.debug("Token refreshed successfully")
                     self._store_tokens(tokens)
+                    assert self._id_token is not None
                     return self._id_token
 
             try:
@@ -229,6 +231,9 @@ class AprilaireCloudApiClient:
             )
         except AprilaireCloudRateLimitError as err:
             if err.retry_after <= SHORT_WRITE_RETRY_THRESHOLD_SECONDS:
+                LOGGER.debug(
+                    "Short rate limit on write (%.1fs), auto-retrying", err.retry_after
+                )
                 await asyncio.sleep(err.retry_after)
                 await self._async_request_json(
                     "PATCH",
@@ -258,6 +263,7 @@ class AprilaireCloudApiClient:
         if self._rate_limited_until is not None:
             remaining = (self._rate_limited_until - datetime.now(tz=UTC)).total_seconds()
             if remaining > 0:
+                LOGGER.debug("Rate limited, %.1fs remaining", remaining)
                 raise AprilaireCloudRateLimitError(remaining)
             self._rate_limited_until = None
 
@@ -273,7 +279,7 @@ class AprilaireCloudApiClient:
                 url,
                 headers=headers,
                 json=payload,
-                timeout=DEFAULT_REQUEST_TIMEOUT,
+                timeout=ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT),
             ) as response:
                 return await self._async_handle_response(
                     response,
@@ -314,10 +320,14 @@ class AprilaireCloudApiClient:
         if response.status == 429:
             retry_after = _sanitize_retry_after(response.headers.get("Retry-After"))
             self._rate_limited_until = datetime.now(tz=UTC) + timedelta(seconds=retry_after)
+            LOGGER.debug("Rate limit hit, retry after %.1fs", retry_after)
             raise AprilaireCloudRateLimitError(retry_after)
 
         if response.status >= 400:
             text = await response.text()
+            LOGGER.warning(
+                "%s %s failed with HTTP %d: %s", method, url, response.status, text[:200]
+            )
             raise AprilaireCloudApiError(
                 f"{method} {url} failed with HTTP {response.status}: {text[:200]}"
             )
@@ -327,6 +337,7 @@ class AprilaireCloudApiClient:
             return {}
 
         try:
-            return json.loads(text)
+            result: dict[str, Any] = json.loads(text)
+            return result
         except json.JSONDecodeError as err:
             raise AprilaireCloudApiError(f"{method} {url} returned invalid JSON") from err

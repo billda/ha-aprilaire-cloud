@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
 from logging import Logger, getLogger
 
 from homeassistant.const import Platform
@@ -42,8 +41,6 @@ WEBSOCKET_RECONNECT_MAX_SECONDS = 30
 UNKNOWN_DEVICE_MESSAGE_TTL_SECONDS = 300
 UNKNOWN_DEVICE_MESSAGE_MAX_PER_DEVICE = 20
 
-DEFAULT_SAFETY_REFRESH_INTERVAL = timedelta(minutes=15)
-DEFAULT_FALLBACK_REFRESH_INTERVAL = timedelta(minutes=2)
 DEFAULT_SAFETY_REFRESH_MINUTES = 15
 DEFAULT_FALLBACK_REFRESH_MINUTES = 2
 MIN_SAFETY_REFRESH_MINUTES = 5
@@ -65,5 +62,6 @@ CONF_FALLBACK_REFRESH_MINUTES = "fallback_refresh_minutes"
 CONF_ENABLE_EXTRA_DIAGNOSTICS = "enable_extra_diagnostics"
 
 ISSUE_UNSUPPORTED_DEVICES = "unsupported_devices"
+ISSUE_NO_SUPPORTED_DEVICES = "no_supported_devices"
 
 ATTRIBUTION = "Data provided by AprilAire Healthy Air"

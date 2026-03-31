@@ -2,110 +2,33 @@
 
 from __future__ import annotations
 
-from typing import ClassVar
+from types import SimpleNamespace
 
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 import custom_components.aprilaire_cloud as integration
-from custom_components.aprilaire_cloud.const import DOMAIN
+from custom_components.aprilaire_cloud.const import (
+    CONF_ENABLE_EXTRA_DIAGNOSTICS,
+    DOMAIN,
+)
 
 from .common import (
     DEVICE_ID,
     LOCATION_ID,
     PASSWORD,
     SECOND_DEVICE_ID,
+    SECOND_LOCATION_ID,
     USERNAME,
+    FakeClient,
+    FakeWebSocket,
+    MultiLocationFakeWebSocket,
     build_hierarchy,
     build_initial_messages,
+    build_two_location_hierarchy,
     build_user,
 )
-
-
-class FakeClient:
-    """Mutable fake API client used for end-to-end setup tests."""
-
-    def __init__(self) -> None:
-        """Initialize the fake client."""
-        self.username = USERNAME
-        self.session = object()
-        self.hierarchy = build_hierarchy()
-
-    async def async_authenticate(self) -> None:
-        """No-op auth."""
-        return None
-
-    async def async_get_user(self) -> dict:
-        """Return the fake account."""
-        return build_user()
-
-    async def async_get_hierarchy(self) -> dict:
-        """Return the current hierarchy."""
-        return self.hierarchy
-
-    async def async_get_device_status(self, device_id: str) -> dict:
-        """Return bootstrap device status."""
-        return build_initial_messages(device_id)[3]
-
-    async def async_get_dehumidifier_status(self, device_id: str) -> dict:
-        """Return bootstrap dehumidifier status."""
-        return build_initial_messages(device_id)[0]
-
-    async def async_get_device_settings(self, device_id: str) -> dict:
-        """Return bootstrap settings."""
-        return build_initial_messages(device_id)[1]
-
-    async def async_patch_device_settings(self, device_id: str, payload: dict) -> None:
-        """Pretend writes succeed."""
-        return None
-
-
-class FakeWebSocket:
-    """Fake websocket that only pushes bootstrap data when asked."""
-
-    instances: ClassVar[dict[str, FakeWebSocket]] = {}
-
-    def __init__(
-        self,
-        *,
-        client,
-        session,
-        location_id,
-        message_callback,
-        state_callback,
-    ) -> None:
-        """Initialize the fake websocket."""
-        self._location_id = location_id
-        self._message_callback = message_callback
-        self._state_callback = state_callback
-        FakeWebSocket.instances[location_id] = self
-
-    async def async_start(self) -> None:
-        """Connect immediately."""
-        from custom_components.aprilaire_cloud.models import SocketState
-
-        await self._state_callback(
-            SocketState(location_id=self._location_id, connected=True, initial_sync_complete=False)
-        )
-
-    async def async_wait_for_initial_sync(self, wait_timeout: float) -> bool:
-        """Push the initial state."""
-        await self.push_messages(build_initial_messages())
-        return True
-
-    async def async_stop(self) -> None:
-        """Stop the websocket."""
-        return None
-
-    async def push_messages(self, messages: list[dict]) -> None:
-        """Push custom websocket messages into the coordinator."""
-        from custom_components.aprilaire_cloud.models import SocketState
-
-        await self._state_callback(
-            SocketState(location_id=self._location_id, connected=True, initial_sync_complete=True)
-        )
-        await self._message_callback(self._location_id, messages)
 
 
 async def test_setup_creates_entities_and_new_devices_surface_automatically(
@@ -143,7 +66,7 @@ async def test_setup_creates_entities_and_new_devices_surface_automatically(
         for identifier in device.identifiers
     )
 
-    client.hierarchy = build_hierarchy(include_second_device=True)
+    client._hierarchy = build_hierarchy(include_second_device=True)
     await entry.runtime_data.coordinator.async_request_refresh()
     await FakeWebSocket.instances[LOCATION_ID].push_messages(
         build_initial_messages(SECOND_DEVICE_ID)
@@ -185,7 +108,7 @@ async def test_removed_devices_can_be_readded_without_reloading(
 
     entity_registry = er.async_get(hass)
 
-    client.hierarchy = build_hierarchy(include_second_device=True)
+    client._hierarchy = build_hierarchy(include_second_device=True)
     await entry.runtime_data.coordinator.async_refresh()
     await FakeWebSocket.instances[LOCATION_ID].push_messages(
         build_initial_messages(SECOND_DEVICE_ID)
@@ -203,14 +126,14 @@ async def test_removed_devices_can_be_readded_without_reloading(
         for entity in er.async_entries_for_config_entry(entity_registry, entry.entry_id)
     )
 
-    client.hierarchy = build_hierarchy()
+    client._hierarchy = build_hierarchy()
     await entry.runtime_data.coordinator.async_refresh()
     await hass.async_block_till_done()
 
     assert SECOND_DEVICE_ID not in entry.runtime_data.coordinator.data.devices
     assert all(hass.states.get(entity_id) is None for entity_id in second_entity_ids)
 
-    client.hierarchy = build_hierarchy(include_second_device=True)
+    client._hierarchy = build_hierarchy(include_second_device=True)
     await entry.runtime_data.coordinator.async_refresh()
     await FakeWebSocket.instances[LOCATION_ID].push_messages(
         build_initial_messages(SECOND_DEVICE_ID)
@@ -220,4 +143,130 @@ async def test_removed_devices_can_be_readded_without_reloading(
     assert any(
         entity.unique_id and entity.unique_id.startswith(f"{SECOND_DEVICE_ID}_")
         for entity in er.async_entries_for_config_entry(entity_registry, entry.entry_id)
+    )
+
+
+async def test_remove_device_guard_blocks_live_location_devices(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+) -> None:
+    """Synthetic location devices should be protected while the location is still active."""
+    client = FakeClient()
+    FakeWebSocket.instances.clear()
+
+    monkeypatch.setattr(
+        integration, "AprilaireCloudApiClient", lambda username, password, session: client
+    )
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket", FakeWebSocket
+    )
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title=USERNAME,
+        unique_id=build_user()["userId"],
+        data={"username": USERNAME, "password": PASSWORD},
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert (
+        await integration.async_remove_config_entry_device(
+            hass,
+            entry,
+            SimpleNamespace(identifiers={(DOMAIN, f"location_{LOCATION_ID}")}),
+        )
+        is False
+    )
+    assert (
+        await integration.async_remove_config_entry_device(
+            hass,
+            entry,
+            SimpleNamespace(identifiers={(DOMAIN, "location_stale-location")}),
+        )
+        is True
+    )
+
+
+async def test_removed_locations_cleanup_and_recreate_websocket_entities(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+) -> None:
+    """Location websocket entities and devices should cleanly remove and re-add."""
+    client = FakeClient()
+    client._hierarchy = build_two_location_hierarchy()
+    FakeWebSocket.instances.clear()
+
+    monkeypatch.setattr(
+        integration, "AprilaireCloudApiClient", lambda username, password, session: client
+    )
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket",
+        MultiLocationFakeWebSocket,
+    )
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title=USERNAME,
+        unique_id=build_user()["userId"],
+        data={"username": USERNAME, "password": PASSWORD},
+        options={CONF_ENABLE_EXTRA_DIAGNOSTICS: True},
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    entity_registry = er.async_get(hass)
+    device_registry = dr.async_get(hass)
+    second_ws_unique_id = f"{SECOND_LOCATION_ID}_websocket_connection"
+    second_ws_entity = next(
+        entity
+        for entity in er.async_entries_for_config_entry(entity_registry, entry.entry_id)
+        if entity.unique_id == second_ws_unique_id
+    )
+
+    assert hass.states.get(second_ws_entity.entity_id) is not None
+    assert any(
+        identifier == (DOMAIN, f"location_{SECOND_LOCATION_ID}")
+        for device in dr.async_entries_for_config_entry(device_registry, entry.entry_id)
+        for identifier in device.identifiers
+    )
+
+    client._hierarchy = build_hierarchy()
+    await entry.runtime_data.coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert SECOND_LOCATION_ID not in entry.runtime_data.coordinator.data.locations
+    assert not any(
+        entity.unique_id == second_ws_unique_id
+        for entity in er.async_entries_for_config_entry(entity_registry, entry.entry_id)
+    )
+    assert not any(
+        identifier == (DOMAIN, f"location_{SECOND_LOCATION_ID}")
+        for device in dr.async_entries_for_config_entry(device_registry, entry.entry_id)
+        for identifier in device.identifiers
+    )
+
+    client._hierarchy = build_two_location_hierarchy()
+    await entry.runtime_data.coordinator.async_refresh()
+    await FakeWebSocket.instances[SECOND_LOCATION_ID].push_messages(
+        build_initial_messages(SECOND_DEVICE_ID)
+    )
+    await hass.async_block_till_done()
+
+    second_ws_entity = next(
+        entity
+        for entity in er.async_entries_for_config_entry(entity_registry, entry.entry_id)
+        if entity.unique_id == second_ws_unique_id
+    )
+    assert hass.states.get(second_ws_entity.entity_id) is not None
+    assert any(
+        identifier == (DOMAIN, f"location_{SECOND_LOCATION_ID}")
+        for device in dr.async_entries_for_config_entry(device_registry, entry.entry_id)
+        for identifier in device.identifiers
     )

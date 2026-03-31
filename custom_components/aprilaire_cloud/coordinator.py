@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterable
 from copy import deepcopy
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from time import monotonic
 from typing import Any
 
@@ -31,6 +31,7 @@ from .const import (
     DEFAULT_FALLBACK_REFRESH_MINUTES,
     DEFAULT_SAFETY_REFRESH_MINUTES,
     DOMAIN,
+    ISSUE_NO_SUPPORTED_DEVICES,
     ISSUE_UNSUPPORTED_DEVICES,
     LOGGER,
     MAX_PARALLEL_REST_REQUESTS,
@@ -96,6 +97,9 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         self._refresh_event_task: asyncio.Task[None] | None = None
         self._write_states: dict[str, DeviceWriteState] = {}
         self._unknown_device_messages: dict[str, list[tuple[float, dict[str, Any]]]] = {}
+        self._last_rest_refresh_at: datetime | None = None
+        self._last_websocket_message_at: dict[str, datetime] = {}
+        self._current_refresh_mode: str = "safety"
 
     async def _async_setup(self) -> None:
         """Perform one-time startup work."""
@@ -124,9 +128,16 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
 
     async def _async_update_data(self) -> AprilaireSnapshot:
         """Perform a slow safety refresh or a bounded REST fallback refresh."""
+        LOGGER.debug(
+            "Starting %s refresh, %d devices tracked",
+            self._current_refresh_mode,
+            len(self._devices),
+        )
         try:
+            old_location_ids = set(self._locations)
             hierarchy = await self.client.async_get_hierarchy()
             removed_ids = self._apply_hierarchy(hierarchy)
+            removed_location_ids = old_location_ids - set(self._locations)
             await self._async_sync_location_websockets()
 
             rest_refresh_ids = self._device_ids_requiring_rest_refresh()
@@ -139,6 +150,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
                 if refresh_errors and not refreshed_ids:
                     self._raise_refresh_error(next(iter(refresh_errors.values())))
 
+            await self._async_cleanup_removed_locations(removed_location_ids)
             await self._async_cleanup_removed_devices(removed_ids)
             self._update_support_issue()
         except AprilaireCloudAuthenticationError as err:
@@ -164,6 +176,11 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
             DOMAIN,
             self._unsupported_devices_issue_id,
         )
+        ir.async_delete_issue(
+            self.hass,
+            DOMAIN,
+            self._no_supported_devices_issue_id,
+        )
         await asyncio.gather(
             *(manager.async_stop() for manager in self._websockets.values()),
             return_exceptions=True,
@@ -177,26 +194,40 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
     ) -> None:
         """Merge websocket messages into the live snapshot."""
         changed = False
+        support_changed = False
         for message in messages:
             message_type = message.get("_type")
             if message_type == "RefreshEvent":
+                LOGGER.debug("RefreshEvent received for location %s", location_id)
                 self._schedule_refresh()
                 continue
 
             device_id = message.get("deviceId")
             if device_id is None:
                 continue
+            LOGGER.debug(
+                "WebSocket message %s for device %s in location %s",
+                message_type,
+                device_id,
+                location_id,
+            )
             if device_id not in self._devices:
+                LOGGER.debug("Caching message for unknown device %s", device_id)
                 self._cache_unknown_device_message(device_id, message)
                 self._schedule_refresh()
                 continue
 
             record = self._devices[device_id]
-            updated = apply_device_message(record, message)
-            if updated == record:
+            updated_record = evaluate_device_support(apply_device_message(record, message))
+            if updated_record == record:
                 continue
-            self._devices[device_id] = evaluate_device_support(updated)
+            self._devices[device_id] = updated_record
             changed = True
+            if (
+                updated_record.supported != record.supported
+                or updated_record.unsupported_reason != record.unsupported_reason
+            ):
+                support_changed = True
             if message_type == "DeviceSettings":
                 write_state = self._write_states.get(device_id)
                 if (
@@ -207,6 +238,9 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
                     write_state.inflight_event.set()
 
         if changed:
+            if support_changed:
+                self._update_support_issue()
+            self._last_websocket_message_at[location_id] = datetime.now(tz=UTC)
             self._publish_snapshot()
 
     async def async_socket_state_changed(self, state: SocketState) -> None:
@@ -246,6 +280,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
 
         write_state = self._write_states.setdefault(device_id, DeviceWriteState())
         payload_paths = format_leaf_paths(payload)
+        LOGGER.debug("Write started for device %s: %s", device_id, payload_paths)
         self._apply_pending_device_settings(device_id, payload)
         self._sync_write_state(device_id, confirmed_settings=None)
         pending_paths = set(write_state.pending_paths)
@@ -269,11 +304,17 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
                     await asyncio.wait_for(
                         inflight_event.wait(), timeout=POST_WRITE_CONFIRM_TIMEOUT
                     )
+                    LOGGER.debug("Write confirmed via WebSocket for device %s", device_id)
                     return
                 except TimeoutError:
+                    LOGGER.debug(
+                        "Write confirmation timed out for device %s, checking REST",
+                        device_id,
+                    )
                     settings = await self._async_refresh_device_settings(device_id)
                     self._publish_snapshot()
                     if settings_match_payload(settings, payload):
+                        LOGGER.debug("Write confirmed via REST for device %s", device_id)
                         return
 
                     should_raise = self._pending_payload_is_current(device_id, payload)
@@ -350,10 +391,16 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
 
     def _apply_hierarchy(self, hierarchy: dict[str, Any]) -> set[str]:
         """Merge hierarchy data and return removed device IDs."""
+        old_device_ids = set(self._devices)
         locations, devices, removed_ids = apply_hierarchy(hierarchy, self._devices)
         self._locations = locations
         self._devices = devices
         self._replay_unknown_device_messages()
+        new_device_ids = set(self._devices) - old_device_ids
+        if new_device_ids:
+            LOGGER.debug("Devices added to hierarchy: %s", new_device_ids)
+        if removed_ids:
+            LOGGER.debug("Devices removed from hierarchy: %s", removed_ids)
         for device_id in removed_ids:
             self._write_states.pop(device_id, None)
             self._unknown_device_messages.pop(device_id, None)
@@ -385,10 +432,17 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
 
     def _update_refresh_interval(self) -> None:
         """Switch between safety refresh and bounded fallback refresh."""
+        needs_fallback = bool(self._device_ids_requiring_rest_refresh())
+        new_mode = "fallback" if needs_fallback else "safety"
+        if new_mode != self._current_refresh_mode:
+            LOGGER.info(
+                "Refresh mode changed from %s to %s",
+                self._current_refresh_mode,
+                new_mode,
+            )
+            self._current_refresh_mode = new_mode
         self.update_interval = (
-            self._fallback_refresh_interval
-            if self._device_ids_requiring_rest_refresh()
-            else self._safety_refresh_interval
+            self._fallback_refresh_interval if needs_fallback else self._safety_refresh_interval
         )
 
     async def _async_sync_location_websockets(self, *, wait_for_ready: bool = False) -> None:
@@ -399,6 +453,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         for location_id in existing_locations - wanted_locations:
             await self._websockets.pop(location_id).async_stop()
             self._socket_states.pop(location_id, None)
+            self._last_websocket_message_at.pop(location_id, None)
 
         new_managers: list[AprilaireLocationWebSocket] = []
         for location_id in wanted_locations - existing_locations:
@@ -429,6 +484,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         ids = list(device_ids)
         if not ids:
             return set(), {}
+        LOGGER.debug("REST refresh starting for %d device(s): %s", len(ids), ids)
 
         semaphore = asyncio.Semaphore(MAX_PARALLEL_REST_REQUESTS)
 
@@ -459,6 +515,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
             if device_id not in self._devices:
                 continue
             if isinstance(settings, Exception):
+                LOGGER.warning("REST refresh failed for device %s: %s", device_id, settings)
                 refresh_errors[device_id] = settings
                 continue
             self._devices[device_id] = evaluate_device_support(
@@ -471,6 +528,8 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
             )
             self._sync_write_state(device_id, confirmed_settings=settings)
             refreshed_ids.add(device_id)
+        if refreshed_ids:
+            self._last_rest_refresh_at = datetime.now(tz=UTC)
         return refreshed_ids, refresh_errors
 
     async def _async_refresh_device_settings(self, device_id: str) -> dict[str, Any]:
@@ -483,6 +542,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         """Remove stale entity registry entries for devices no longer in the hierarchy."""
         if not removed_ids:
             return
+        LOGGER.debug("Cleaning up removed devices: %s", removed_ids)
         device_registry = dr.async_get(self.hass)
         entity_registry = er.async_get(self.hass)
         stale_registry_device_ids = {
@@ -505,6 +565,41 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
                 and any(
                     registry_entry.unique_id.startswith(f"{device_id}_")
                     for device_id in removed_ids
+                )
+            ):
+                entity_registry.async_remove(registry_entry.entity_id)
+
+        for registry_device_id in stale_registry_device_ids:
+            device_registry.async_remove_device(registry_device_id)
+
+    async def _async_cleanup_removed_locations(self, removed_location_ids: set[str]) -> None:
+        """Remove stale entity and device registry entries for removed locations."""
+        if not removed_location_ids:
+            return
+        LOGGER.debug("Cleaning up removed locations: %s", removed_location_ids)
+        device_registry = dr.async_get(self.hass)
+        entity_registry = er.async_get(self.hass)
+        stale_registry_device_ids = {
+            device.id
+            for device in dr.async_entries_for_config_entry(
+                device_registry, self.config_entry.entry_id
+            )
+            if any(
+                identifier[0] == DOMAIN and identifier[1] == f"location_{location_id}"
+                for identifier in device.identifiers
+                for location_id in removed_location_ids
+            )
+        }
+
+        for registry_entry in er.async_entries_for_config_entry(
+            entity_registry,
+            self.config_entry.entry_id,
+        ):
+            if registry_entry.device_id in stale_registry_device_ids or (
+                registry_entry.unique_id
+                and any(
+                    registry_entry.unique_id == f"{location_id}_websocket_connection"
+                    for location_id in removed_location_ids
                 )
             ):
                 entity_registry.async_remove(registry_entry.entity_id)
@@ -550,9 +645,52 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         return bool(self.config_entry.options.get(CONF_ENABLE_EXTRA_DIAGNOSTICS, False))
 
     @property
+    def write_state_summaries(self) -> dict[str, dict]:
+        """Return a diagnostics-friendly summary of write states."""
+        return {
+            device_id: state.summary
+            for device_id, state in self._write_states.items()
+        }
+
+    @property
+    def unknown_device_message_counts(self) -> dict[str, int]:
+        """Return the count of cached messages per unknown device."""
+        return {
+            device_id: len(messages)
+            for device_id, messages in self._unknown_device_messages.items()
+        }
+
+    @property
+    def last_rest_refresh_at(self) -> datetime | None:
+        """Return when the last successful REST refresh completed."""
+        return self._last_rest_refresh_at
+
+    @property
+    def last_websocket_message_at(self) -> dict[str, datetime]:
+        """Return per-location timestamps of the last websocket message."""
+        return dict(self._last_websocket_message_at)
+
+    @property
+    def current_refresh_mode(self) -> str:
+        """Return the current refresh mode (safety or fallback)."""
+        return self._current_refresh_mode
+
+    @property
+    def current_refresh_interval_seconds(self) -> float:
+        """Return the current refresh interval in seconds."""
+        if self.update_interval is None:
+            return 0.0
+        return self.update_interval.total_seconds()
+
+    @property
     def _unsupported_devices_issue_id(self) -> str:
         """Return the issue id used for unsupported devices."""
         return f"{ISSUE_UNSUPPORTED_DEVICES}_{self.config_entry.entry_id}"
+
+    @property
+    def _no_supported_devices_issue_id(self) -> str:
+        """Return the issue id used when no supported devices are available."""
+        return f"{ISSUE_NO_SUPPORTED_DEVICES}_{self.config_entry.entry_id}"
 
     def _sync_write_state(
         self,
@@ -626,18 +764,39 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         raise UpdateFailed(f"Unable to refresh AprilAire data: {err}") from err
 
     def _update_support_issue(self) -> None:
-        """Create or clear a repair issue for unsupported devices on a mixed account."""
+        """Create or clear repair issues for unsupported device combinations."""
         supported = [device for device in self._devices.values() if device.supported]
         unsupported = [device for device in self._devices.values() if not device.supported]
+        reason_counts: dict[str, int] = {}
+        for device in unsupported:
+            if device.unsupported_reason is None:
+                continue
+            reason_counts[device.unsupported_reason] = (
+                reason_counts.get(device.unsupported_reason, 0) + 1
+            )
+
+        if unsupported and not supported:
+            ir.async_create_issue(
+                self.hass,
+                DOMAIN,
+                self._no_supported_devices_issue_id,
+                is_fixable=False,
+                is_persistent=False,
+                severity=IssueSeverity.WARNING,
+                translation_key=ISSUE_NO_SUPPORTED_DEVICES,
+                translation_placeholders={
+                    "unsupported_count": str(len(unsupported)),
+                    "reason_summary": format_unsupported_reasons(reason_counts),
+                },
+            )
+            ir.async_delete_issue(
+                self.hass,
+                DOMAIN,
+                self._unsupported_devices_issue_id,
+            )
+            return
 
         if supported and unsupported:
-            reason_counts: dict[str, int] = {}
-            for device in unsupported:
-                if device.unsupported_reason is None:
-                    continue
-                reason_counts[device.unsupported_reason] = (
-                    reason_counts.get(device.unsupported_reason, 0) + 1
-                )
             ir.async_create_issue(
                 self.hass,
                 DOMAIN,
@@ -652,10 +811,20 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
                     "reason_summary": format_unsupported_reasons(reason_counts),
                 },
             )
+            ir.async_delete_issue(
+                self.hass,
+                DOMAIN,
+                self._no_supported_devices_issue_id,
+            )
             return
 
         ir.async_delete_issue(
             self.hass,
             DOMAIN,
             self._unsupported_devices_issue_id,
+        )
+        ir.async_delete_issue(
+            self.hass,
+            DOMAIN,
+            self._no_supported_devices_issue_id,
         )
