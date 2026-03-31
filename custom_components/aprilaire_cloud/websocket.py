@@ -157,6 +157,7 @@ class AprilaireLocationWebSocket:
 
     async def async_stop(self) -> None:
         """Stop the websocket loop."""
+        LOGGER.debug("WebSocket stopping for location %s", self._location_id)
         self._stop_event.set()
         if self._runner_task is None:
             return
@@ -193,11 +194,18 @@ class AprilaireLocationWebSocket:
                 if self._stop_event.is_set():
                     break
                 sleep_for = min(delay, WEBSOCKET_RECONNECT_MAX_SECONDS) + random.uniform(0, 1)
+                LOGGER.debug(
+                    "WebSocket reconnect attempt %d for location %s in %.1fs",
+                    self._reconnect_attempt,
+                    self._location_id,
+                    sleep_for,
+                )
                 await asyncio.sleep(sleep_for)
                 delay = min(delay * 2, WEBSOCKET_RECONNECT_MAX_SECONDS)
 
     async def _async_connect_once(self) -> None:
         """Open a websocket connection and process messages until it closes."""
+        LOGGER.debug("WebSocket connecting for location %s", self._location_id)
         self._pong_event.clear()
         token = await self._client.async_get_id_token()
         async with self._session.ws_connect(
@@ -207,6 +215,7 @@ class AprilaireLocationWebSocket:
             receive_timeout=None,
         ) as ws:
             await self._async_send_subscribe(ws, token)
+            LOGGER.debug("WebSocket subscribed to location %s", self._location_id)
             await self._publish_state(connected=True, initial_sync_complete=False)
 
             ping_task = asyncio.create_task(self._async_ping_loop(ws))

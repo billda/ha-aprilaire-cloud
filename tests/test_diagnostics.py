@@ -13,8 +13,15 @@ from custom_components.aprilaire_cloud.data import AprilaireCloudRuntimeData
 from custom_components.aprilaire_cloud.diagnostics import async_get_config_entry_diagnostics
 from custom_components.aprilaire_cloud.state import DeviceWriteState
 
-from .common import DEVICE_ID, PASSWORD, USERNAME, build_user
-from .test_coordinator import FakeClient, FakeWebSocket, bootstrap_coordinator
+from .common import (
+    DEVICE_ID,
+    PASSWORD,
+    USERNAME,
+    FakeClient,
+    FakeWebSocket,
+    bootstrap_coordinator,
+    build_user,
+)
 
 
 async def test_diagnostics_include_runtime_state_and_redact_credentials(
@@ -83,3 +90,10 @@ async def test_diagnostics_include_runtime_state_and_redact_credentials(
         "dehumidifier.humiditySetpoint"
     ]
     assert diagnostics["snapshot"]["write_states"][DEVICE_ID]["waiting_for_confirmation"] is True
+    assert diagnostics["snapshot"]["current_refresh_mode"] == "safety"
+    assert diagnostics["snapshot"]["current_refresh_interval_seconds"] > 0
+    assert "last_rest_refresh" in diagnostics["snapshot"]
+    assert "last_websocket_message" in diagnostics["snapshot"]
+    assert diagnostics["snapshot"]["config_options"]["safety_refresh_minutes"] == 15
+    assert diagnostics["snapshot"]["config_options"]["fallback_refresh_minutes"] == 2
+    assert diagnostics["snapshot"]["config_options"]["enable_extra_diagnostics"] is False

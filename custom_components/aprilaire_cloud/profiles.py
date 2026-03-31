@@ -82,19 +82,22 @@ class DeviceProfile(Protocol):
 
     def matches(self, record: DeviceRecord) -> bool:
         """Return whether the profile supports a record."""
+        ...
 
     def normalize(self, record: DeviceRecord) -> object | None:
         """Return normalized state for a record."""
+        ...
 
     def entity_descriptions(self, record: DeviceRecord) -> ProfileEntitySet:
         """Return entity keys for a record."""
+        ...
 
 
 class DehumidifierProfile:
     """Profile for supported AprilAire dehumidifiers."""
 
-    key = "dehumidifier"
-    supported_writes = ("mode", "humiditySetpoint", "alertLimits.highHum")
+    key: str = "dehumidifier"
+    supported_writes: tuple[str, ...] = ("mode", "humiditySetpoint", "alertLimits.highHum")
 
     def matches(self, record: DeviceRecord) -> bool:
         """Return whether the record is a supported dehumidifier."""
@@ -213,7 +216,7 @@ class DehumidifierProfile:
         )
 
 
-DEHUMIDIFIER_PROFILE = DehumidifierProfile()
+DEHUMIDIFIER_PROFILE: DeviceProfile = DehumidifierProfile()
 DEVICE_PROFILES: tuple[DeviceProfile, ...] = (DEHUMIDIFIER_PROFILE,)
 
 

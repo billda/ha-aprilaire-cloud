@@ -86,6 +86,9 @@
       },
       "hvac_fan": {
         "name": "HVAC fan"
+      },
+      "websocket_connection": {
+        "name": "Cloud connection"
       }
     },
     "number": {
@@ -103,6 +106,10 @@
     }
   },
   "issues": {
+    "no_supported_devices": {
+      "title": "No supported AprilAire devices are available yet",
+      "description": "This AprilAire account currently has {unsupported_count} discovered device(s), but none match the supported AprilAire Cloud profile so no entities were added.\n\nReasons: {reason_summary}\n\nIf a device is still finishing setup in the AprilAire Healthy Air app, keep the integration installed and it will retry automatically."
+    },
     "unsupported_devices": {
       "title": "Some AprilAire devices were skipped",
       "description": "This AprilAire account has {supported_count} supported device(s) and {unsupported_count} unsupported device(s). Unsupported devices were not added to Home Assistant.\n\nReasons: {reason_summary}"

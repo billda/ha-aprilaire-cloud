@@ -1,8 +1,14 @@
-"""Shared test fixtures and payload factories."""
+"""Shared test fixtures, payload factories, and test doubles."""
 
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
+from typing import ClassVar
+
+from custom_components.aprilaire_cloud.api import AprilaireCloudRateLimitError
+from custom_components.aprilaire_cloud.coordinator import AprilaireCloudDataUpdateCoordinator
+from custom_components.aprilaire_cloud.models import SocketState
 
 USERNAME = "billda@gmail.com"
 PASSWORD = "Trueblue1!"
@@ -190,3 +196,168 @@ def build_initial_messages(
 def deep_copy(data):
     """Return a deep copy helper."""
     return deepcopy(data)
+
+
+# ---------------------------------------------------------------------------
+# Fake API client (superset used by coordinator, entity, diagnostics tests)
+# ---------------------------------------------------------------------------
+
+
+class FakeClient:
+    """Fake API client for tests that need write tracking and failure injection."""
+
+    def __init__(self) -> None:
+        """Initialize the fake client."""
+        self.username = USERNAME
+        self.session = object()
+        self._hierarchy = build_hierarchy()
+        self._rate_limit = False
+        self.device_settings = build_device_settings()
+        self.patched_payloads: list[dict] = []
+        self.patch_started = asyncio.Event()
+        self.patch_release: asyncio.Event | None = None
+        self.patch_side_effect: Exception | None = None
+        self.patch_side_effects: list[Exception | None] = []
+        self.rest_failures: dict[tuple[str, str], Exception] = {}
+        self.requested_status_ids: list[str] = []
+        self.requested_dehumidifier_ids: list[str] = []
+        self.requested_settings_ids: list[str] = []
+        self.rate_limited_until = None
+
+    async def async_authenticate(self) -> None:
+        """No-op auth."""
+        return None
+
+    async def async_get_user(self) -> dict:
+        """Return a fake account."""
+        return build_user()
+
+    async def async_get_hierarchy(self) -> dict:
+        """Return the current fake hierarchy."""
+        if self._rate_limit:
+            raise AprilaireCloudRateLimitError(120)
+        return self._hierarchy
+
+    async def async_get_device_status(self, device_id: str) -> dict:
+        """Return status."""
+        self.requested_status_ids.append(device_id)
+        if ("device_status", device_id) in self.rest_failures:
+            raise self.rest_failures[("device_status", device_id)]
+        return build_initial_messages(device_id)[3]
+
+    async def async_get_dehumidifier_status(self, device_id: str) -> dict:
+        """Return dehumidifier status."""
+        self.requested_dehumidifier_ids.append(device_id)
+        if ("dehumidifier_status", device_id) in self.rest_failures:
+            raise self.rest_failures[("dehumidifier_status", device_id)]
+        return build_dehumidifier_status(device_id)
+
+    async def async_get_device_settings(self, device_id: str) -> dict:
+        """Return device settings."""
+        self.requested_settings_ids.append(device_id)
+        if ("device_settings", device_id) in self.rest_failures:
+            raise self.rest_failures[("device_settings", device_id)]
+        return deep_copy(self.device_settings)
+
+    async def async_patch_device_settings(self, device_id: str, payload: dict) -> None:
+        """Pretend a write succeeded."""
+        self.patched_payloads.append(deep_copy(payload))
+        self.patch_started.set()
+        if self.patch_release is not None:
+            await self.patch_release.wait()
+        if self.patch_side_effects:
+            side_effect = self.patch_side_effects.pop(0)
+            if side_effect is not None:
+                raise side_effect
+        if self.patch_side_effect is not None:
+            raise self.patch_side_effect
+        return None
+
+    def set_remote_settings(self, payload: dict) -> None:
+        """Update the fake remote settings payload."""
+        self.device_settings = deep_copy(payload)
+
+
+# ---------------------------------------------------------------------------
+# Fake WebSocket doubles
+# ---------------------------------------------------------------------------
+
+
+class FakeWebSocket:
+    """Fake websocket manager that injects a bootstrap message batch."""
+
+    instances: ClassVar[dict[str, FakeWebSocket]] = {}
+
+    def __init__(
+        self,
+        *,
+        client,
+        session,
+        location_id,
+        message_callback,
+        state_callback,
+    ) -> None:
+        """Initialize the websocket."""
+        self._location_id = location_id
+        self._message_callback = message_callback
+        self._state_callback = state_callback
+        FakeWebSocket.instances[location_id] = self
+
+    async def async_start(self) -> None:
+        """Publish the initial socket state."""
+        await self._state_callback(
+            SocketState(location_id=self._location_id, connected=True, initial_sync_complete=False)
+        )
+
+    async def async_wait_for_initial_sync(self, wait_timeout: float) -> bool:
+        """Inject bootstrap data."""
+        await self._message_callback(self._location_id, build_initial_messages())
+        await self._state_callback(
+            SocketState(location_id=self._location_id, connected=True, initial_sync_complete=True)
+        )
+        return True
+
+    async def async_stop(self) -> None:
+        """Stop the websocket."""
+        return None
+
+    async def push_messages(self, messages: list[dict]) -> None:
+        """Push custom websocket messages into the coordinator."""
+        await self._state_callback(
+            SocketState(location_id=self._location_id, connected=True, initial_sync_complete=True)
+        )
+        await self._message_callback(self._location_id, messages)
+
+
+class MultiLocationFakeWebSocket(FakeWebSocket):
+    """Fake websocket that boots the matching device for each location."""
+
+    async def async_wait_for_initial_sync(self, wait_timeout: float) -> bool:
+        """Inject bootstrap data for the matching location."""
+        device_id = DEVICE_ID if self._location_id == LOCATION_ID else SECOND_DEVICE_ID
+        await self._message_callback(self._location_id, build_initial_messages(device_id))
+        await self._state_callback(
+            SocketState(location_id=self._location_id, connected=True, initial_sync_complete=True)
+        )
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Coordinator helpers
+# ---------------------------------------------------------------------------
+
+
+async def bootstrap_coordinator(coordinator: AprilaireCloudDataUpdateCoordinator) -> None:
+    """Run the coordinator's startup path without config-entry state checks."""
+    await coordinator._async_setup()
+    coordinator.async_set_updated_data(coordinator._build_snapshot())
+
+
+async def wait_until(predicate, *, wait_timeout: float = 1.0) -> None:
+    """Wait until a predicate becomes true."""
+    end = asyncio.get_running_loop().time() + wait_timeout
+    while asyncio.get_running_loop().time() < end:
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("Timed out waiting for predicate")
