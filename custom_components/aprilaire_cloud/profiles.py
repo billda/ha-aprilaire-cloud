@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
 
-from .const import SUPPORTED_CONTROL_TYPE, SUPPORTED_REPORTING_TYPE, SUPPORTED_SCALE
+from .const import (
+    DEHUMIDIFIER_CONTROL_TYPE,
+    DEHUMIDIFIER_REPORTING_TYPE,
+    DEHUMIDIFIER_SCALE,
+)
 from .models import DeviceRecord
 
 UNSUPPORTED_REASON_LABELS: dict[str, str] = {
@@ -35,10 +39,19 @@ class SupportedDeviceSummary:
 class ProfileEntitySet:
     """Entity keys exposed by a profile."""
 
+    climate_keys: tuple[str, ...] = ()
     sensor_keys: tuple[str, ...] = ()
+    dynamic_sensor_keys: tuple[str, ...] = ()
     binary_sensor_keys: tuple[str, ...] = ()
     number_keys: tuple[str, ...] = ()
-    extra_temperature_uids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileStatusRequest:
+    """A profile-owned REST status endpoint."""
+
+    key: str
+    endpoint: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,8 +93,20 @@ class DeviceProfile(Protocol):
     key: str
     supported_writes: tuple[str, ...]
 
+    def unsupported_reason(self, record: DeviceRecord) -> str | None:
+        """Return why this profile does not currently support a record."""
+        ...
+
     def matches(self, record: DeviceRecord) -> bool:
         """Return whether the profile supports a record."""
+        ...
+
+    def status_requests(self, record: DeviceRecord) -> tuple[ProfileStatusRequest, ...]:
+        """Return REST status requests needed by this profile."""
+        ...
+
+    def has_required_status(self, record: DeviceRecord) -> bool:
+        """Return whether this profile has the status payloads it needs."""
         ...
 
     def normalize(self, record: DeviceRecord) -> object | None:
@@ -98,15 +123,30 @@ class DehumidifierProfile:
 
     key: str = "dehumidifier"
     supported_writes: tuple[str, ...] = ("mode", "humiditySetpoint", "alertLimits.highHum")
+    _status_requests: tuple[ProfileStatusRequest, ...] = (
+        ProfileStatusRequest(key="dehumidifier", endpoint="dehumidifier"),
+    )
+
+    def unsupported_reason(self, record: DeviceRecord) -> str | None:
+        """Return why the record is not a supported dehumidifier."""
+        return dehumidifier_unsupported_reason(record)
 
     def matches(self, record: DeviceRecord) -> bool:
         """Return whether the record is a supported dehumidifier."""
-        return dehumidifier_unsupported_reason(record) is None
+        return self.unsupported_reason(record) is None
+
+    def status_requests(self, record: DeviceRecord) -> tuple[ProfileStatusRequest, ...]:
+        """Return dehumidifier status requests."""
+        return self._status_requests
+
+    def has_required_status(self, record: DeviceRecord) -> bool:
+        """Return whether dehumidifier status has been loaded."""
+        return bool(get_status_payload(record, self.key))
 
     def normalize(self, record: DeviceRecord) -> NormalizedDehumidifierState:
         """Normalize dehumidifier state from vendor payloads."""
         settings = record.effective_device_settings.get("dehumidifier", {})
-        status = record.dehumidifier_status
+        status = get_status_payload(record, self.key)
         alerts = status.get("alerts", {})
 
         current_humidity = next(
@@ -204,15 +244,16 @@ class DehumidifierProfile:
             binary_sensor_keys.append("hvac_fan")
 
         number_keys = tuple(sorted(key for key in normalized.alert_limits if key in {"highHum"}))
-        extra_temperature_uids = tuple(
-            sorted(probe.uid for probe in normalized.extra_temperature_probes)
+        dynamic_sensor_keys = tuple(
+            f"temperature_{uid}"
+            for uid in sorted(probe.uid for probe in normalized.extra_temperature_probes)
         )
 
         return ProfileEntitySet(
             sensor_keys=tuple(sensor_keys),
+            dynamic_sensor_keys=dynamic_sensor_keys,
             binary_sensor_keys=tuple(binary_sensor_keys),
             number_keys=number_keys,
-            extra_temperature_uids=extra_temperature_uids,
         )
 
 
@@ -224,7 +265,7 @@ def dehumidifier_unsupported_reason(record: DeviceRecord) -> str | None:
     """Return the unsupported reason for the dehumidifier profile."""
     if not record.device_setup:
         return "awaiting_device_setup"
-    if record.device_setup.get("type") != SUPPORTED_REPORTING_TYPE:
+    if record.device_setup.get("type") != DEHUMIDIFIER_REPORTING_TYPE:
         return "unsupported_equipment_type"
 
     dehumidifier_setup = record.device_setup.get("dehumidifier", {})
@@ -234,9 +275,9 @@ def dehumidifier_unsupported_reason(record: DeviceRecord) -> str | None:
         return "awaiting_device_setup"
     if not dehumidifier_settings:
         return "awaiting_device_settings"
-    if dehumidifier_setup.get("controlType") != SUPPORTED_CONTROL_TYPE:
+    if dehumidifier_setup.get("controlType") != DEHUMIDIFIER_CONTROL_TYPE:
         return "unsupported_control_type"
-    if dehumidifier_setup.get("scale") != SUPPORTED_SCALE:
+    if dehumidifier_setup.get("scale") != DEHUMIDIFIER_SCALE:
         return "unsupported_scale"
     if "humiditySetpoint" not in dehumidifier_settings:
         return "missing_humidity_setpoint"
@@ -247,17 +288,82 @@ def dehumidifier_unsupported_reason(record: DeviceRecord) -> str | None:
 
 def evaluate_profile(record: DeviceRecord) -> tuple[bool, str | None, str | None, tuple[str, ...]]:
     """Return support, reason, profile key, and supported writes."""
-    reason = dehumidifier_unsupported_reason(record)
-    if reason is None and DEHUMIDIFIER_PROFILE.matches(record):
-        return True, None, DEHUMIDIFIER_PROFILE.key, DEHUMIDIFIER_PROFILE.supported_writes
-    return False, reason, None, ()
+    reasons: list[str] = []
+    for profile in DEVICE_PROFILES:
+        reason = profile.unsupported_reason(record)
+        if reason is None and profile.matches(record):
+            return True, None, profile.key, profile.supported_writes
+        if reason is not None:
+            reasons.append(reason)
+
+    fallback_reason = next(
+        (reason for reason in reasons if reason in INCOMPLETE_SUPPORT_REASONS),
+        reasons[0] if reasons else None,
+    )
+    return False, fallback_reason, None, ()
 
 
 def get_profile(profile_key: str | None) -> DeviceProfile | None:
     """Return a profile by key."""
-    if profile_key == DEHUMIDIFIER_PROFILE.key:
-        return DEHUMIDIFIER_PROFILE
+    for profile in DEVICE_PROFILES:
+        if profile_key == profile.key:
+            return profile
     return None
+
+
+def profiles_requiring_data(record: DeviceRecord) -> tuple[DeviceProfile, ...]:
+    """Return profiles that are supported or still pending classification."""
+    profile = get_profile(record.profile_key)
+    if profile is not None:
+        return (profile,)
+    return tuple(
+        profile
+        for profile in DEVICE_PROFILES
+        if (
+            (reason := profile.unsupported_reason(record)) is None
+            or reason in INCOMPLETE_SUPPORT_REASONS
+        )
+    )
+
+
+def status_requests_for_record(record: DeviceRecord) -> tuple[ProfileStatusRequest, ...]:
+    """Return deduplicated status requests needed to refresh a record."""
+    requests: dict[tuple[str, str], ProfileStatusRequest] = {}
+    for profile in profiles_requiring_data(record):
+        for request in profile.status_requests(record):
+            requests[(request.key, request.endpoint)] = request
+    return tuple(requests.values())
+
+
+def record_has_required_status(record: DeviceRecord) -> bool:
+    """Return whether candidate profiles have their required status payloads."""
+    profiles = profiles_requiring_data(record)
+    if not profiles:
+        return True
+    return all(profile.has_required_status(record) for profile in profiles)
+
+
+def record_requires_rest_refresh(
+    record: DeviceRecord,
+    *,
+    location_unhealthy: bool = False,
+) -> bool:
+    """Return whether a record still needs profile-owned REST refresh data."""
+    profiles = profiles_requiring_data(record)
+    if not profiles:
+        return False
+    return (
+        location_unhealthy
+        or not record.device_settings
+        or any(not profile.has_required_status(record) for profile in profiles)
+    )
+
+
+def get_status_payload(record: DeviceRecord, key: str) -> dict[str, Any]:
+    """Return a profile-owned status payload."""
+    if key in record.status_payloads:
+        return record.status_payloads[key]
+    return {}
 
 
 def normalize_device(record: DeviceRecord) -> object | None:

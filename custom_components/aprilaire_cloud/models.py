@@ -49,7 +49,7 @@ class DeviceRecord:
     device_settings: dict[str, Any] = field(default_factory=dict)
     pending_device_settings: dict[str, Any] = field(default_factory=dict)
     device_setup: dict[str, Any] = field(default_factory=dict)
-    dehumidifier_status: dict[str, Any] = field(default_factory=dict)
+    status_payloads: dict[str, dict[str, Any]] = field(default_factory=dict)
     sensor_hub_status: dict[str, Any] = field(default_factory=dict)
     supported: bool = False
     unsupported_reason: str | None = None

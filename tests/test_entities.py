@@ -18,7 +18,10 @@ from custom_components.aprilaire_cloud.coordinator import AprilaireCloudDataUpda
 from custom_components.aprilaire_cloud.entity import raise_ha_write_error
 from custom_components.aprilaire_cloud.humidifier import AprilaireCloudHumidifierEntity
 from custom_components.aprilaire_cloud.number import AprilaireAlertLimitNumber
-from custom_components.aprilaire_cloud.sensor import STATIC_SENSORS, AprilaireStaticSensorEntity
+from custom_components.aprilaire_cloud.sensor import (
+    DEHUMIDIFIER_SENSORS,
+    AprilaireStaticSensorEntity,
+)
 
 from .common import (
     LOCATION_ID,
@@ -59,7 +62,7 @@ async def test_humidifier_action_and_sensor_values(
     current_humidity_sensor = AprilaireStaticSensorEntity(
         coordinator,
         coordinator.data.supported_device_ids[0],
-        STATIC_SENSORS["current_humidity"],
+        DEHUMIDIFIER_SENSORS["current_humidity"],
     )
 
     assert humidifier.is_on is True

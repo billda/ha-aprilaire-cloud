@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 from homeassistant.components.humidifier import (
     HumidifierAction,
     HumidifierDeviceClass,
@@ -13,7 +15,7 @@ from .api import AprilaireCloudApiError, AprilaireCloudRateLimitError
 from .coordinator import AprilaireCloudDataUpdateCoordinator
 from .data import AprilaireCloudConfigEntry
 from .entity import AprilaireCloudEntity, raise_ha_write_error, setup_dynamic_platform_entities
-from .profiles import get_profile
+from .profiles import NormalizedDehumidifierState, get_profile
 
 
 async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry, async_add_entities) -> None:
@@ -45,9 +47,14 @@ class AprilaireCloudHumidifierEntity(AprilaireCloudEntity, HumidifierEntity):
         super().__init__(coordinator, device_id, "dehumidifier")
 
     @property
+    def _normalized_dehumidifier(self) -> NormalizedDehumidifierState | None:
+        """Return normalized dehumidifier state."""
+        return cast(NormalizedDehumidifierState | None, self.normalized_state)
+
+    @property
     def current_humidity(self) -> float | None:
         """Return the controlling humidity sensor reading."""
-        normalized = self.normalized_device
+        normalized = self._normalized_dehumidifier
         if normalized is None:
             return None
         return normalized.current_humidity
@@ -55,7 +62,7 @@ class AprilaireCloudHumidifierEntity(AprilaireCloudEntity, HumidifierEntity):
     @property
     def target_humidity(self) -> float | None:
         """Return the humidity setpoint."""
-        normalized = self.normalized_device
+        normalized = self._normalized_dehumidifier
         if normalized is None:
             return None
         return normalized.target_humidity
@@ -63,7 +70,7 @@ class AprilaireCloudHumidifierEntity(AprilaireCloudEntity, HumidifierEntity):
     @property
     def is_on(self) -> bool | None:
         """Return whether the device is enabled."""
-        normalized = self.normalized_device
+        normalized = self._normalized_dehumidifier
         if normalized is None:
             return None
         return normalized.mode == "on"
@@ -71,7 +78,7 @@ class AprilaireCloudHumidifierEntity(AprilaireCloudEntity, HumidifierEntity):
     @property
     def action(self) -> HumidifierAction | None:
         """Return the current operating action."""
-        normalized = self.normalized_device
+        normalized = self._normalized_dehumidifier
         if normalized is None:
             return None
         if self.is_on is False:
@@ -86,21 +93,30 @@ class AprilaireCloudHumidifierEntity(AprilaireCloudEntity, HumidifierEntity):
     async def async_turn_on(self, **kwargs) -> None:
         """Turn the device on."""
         try:
-            await self.coordinator.async_set_mode(self._device_id, True)
+            await self.coordinator.async_write_device_settings(
+                self._device_id,
+                {"dehumidifier": {"mode": "on"}},
+            )
         except (AprilaireCloudRateLimitError, AprilaireCloudApiError) as err:
             raise_ha_write_error(err)
 
     async def async_turn_off(self, **kwargs) -> None:
         """Turn the device off."""
         try:
-            await self.coordinator.async_set_mode(self._device_id, False)
+            await self.coordinator.async_write_device_settings(
+                self._device_id,
+                {"dehumidifier": {"mode": "off"}},
+            )
         except (AprilaireCloudRateLimitError, AprilaireCloudApiError) as err:
             raise_ha_write_error(err)
 
     async def async_set_humidity(self, humidity: int) -> None:
         """Set the target humidity."""
         try:
-            await self.coordinator.async_set_target_humidity(self._device_id, humidity)
+            await self.coordinator.async_write_device_settings(
+                self._device_id,
+                {"dehumidifier": {"humiditySetpoint": humidity}},
+            )
         except (AprilaireCloudRateLimitError, AprilaireCloudApiError) as err:
             raise_ha_write_error(err)
 
@@ -108,7 +124,7 @@ class AprilaireCloudHumidifierEntity(AprilaireCloudEntity, HumidifierEntity):
     def extra_state_attributes(self) -> dict[str, str | float | int | bool | None]:
         """Expose raw AprilAire values that are useful for debugging."""
         attrs = dict(super().extra_state_attributes)
-        normalized = self.normalized_device
+        normalized = self._normalized_dehumidifier
         if normalized is not None:
             attrs["equipment_status"] = normalized.equipment_status
             attrs["setpoint_unit"] = PERCENTAGE

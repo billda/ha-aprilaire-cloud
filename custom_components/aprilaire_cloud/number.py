@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.const import PERCENTAGE
 from homeassistant.helpers.entity import EntityCategory
@@ -14,7 +16,7 @@ from .entity import (
     raise_ha_write_error,
     setup_dynamic_platform_entities,
 )
-from .profiles import get_profile
+from .profiles import NormalizedDehumidifierState, get_profile
 
 ALERT_LIMIT_DESCRIPTIONS: dict[str, dict[str, str | float]] = {
     "highHum": {
@@ -64,7 +66,7 @@ class AprilaireAlertLimitNumber(AprilaireCloudEntity, NumberEntity):
     @property
     def native_value(self) -> float | None:
         """Return the current limit value."""
-        normalized = self.normalized_device
+        normalized = cast(NormalizedDehumidifierState | None, self.normalized_state)
         if normalized is None:
             return None
         return normalized.alert_limits.get(self._limit_key)
@@ -72,8 +74,9 @@ class AprilaireAlertLimitNumber(AprilaireCloudEntity, NumberEntity):
     async def async_set_native_value(self, value: float) -> None:
         """Write a new alert threshold."""
         try:
-            await self.coordinator.async_set_alert_limit(
-                self._device_id, self._limit_key, int(value)
+            await self.coordinator.async_write_device_settings(
+                self._device_id,
+                {"dehumidifier": {"alertLimits": {self._limit_key: int(value)}}},
             )
         except (AprilaireCloudRateLimitError, AprilaireCloudApiError) as err:
             raise_ha_write_error(err)

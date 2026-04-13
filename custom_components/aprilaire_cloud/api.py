@@ -206,11 +206,9 @@ class AprilaireCloudApiClient:
         """Fetch device status."""
         return await self._async_request_json("GET", f"{DEVICE_API}/{device_id}/status")
 
-    async def async_get_dehumidifier_status(self, device_id: str) -> dict[str, Any]:
-        """Fetch dehumidifier status."""
-        return await self._async_request_json(
-            "GET", f"{DEVICE_API}/{device_id}/status/dehumidifier"
-        )
+    async def async_get_status(self, device_id: str, endpoint: str) -> dict[str, Any]:
+        """Fetch a profile-specific status payload."""
+        return await self._async_request_json("GET", f"{DEVICE_API}/{device_id}/status/{endpoint}")
 
     async def async_get_device_settings(self, device_id: str) -> dict[str, Any]:
         """Fetch writable device settings."""

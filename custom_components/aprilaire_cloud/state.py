@@ -11,6 +11,9 @@ from .models import DeviceRecord, HierarchyDevice, HierarchyLocation, merge_sett
 from .profiles import evaluate_profile
 
 _MISSING = object()
+STATUS_MESSAGE_KEYS = {
+    "DehumidifierStatus": "dehumidifier",
+}
 
 
 @dataclass(slots=True)
@@ -139,11 +142,22 @@ def evaluate_device_support(record: DeviceRecord) -> DeviceRecord:
     )
 
 
+def apply_status_payload(
+    record: DeviceRecord,
+    key: str,
+    payload: dict[str, Any],
+) -> DeviceRecord:
+    """Apply a profile-owned status payload to a device record."""
+    status_payloads = dict(record.status_payloads)
+    status_payloads[key] = deepcopy(payload)
+    return replace(record, status_payloads=status_payloads)
+
+
 def apply_device_message(record: DeviceRecord, message: dict[str, Any]) -> DeviceRecord:
     """Apply one websocket payload to a device record."""
     message_type = message.get("_type")
-    if message_type == "DehumidifierStatus":
-        return replace(record, dehumidifier_status=message)
+    if message_type in STATUS_MESSAGE_KEYS:
+        return apply_status_payload(record, STATUS_MESSAGE_KEYS[message_type], message)
     if message_type == "DeviceSettings":
         return apply_confirmed_device_settings(record, message)
     if message_type == "DeviceSetup":
@@ -159,15 +173,17 @@ def apply_rest_refresh(
     record: DeviceRecord,
     *,
     device_status: dict[str, Any],
-    dehumidifier_status: dict[str, Any],
     settings: dict[str, Any],
+    status_payloads: dict[str, dict[str, Any]] | None = None,
 ) -> DeviceRecord:
     """Apply a REST refresh to a device record."""
-    return replace(
+    updated = replace(
         apply_confirmed_device_settings(record, settings),
         device_status=device_status,
-        dehumidifier_status=dehumidifier_status,
     )
+    for key, payload in (status_payloads or {}).items():
+        updated = apply_status_payload(updated, key, payload)
+    return updated
 
 
 def apply_hierarchy(

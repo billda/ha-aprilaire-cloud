@@ -35,6 +35,7 @@ from .common import (
     build_dehumidifier_status,
     build_device_settings,
     build_device_setup,
+    build_device_status,
     build_hierarchy,
     build_initial_messages,
     build_two_location_hierarchy,
@@ -54,6 +55,29 @@ def config_entry(hass):
     )
     entry.add_to_hass(hass)
     return entry
+
+
+async def _async_set_target_humidity(
+    coordinator: AprilaireCloudDataUpdateCoordinator,
+    humidity: int,
+) -> None:
+    """Write the dehumidifier humidity setpoint."""
+    await coordinator.async_write_device_settings(
+        DEVICE_ID,
+        {"dehumidifier": {"humiditySetpoint": humidity}},
+    )
+
+
+async def _async_set_alert_limit(
+    coordinator: AprilaireCloudDataUpdateCoordinator,
+    key: str,
+    value: int,
+) -> None:
+    """Write a dehumidifier alert limit."""
+    await coordinator.async_write_device_settings(
+        DEVICE_ID,
+        {"dehumidifier": {"alertLimits": {key: value}}},
+    )
 
 
 async def test_coordinator_bootstrap_marks_supported_devices(
@@ -144,7 +168,7 @@ async def test_single_humidity_write_is_optimistic_and_requires_device_settings_
     )
     await bootstrap_coordinator(coordinator)
 
-    task = asyncio.create_task(coordinator.async_set_target_humidity(DEVICE_ID, 55))
+    task = asyncio.create_task(_async_set_target_humidity(coordinator, 55))
     await asyncio.wait_for(client.patch_started.wait(), timeout=1)
 
     assert (
@@ -193,7 +217,7 @@ async def test_successful_write_clears_internal_write_state(
     )
     await bootstrap_coordinator(coordinator)
 
-    task = asyncio.create_task(coordinator.async_set_target_humidity(DEVICE_ID, 55))
+    task = asyncio.create_task(_async_set_target_humidity(coordinator, 55))
     await asyncio.wait_for(client.patch_started.wait(), timeout=1)
 
     client.patch_release.set()
@@ -222,10 +246,10 @@ async def test_rapid_humidity_writes_are_last_write_wins(
     )
     await bootstrap_coordinator(coordinator)
 
-    first = asyncio.create_task(coordinator.async_set_target_humidity(DEVICE_ID, 45))
+    first = asyncio.create_task(_async_set_target_humidity(coordinator, 45))
     await wait_until(lambda: len(client.patched_payloads) == 1)
 
-    second = asyncio.create_task(coordinator.async_set_target_humidity(DEVICE_ID, 50))
+    second = asyncio.create_task(_async_set_target_humidity(coordinator, 50))
     await asyncio.sleep(0)
 
     assert (
@@ -284,10 +308,10 @@ async def test_failed_older_write_reverts_only_its_own_paths(
     )
     await bootstrap_coordinator(coordinator)
 
-    first = asyncio.create_task(coordinator.async_set_target_humidity(DEVICE_ID, 55))
+    first = asyncio.create_task(_async_set_target_humidity(coordinator, 55))
     await asyncio.wait_for(client.patch_started.wait(), timeout=1)
 
-    second = asyncio.create_task(coordinator.async_set_alert_limit(DEVICE_ID, "highHum", 70))
+    second = asyncio.create_task(_async_set_alert_limit(coordinator, "highHum", 70))
     await asyncio.sleep(0)
 
     assert (
@@ -394,7 +418,7 @@ async def test_fallback_refresh_only_targets_devices_in_unhealthy_locations(
     await bootstrap_coordinator(coordinator)
 
     client.requested_status_ids.clear()
-    client.requested_dehumidifier_ids.clear()
+    client.requested_status_endpoints.clear()
     client.requested_settings_ids.clear()
 
     await coordinator.async_socket_state_changed(
@@ -408,8 +432,69 @@ async def test_fallback_refresh_only_targets_devices_in_unhealthy_locations(
     await coordinator._async_update_data()
 
     assert client.requested_status_ids == [SECOND_DEVICE_ID]
-    assert client.requested_dehumidifier_ids == [SECOND_DEVICE_ID]
+    assert client.requested_status_endpoints == [(SECOND_DEVICE_ID, "dehumidifier")]
     assert client.requested_settings_ids == [SECOND_DEVICE_ID]
+
+
+async def test_terminally_rejected_devices_do_not_drive_rest_fallback(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """A terminally unsupported device should not force REST fallback refreshes."""
+
+    class TerminalUnsupportedFakeWebSocket(FakeWebSocket):
+        async def async_wait_for_initial_sync(self, wait_timeout: float) -> bool:
+            await self._message_callback(
+                self._location_id,
+                [
+                    {
+                        "_type": "DeviceSetup",
+                        "deviceId": DEVICE_ID,
+                        "type": "thermostat",
+                    },
+                    build_device_status(DEVICE_ID),
+                ],
+            )
+            await self._state_callback(
+                SocketState(
+                    location_id=self._location_id,
+                    connected=True,
+                    initial_sync_complete=True,
+                )
+            )
+            return True
+
+    client = FakeClient()
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket",
+        TerminalUnsupportedFakeWebSocket,
+    )
+
+    coordinator = AprilaireCloudDataUpdateCoordinator(
+        hass, config_entry=config_entry, client=client
+    )
+    await bootstrap_coordinator(coordinator)
+
+    assert coordinator.data.devices[DEVICE_ID].supported is False
+    assert coordinator.data.devices[DEVICE_ID].unsupported_reason == "unsupported_equipment_type"
+    assert client.requested_status_ids == []
+    assert client.requested_status_endpoints == []
+    assert client.requested_settings_ids == []
+
+    await coordinator.async_socket_state_changed(
+        SocketState(
+            location_id=LOCATION_ID,
+            connected=False,
+            initial_sync_complete=False,
+        )
+    )
+    await coordinator._async_update_data()
+
+    assert client.requested_status_ids == []
+    assert client.requested_status_endpoints == []
+    assert client.requested_settings_ids == []
 
 
 async def test_partial_rest_refresh_failure_keeps_successful_devices_updated(
@@ -505,7 +590,7 @@ async def test_timeout_rest_refresh_matching_value_succeeds(
     )
     await bootstrap_coordinator(coordinator)
 
-    await coordinator.async_set_target_humidity(DEVICE_ID, 55)
+    await _async_set_target_humidity(coordinator, 55)
 
     assert coordinator.data.devices[DEVICE_ID].pending_device_settings == {}
     assert (
@@ -537,7 +622,7 @@ async def test_timeout_rest_refresh_mismatch_reverts_latest_pending_write(
     await bootstrap_coordinator(coordinator)
 
     with pytest.raises(AprilaireCloudWriteError):
-        await coordinator.async_set_target_humidity(DEVICE_ID, 55)
+        await _async_set_target_humidity(coordinator, 55)
 
     assert coordinator.data.devices[DEVICE_ID].pending_device_settings == {}
     assert (
@@ -565,7 +650,7 @@ async def test_alert_limit_write_uses_nested_settings_confirmation(
     )
     await bootstrap_coordinator(coordinator)
 
-    task = asyncio.create_task(coordinator.async_set_alert_limit(DEVICE_ID, "highHum", 70))
+    task = asyncio.create_task(_async_set_alert_limit(coordinator, "highHum", 70))
     await wait_until(
         lambda: (
             coordinator.data.devices[DEVICE_ID].effective_device_settings["dehumidifier"][

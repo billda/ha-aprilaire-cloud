@@ -86,6 +86,8 @@ async def test_diagnostics_include_runtime_state_and_redact_credentials(
         ]
         == 60
     )
+    assert "dehumidifier" in diagnostics["snapshot"]["devices"][DEVICE_ID]["status_payloads"]
+    assert "dehumidifier_status" not in diagnostics["snapshot"]["devices"][DEVICE_ID]
     assert diagnostics["snapshot"]["write_states"][DEVICE_ID]["pending_paths"] == [
         "dehumidifier.humiditySetpoint"
     ]
