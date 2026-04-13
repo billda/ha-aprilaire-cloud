@@ -89,7 +89,7 @@ async def async_get_config_entry_diagnostics(
                         "device_settings": device.device_settings,
                         "pending_device_settings": device.pending_device_settings,
                         "effective_device_settings": device.effective_device_settings,
-                        "dehumidifier_status": device.dehumidifier_status,
+                        "status_payloads": device.status_payloads,
                     }
                     for device_id, device in coordinator.data.devices.items()
                 },

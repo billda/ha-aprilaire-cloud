@@ -42,7 +42,11 @@ from .const import (
 )
 from .data import AprilaireCloudConfigEntry
 from .models import AprilaireSnapshot, DeviceRecord, HierarchyLocation, SocketState
-from .profiles import format_unsupported_reasons
+from .profiles import (
+    format_unsupported_reasons,
+    record_requires_rest_refresh,
+    status_requests_for_record,
+)
 from .state import (
     DeviceWriteState,
     apply_confirmed_device_settings,
@@ -248,27 +252,6 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         self._socket_states[state.location_id] = state
         self._publish_snapshot()
 
-    async def async_set_mode(self, device_id: str, enabled: bool) -> None:
-        """Set the operating mode for a device."""
-        await self.async_write_device_settings(
-            device_id,
-            {"dehumidifier": {"mode": "on" if enabled else "off"}},
-        )
-
-    async def async_set_target_humidity(self, device_id: str, humidity: int) -> None:
-        """Set the target humidity for a device."""
-        await self.async_write_device_settings(
-            device_id,
-            {"dehumidifier": {"humiditySetpoint": humidity}},
-        )
-
-    async def async_set_alert_limit(self, device_id: str, key: str, value: int) -> None:
-        """Set an alert limit."""
-        await self.async_write_device_settings(
-            device_id,
-            {"dehumidifier": {"alertLimits": {key: value}}},
-        )
-
     async def async_write_device_settings(
         self,
         device_id: str,
@@ -423,10 +406,9 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         return {
             device_id
             for device_id, record in self._devices.items()
-            if (
-                record.hierarchy.location_id in unhealthy_locations
-                or not record.device_settings
-                or not record.dehumidifier_status
+            if record_requires_rest_refresh(
+                record,
+                location_unhealthy=record.hierarchy.location_id in unhealthy_locations,
             )
         }
 
@@ -490,13 +472,22 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
 
         async def _refresh_device(
             device_id: str,
-        ) -> tuple[str, dict[str, Any], dict[str, Any], dict[str, Any] | Exception]:
+        ) -> tuple[
+            str,
+            dict[str, Any],
+            dict[str, dict[str, Any]],
+            dict[str, Any] | Exception,
+        ]:
             async with semaphore:
                 try:
-                    status, dehumidifier_status, settings = await asyncio.gather(
+                    status_requests = status_requests_for_record(self._devices[device_id])
+                    status, settings, *profile_statuses = await asyncio.gather(
                         self.client.async_get_device_status(device_id),
-                        self.client.async_get_dehumidifier_status(device_id),
                         self.client.async_get_device_settings(device_id),
+                        *(
+                            self.client.async_get_status(device_id, request.endpoint)
+                            for request in status_requests
+                        ),
                     )
                 except (
                     AprilaireCloudApiError,
@@ -505,13 +496,23 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
                     AprilaireCloudRateLimitError,
                 ) as err:
                     return device_id, {}, {}, err
-                return device_id, status, dehumidifier_status, settings
+                return (
+                    device_id,
+                    status,
+                    {
+                        request.key: payload
+                        for request, payload in zip(
+                            status_requests, profile_statuses, strict=True
+                        )
+                    },
+                    settings,
+                )
 
         results = await asyncio.gather(*(_refresh_device(device_id) for device_id in ids))
         refreshed_ids: set[str] = set()
         refresh_errors: dict[str, Exception] = {}
 
-        for device_id, status, dehumidifier_status, settings in results:
+        for device_id, status, status_payloads, settings in results:
             if device_id not in self._devices:
                 continue
             if isinstance(settings, Exception):
@@ -522,8 +523,8 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
                 apply_rest_refresh(
                     self._devices[device_id],
                     device_status=status,
-                    dehumidifier_status=dehumidifier_status,
                     settings=settings,
+                    status_payloads=status_payloads,
                 )
             )
             self._sync_write_state(device_id, confirmed_settings=settings)

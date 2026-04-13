@@ -220,7 +220,7 @@ class FakeClient:
         self.patch_side_effects: list[Exception | None] = []
         self.rest_failures: dict[tuple[str, str], Exception] = {}
         self.requested_status_ids: list[str] = []
-        self.requested_dehumidifier_ids: list[str] = []
+        self.requested_status_endpoints: list[tuple[str, str]] = []
         self.requested_settings_ids: list[str] = []
         self.rate_limited_until = None
 
@@ -245,12 +245,14 @@ class FakeClient:
             raise self.rest_failures[("device_status", device_id)]
         return build_initial_messages(device_id)[3]
 
-    async def async_get_dehumidifier_status(self, device_id: str) -> dict:
-        """Return dehumidifier status."""
-        self.requested_dehumidifier_ids.append(device_id)
-        if ("dehumidifier_status", device_id) in self.rest_failures:
-            raise self.rest_failures[("dehumidifier_status", device_id)]
-        return build_dehumidifier_status(device_id)
+    async def async_get_status(self, device_id: str, endpoint: str) -> dict:
+        """Return a profile-specific status payload."""
+        self.requested_status_endpoints.append((device_id, endpoint))
+        if ("status", f"{device_id}:{endpoint}") in self.rest_failures:
+            raise self.rest_failures[("status", f"{device_id}:{endpoint}")]
+        if endpoint == "dehumidifier":
+            return build_dehumidifier_status(device_id)
+        return {"_type": f"{endpoint.title()}Status", "deviceId": device_id}
 
     async def async_get_device_settings(self, device_id: str) -> dict:
         """Return device settings."""

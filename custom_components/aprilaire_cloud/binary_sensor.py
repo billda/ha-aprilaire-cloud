@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
@@ -26,47 +26,52 @@ from .profiles import NormalizedDehumidifierState, get_profile
 class AprilaireBinarySensorDescription(BinarySensorEntityDescription):
     """Description for an AprilAire binary sensor."""
 
-    value_fn: Callable[[NormalizedDehumidifierState], bool | None]
+    value_fn: Callable[[object], bool | None]
     enabled_default: bool = True
 
 
-BINARY_SENSORS: dict[str, AprilaireBinarySensorDescription] = {
+def _dehumidifier_state(normalized: object) -> NormalizedDehumidifierState:
+    """Return dehumidifier-normalized state."""
+    return cast(NormalizedDehumidifierState, normalized)
+
+
+DEHUMIDIFIER_BINARY_SENSORS: dict[str, AprilaireBinarySensorDescription] = {
     "filter_service": AprilaireBinarySensorDescription(
         key="filter_service",
         translation_key="filter_service",
         device_class=BinarySensorDeviceClass.PROBLEM,
-        value_fn=lambda normalized: normalized.filter_needs_service,
+        value_fn=lambda normalized: _dehumidifier_state(normalized).filter_needs_service,
     ),
     "alert_high_humidity": AprilaireBinarySensorDescription(
         key="alert_high_humidity",
         translation_key="alert_high_humidity",
         device_class=BinarySensorDeviceClass.PROBLEM,
-        value_fn=lambda normalized: normalized.alert_high_humidity,
+        value_fn=lambda normalized: _dehumidifier_state(normalized).alert_high_humidity,
     ),
     "alert_low_humidity": AprilaireBinarySensorDescription(
         key="alert_low_humidity",
         translation_key="alert_low_humidity",
         device_class=BinarySensorDeviceClass.PROBLEM,
-        value_fn=lambda normalized: normalized.alert_low_humidity,
+        value_fn=lambda normalized: _dehumidifier_state(normalized).alert_low_humidity,
     ),
     "alert_high_temperature": AprilaireBinarySensorDescription(
         key="alert_high_temperature",
         translation_key="alert_high_temperature",
         device_class=BinarySensorDeviceClass.PROBLEM,
-        value_fn=lambda normalized: normalized.alert_high_temperature,
+        value_fn=lambda normalized: _dehumidifier_state(normalized).alert_high_temperature,
     ),
     "alert_low_temperature": AprilaireBinarySensorDescription(
         key="alert_low_temperature",
         translation_key="alert_low_temperature",
         device_class=BinarySensorDeviceClass.PROBLEM,
-        value_fn=lambda normalized: normalized.alert_low_temperature,
+        value_fn=lambda normalized: _dehumidifier_state(normalized).alert_low_temperature,
     ),
     "compressor": AprilaireBinarySensorDescription(
         key="compressor",
         translation_key="compressor",
         device_class=BinarySensorDeviceClass.RUNNING,
         entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda normalized: normalized.compressor_on,
+        value_fn=lambda normalized: _dehumidifier_state(normalized).compressor_on,
         enabled_default=False,
     ),
     "dehumidifier_fan": AprilaireBinarySensorDescription(
@@ -74,7 +79,7 @@ BINARY_SENSORS: dict[str, AprilaireBinarySensorDescription] = {
         translation_key="dehumidifier_fan",
         device_class=BinarySensorDeviceClass.RUNNING,
         entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda normalized: normalized.dehumidifier_fan_on,
+        value_fn=lambda normalized: _dehumidifier_state(normalized).dehumidifier_fan_on,
         enabled_default=False,
     ),
     "hvac_fan": AprilaireBinarySensorDescription(
@@ -82,9 +87,14 @@ BINARY_SENSORS: dict[str, AprilaireBinarySensorDescription] = {
         translation_key="hvac_fan",
         device_class=BinarySensorDeviceClass.RUNNING,
         entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda normalized: normalized.hvac_fan_on,
+        value_fn=lambda normalized: _dehumidifier_state(normalized).hvac_fan_on,
         enabled_default=False,
     ),
+}
+PROFILE_BINARY_SENSOR_DESCRIPTIONS: dict[
+    str, dict[str, AprilaireBinarySensorDescription]
+] = {
+    "dehumidifier": DEHUMIDIFIER_BINARY_SENSORS,
 }
 
 
@@ -97,8 +107,9 @@ async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry, async_add_en
         if profile is None:
             return
         entity_set = profile.entity_descriptions(coordinator.data.devices[device_id])
+        descriptions = PROFILE_BINARY_SENSOR_DESCRIPTIONS.get(device.profile_key, {})
         for key in entity_set.binary_sensor_keys:
-            description = BINARY_SENSORS.get(key)
+            description = descriptions.get(key)
             if description is not None:
                 yield AprilaireBinarySensorEntity(coordinator, device_id, description)
 
@@ -153,7 +164,7 @@ class AprilaireBinarySensorEntity(AprilaireCloudEntity, BinarySensorEntity):
     @property
     def is_on(self) -> bool | None:
         """Return whether the binary sensor is on."""
-        normalized = self.normalized_device
+        normalized = self.normalized_state
         if normalized is None:
             return None
         return self.entity_description.value_fn(normalized)

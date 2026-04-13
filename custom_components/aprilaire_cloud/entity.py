@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from typing import Any, cast
+from typing import Any
 
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -14,7 +14,7 @@ from .const import ATTRIBUTION, DOMAIN, MANUFACTURER
 from .coordinator import AprilaireCloudDataUpdateCoordinator
 from .data import AprilaireCloudConfigEntry
 from .models import DeviceRecord
-from .profiles import DeviceProfile, NormalizedDehumidifierState, get_profile, normalize_device
+from .profiles import DeviceProfile, get_profile, normalize_device
 
 
 def raise_ha_write_error(err: Exception) -> None:
@@ -114,12 +114,12 @@ class AprilaireCloudEntity(CoordinatorEntity[AprilaireCloudDataUpdateCoordinator
         return get_profile(device.profile_key)
 
     @property
-    def normalized_device(self) -> NormalizedDehumidifierState | None:
-        """Return normalized device state for supported devices."""
+    def normalized_state(self) -> object | None:
+        """Return normalized profile state for supported devices."""
         device = self.device
         if device is None:
             return None
-        return cast(NormalizedDehumidifierState | None, normalize_device(device))
+        return normalize_device(device)
 
     @property
     def device_info(self) -> DeviceInfo:
