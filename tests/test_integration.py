@@ -13,6 +13,7 @@ from custom_components.aprilaire_cloud.const import (
     CONF_ENABLE_EXTRA_DIAGNOSTICS,
     DOMAIN,
 )
+from custom_components.aprilaire_cloud.models import SocketState
 
 from .common import (
     DEVICE_ID,
@@ -24,8 +25,12 @@ from .common import (
     FakeClient,
     FakeWebSocket,
     MultiLocationFakeWebSocket,
+    ThermostatFakeWebSocket,
     build_hierarchy,
     build_initial_messages,
+    build_thermostat_hierarchy,
+    build_thermostat_initial_messages,
+    build_thermostat_settings,
     build_two_location_hierarchy,
     build_user,
 )
@@ -189,6 +194,127 @@ async def test_remove_device_guard_blocks_live_location_devices(
         )
         is True
     )
+
+
+async def test_setup_creates_climate_entities_for_thermostat_accounts(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+) -> None:
+    """Thermostat-only accounts should create stable zone climate entities."""
+    client = FakeClient()
+    client._hierarchy = build_thermostat_hierarchy()
+    client.device_settings = build_thermostat_settings()
+    FakeWebSocket.instances.clear()
+
+    monkeypatch.setattr(
+        integration, "AprilaireCloudApiClient", lambda username, password, session: client
+    )
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket",
+        ThermostatFakeWebSocket,
+    )
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title=USERNAME,
+        unique_id=build_user()["userId"],
+        data={"username": USERNAME, "password": PASSWORD},
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    entity_registry = er.async_get(hass)
+    unique_ids = {
+        entity.unique_id
+        for entity in er.async_entries_for_config_entry(entity_registry, entry.entry_id)
+    }
+
+    assert {
+        "THERMO0001_thermostat_pz1",
+        "THERMO0001_thermostat_sz2",
+        "THERMO0001_thermostat_sz3",
+    }.issubset(unique_ids)
+
+
+async def test_mixed_dehumidifier_and_thermostat_accounts_create_both_families(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+) -> None:
+    """Mixed accounts should surface both existing and beta device families."""
+
+    class MixedFakeWebSocket(FakeWebSocket):
+        async def async_wait_for_initial_sync(self, wait_timeout: float) -> bool:
+            await self._message_callback(
+                self._location_id,
+                [
+                    *build_initial_messages(DEVICE_ID),
+                    *build_thermostat_initial_messages(),
+                ],
+            )
+            await self._state_callback(
+                SocketState(
+                    location_id=self._location_id,
+                    connected=True,
+                    initial_sync_complete=True,
+                )
+            )
+            return True
+
+    client = FakeClient()
+    client._hierarchy = {
+        "locations": [
+            {
+                "locationId": LOCATION_ID,
+                "name": "Home",
+                "timeZone": "America/New_York",
+                "rooms": [
+                    {
+                        "name": "Basement",
+                        "devices": [{"deviceId": DEVICE_ID, "access": "manage", "zone": 1}],
+                    },
+                    {
+                        "name": "Main Floor",
+                        "devices": [
+                            {"deviceId": "THERMO0001", "access": "manage", "zone": 1}
+                        ],
+                    },
+                ],
+            }
+        ]
+    }
+    FakeWebSocket.instances.clear()
+
+    monkeypatch.setattr(
+        integration, "AprilaireCloudApiClient", lambda username, password, session: client
+    )
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket",
+        MixedFakeWebSocket,
+    )
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title=USERNAME,
+        unique_id=build_user()["userId"],
+        data={"username": USERNAME, "password": PASSWORD},
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    entity_registry = er.async_get(hass)
+    unique_ids = {
+        entity.unique_id
+        for entity in er.async_entries_for_config_entry(entity_registry, entry.entry_id)
+    }
+
+    assert f"{DEVICE_ID}_dehumidifier" in unique_ids
+    assert "THERMO0001_thermostat_pz1" in unique_ids
 
 
 async def test_removed_locations_cleanup_and_recreate_websocket_entities(

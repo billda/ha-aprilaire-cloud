@@ -4,7 +4,7 @@
 [![Validate](https://github.com/billda/ha-aprilaire-cloud/actions/workflows/validate.yml/badge.svg)](https://github.com/billda/ha-aprilaire-cloud/actions/workflows/validate.yml)
 [![Open in HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=billda&repository=ha-aprilaire-cloud&category=integration)
 
-Home Assistant custom integration for AprilAire Healthy Air cloud-connected dehumidifiers.
+Home Assistant custom integration for AprilAire Healthy Air cloud-connected dehumidifiers and beta/tester-ready thermostats.
 
 This integration connects to the modern `aprilaire.io` platform used by the AprilAire Healthy Air app. It is built as a standard Home Assistant config-entry integration for HACS, with automatic device discovery, WebSocket-first updates, diagnostics support, and dynamic entity creation when new supported devices appear on the account.
 
@@ -22,17 +22,17 @@ This project is unofficial and is not affiliated with AprilAire.
 | --- | --- |
 | Platform | Home Assistant custom integration via HACS |
 | Cloud | `aprilaire.io` |
-| Device focus | Supported AprilAire Healthy Air dehumidifiers |
+| Device focus | Supported AprilAire Healthy Air dehumidifiers and beta AprilAire thermostats |
 | Setup style | UI-only config entry |
 | Update model | WebSocket-first with bounded REST fallback |
 | Multi-device support | Yes, across multiple locations on one account |
-| Tested live | AprilAire E100W |
+| Tested live | AprilAire E100W; thermostat support needs tester confirmation |
 
 ## Highlights
 
 - UI-only setup through Home Assistant
 - WebSocket-first updates for near real-time state changes
-- Automatic discovery of supported dehumidifiers on the configured account
+- Automatic discovery of supported dehumidifiers and beta thermostats on the configured account
 - Support for multiple devices and multiple locations on one account
 - Standard Home Assistant behavior: device registry, config entries, reauth, diagnostics, dynamic entity creation
 - Conservative capability detection so unsupported devices are skipped instead of exposed in a misleading or partially broken way
@@ -49,6 +49,22 @@ This integration supports AprilAire Healthy Air dehumidifiers available through 
 
 The integration is designed to discover devices by capability rather than by a hardcoded model allowlist. If you have a different AprilAire dehumidifier model that uses the same capability profile, there is a good chance it will work, but I need real-world testing reports to confirm broader model support.
 
+### Beta Thermostat Support
+
+Thermostat support is beta/tester-ready. It is based on the same `aprilaire.io` API research as the dehumidifier support, but live thermostat payloads still need confirmation from owners.
+
+Expected thermostat support includes:
+
+- climate entities for zones `PZ1`, `SZ2`, and `SZ3` when those zones are reported
+- heat, cool, auto, and off HVAC modes
+- heat and cool setpoints
+- fan modes `auto`, `on`, and `circulate`
+- hold/preset modes `none`, `temporary`, `permanent`, and `vacation`
+- read-only thermostat humidity, outdoor conditions, equipment status, and HVAC service sensors when reported
+- read-only status/service sensors for thermostat-connected humidifier, dehumidifier, fresh-air, and air-cleaning equipment when installed
+
+Expected model families include the AprilAire Wi-Fi thermostat families that use the AprilAire Healthy Air / `aprilaire.io` platform, including the 8920W. Please file a compatibility report with diagnostics if your thermostat appears, partly works, or is skipped.
+
 Live validation has been performed against a real AprilAire cloud account and a real AprilAire E100W. If your device authenticates successfully but does not show up in Home Assistant, the most likely reason is that it exposes an unsupported capability profile rather than a bad login.
 
 ## Explicitly Out Of Scope
@@ -56,10 +72,12 @@ Live validation has been performed against a real AprilAire cloud account and a 
 The following are not supported:
 
 - `aprilairestat.com`
-- AprilAire thermostats
 - devices that use `drynessSetpoint`
 - devices using `remote`, `external`, or other non-internal control modes
 - devices using dew-point style control instead of `%RH`
+- thermostat schedule editing
+- thermostat-connected IAQ controls
+- thermostat emergency-heat writes
 - YAML configuration
 
 Unsupported devices are intentionally ignored rather than approximated.
@@ -97,7 +115,7 @@ During setup, the integration:
 2. Validates the account through the AprilAire account API.
 3. Loads the AprilAire device hierarchy for the account.
 4. Creates one Home Assistant config entry for that AprilAire cloud account.
-5. Discovers and adds all supported dehumidifiers under that account.
+5. Discovers and adds all supported dehumidifiers and beta thermostats under that account.
 
 The account `userId` is used as the config-entry unique ID so the same AprilAire account cannot be added twice.
 
@@ -105,7 +123,7 @@ The account `userId` is used as the config-entry unique ID so the same AprilAire
 
 One Home Assistant config entry represents one AprilAire cloud account.
 
-All supported dehumidifiers on that account are created automatically during setup. If you add another supported AprilAire dehumidifier to the same account later, Home Assistant should surface it automatically without requiring you to remove and re-add the integration.
+All supported dehumidifiers and beta thermostats on that account are created automatically during setup. If you add another supported AprilAire device to the same account later, Home Assistant should surface it automatically without requiring you to remove and re-add the integration.
 
 Discovery happens through:
 
@@ -119,6 +137,7 @@ The exact set of entities depends on what each device reports.
 
 | Entity type | Purpose |
 | --- | --- |
+| `climate` | Thermostat zone control |
 | `humidifier` | Main dehumidifier control and target humidity |
 | `sensor` | Humidity, temperature, filter life, and diagnostics |
 | `binary_sensor` | Alerts and running-state diagnostics |
@@ -126,7 +145,7 @@ The exact set of entities depends on what each device reports.
 
 ### Primary Control
 
-Each supported device creates one primary `humidifier` entity using Home Assistant's dehumidifier device class.
+Each supported dehumidifier creates one primary `humidifier` entity using Home Assistant's dehumidifier device class.
 
 Supported controls:
 
@@ -148,6 +167,19 @@ Depending on device payloads, the integration may expose:
 - raw equipment status
 - extra temperature sensors
 - writable high humidity alert limit
+
+### Thermostat Controls
+
+Each supported thermostat creates one `climate` entity per reported zone.
+
+Supported controls:
+
+- set HVAC mode to off, heat, cool, or heat/cool auto
+- set heat and cool setpoints
+- set fan mode
+- set hold/preset mode
+
+Thermostat schedule editing, emergency-heat writes, and controls for thermostat-connected IAQ equipment are intentionally deferred.
 
 ## Update Model
 

@@ -23,7 +23,12 @@ from homeassistant.helpers.entity import EntityCategory
 from .coordinator import AprilaireCloudDataUpdateCoordinator
 from .data import AprilaireCloudConfigEntry
 from .entity import AprilaireCloudEntity, setup_dynamic_platform_entities
-from .profiles import NormalizedDehumidifierState, get_profile
+from .profiles import (
+    NormalizedDehumidifierState,
+    NormalizedThermostatState,
+    NormalizedThermostatZoneState,
+    get_profile,
+)
 
 DynamicSensorFactory = Callable[
     [AprilaireCloudDataUpdateCoordinator, str, str],
@@ -121,6 +126,52 @@ PROFILE_DYNAMIC_SENSOR_FACTORIES: dict[str, DynamicSensorFactory] = {
 }
 
 
+THERMOSTAT_ZONE_SENSOR_NAMES = {
+    "indoor_humidity": "Indoor humidity",
+    "outdoor_temperature": "Outdoor temperature",
+    "outdoor_humidity": "Outdoor humidity",
+    "equipment_status": "Equipment status",
+    "hvac_service_remaining": "HVAC service remaining",
+}
+
+THERMOSTAT_IAQ_SENSOR_NAMES = {
+    "status": "Status",
+    "service_remaining": "Service remaining",
+}
+
+
+def _thermostat_dynamic_sensor(
+    coordinator: AprilaireCloudDataUpdateCoordinator,
+    device_id: str,
+    key: str,
+) -> AprilaireCloudEntity | None:
+    """Create a thermostat-owned dynamic sensor."""
+    thermostat_prefix = "thermostat_"
+    if key.startswith(thermostat_prefix):
+        remainder = key.removeprefix(thermostat_prefix)
+        parts = remainder.split("_", 1)
+        if len(parts) != 2:
+            return None
+        zone_key, metric = parts[0].upper(), parts[1]
+        if metric not in THERMOSTAT_ZONE_SENSOR_NAMES:
+            return None
+        return AprilaireThermostatZoneSensor(coordinator, device_id, zone_key, metric, key)
+
+    iaq_prefix = "iaq_"
+    if key.startswith(iaq_prefix):
+        remainder = key.removeprefix(iaq_prefix)
+        for metric in THERMOSTAT_IAQ_SENSOR_NAMES:
+            suffix = f"_{metric}"
+            if remainder.endswith(suffix):
+                kind = remainder[: -len(suffix)]
+                return AprilaireThermostatIAQSensor(coordinator, device_id, kind, metric, key)
+
+    return None
+
+
+PROFILE_DYNAMIC_SENSOR_FACTORIES["thermostat"] = _thermostat_dynamic_sensor
+
+
 async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry, async_add_entities) -> None:
     """Set up AprilAire sensors."""
     coordinator = entry.runtime_data.coordinator
@@ -213,4 +264,128 @@ class AprilaireDehumidifierExtraTemperatureSensor(AprilaireCloudEntity, SensorEn
         for probe in normalized.extra_temperature_probes:
             if probe.uid == self._uid:
                 return probe.reading
+        return None
+
+
+def _thermostat_state(normalized: object | None) -> NormalizedThermostatState | None:
+    """Return thermostat-normalized state."""
+    return cast(NormalizedThermostatState | None, normalized)
+
+
+def _thermostat_temperature_unit(zone: NormalizedThermostatZoneState | None) -> str:
+    """Return a Home Assistant temperature unit for a thermostat zone."""
+    if zone and zone.temperature_unit == "C":
+        return UnitOfTemperature.CELSIUS
+    return UnitOfTemperature.FAHRENHEIT
+
+
+class AprilaireThermostatZoneSensor(AprilaireCloudEntity, SensorEntity):
+    """A thermostat-owned zone sensor."""
+
+    def __init__(
+        self,
+        coordinator: AprilaireCloudDataUpdateCoordinator,
+        device_id: str,
+        zone_key: str,
+        metric: str,
+        key: str,
+    ) -> None:
+        """Initialize the sensor."""
+        self._zone_key = zone_key
+        self._metric = metric
+        super().__init__(coordinator, device_id, key)
+        if metric in {"indoor_humidity", "outdoor_humidity"}:
+            self._attr_native_unit_of_measurement = PERCENTAGE
+            self._attr_device_class = SensorDeviceClass.HUMIDITY
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+        elif metric == "outdoor_temperature":
+            self._attr_device_class = SensorDeviceClass.TEMPERATURE
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+        elif metric == "hvac_service_remaining":
+            self._attr_native_unit_of_measurement = PERCENTAGE
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+            self._attr_entity_category = EntityCategory.DIAGNOSTIC
+            self._attr_entity_registry_enabled_default = coordinator.extra_diagnostics_enabled
+        else:
+            self._attr_entity_category = EntityCategory.DIAGNOSTIC
+            self._attr_entity_registry_enabled_default = coordinator.extra_diagnostics_enabled
+
+    @property
+    def name(self) -> str:
+        """Return the entity name."""
+        return f"{self._zone_key} {THERMOSTAT_ZONE_SENSOR_NAMES[self._metric]}"
+
+    @property
+    def _zone(self) -> NormalizedThermostatZoneState | None:
+        """Return normalized thermostat zone state."""
+        normalized = _thermostat_state(self.normalized_state)
+        if normalized is None:
+            return None
+        return normalized.zones.get(self._zone_key)
+
+    @property
+    def native_unit_of_measurement(self) -> str | None:
+        """Return the unit for thermostat temperature sensors."""
+        if self._metric == "outdoor_temperature":
+            return _thermostat_temperature_unit(self._zone)
+        return getattr(self, "_attr_native_unit_of_measurement", None)
+
+    @property
+    def native_value(self):
+        """Return the current sensor reading."""
+        zone = self._zone
+        if zone is None:
+            return None
+        if self._metric == "indoor_humidity":
+            return zone.current_humidity
+        if self._metric == "outdoor_temperature":
+            return zone.outdoor_temperature
+        if self._metric == "outdoor_humidity":
+            return zone.outdoor_humidity
+        if self._metric == "equipment_status":
+            return zone.equipment_status
+        if self._metric == "hvac_service_remaining":
+            return zone.hvac_service_remaining
+        return None
+
+
+class AprilaireThermostatIAQSensor(AprilaireCloudEntity, SensorEntity):
+    """A read-only thermostat-owned IAQ status sensor."""
+
+    def __init__(
+        self,
+        coordinator: AprilaireCloudDataUpdateCoordinator,
+        device_id: str,
+        kind: str,
+        metric: str,
+        key: str,
+    ) -> None:
+        """Initialize the sensor."""
+        self._kind = kind
+        self._metric = metric
+        super().__init__(coordinator, device_id, key)
+        if metric == "service_remaining":
+            self._attr_native_unit_of_measurement = PERCENTAGE
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+        self._attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    @property
+    def name(self) -> str:
+        """Return the entity name."""
+        kind_name = self._kind.replace("freshair", "fresh air").replace(
+            "aircleaning", "air cleaning"
+        )
+        return f"{kind_name.title()} {THERMOSTAT_IAQ_SENSOR_NAMES[self._metric]}"
+
+    @property
+    def native_value(self):
+        """Return the IAQ sensor value."""
+        normalized = _thermostat_state(self.normalized_state)
+        if normalized is None or self._kind not in normalized.iaq:
+            return None
+        iaq_state = normalized.iaq[self._kind]
+        if self._metric == "status":
+            return iaq_state.status
+        if self._metric == "service_remaining":
+            return iaq_state.service_remaining
         return None

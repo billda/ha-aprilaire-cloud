@@ -452,7 +452,7 @@ async def test_terminally_rejected_devices_do_not_drive_rest_fallback(
                     {
                         "_type": "DeviceSetup",
                         "deviceId": DEVICE_ID,
-                        "type": "thermostat",
+                        "type": "ventilator",
                     },
                     build_device_status(DEVICE_ID),
                 ],

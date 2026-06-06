@@ -21,6 +21,9 @@ from .common import (
     build_device_settings,
     build_hierarchy,
     build_initial_messages,
+    build_thermostat_hierarchy,
+    build_thermostat_initial_messages,
+    build_thermostat_settings,
     build_user,
 )
 
@@ -219,6 +222,43 @@ async def test_setup_does_not_false_negative_when_device_setup_arrives_late(
 
     assert result["type"] == "create_entry"
     assert result["title"] == USERNAME
+
+
+async def test_user_flow_accepts_thermostat_only_account(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+) -> None:
+    """A thermostat-only account should be accepted by config flow."""
+    monkeypatch.setattr(AprilaireCloudApiClient, "async_authenticate", AsyncMock())
+    monkeypatch.setattr(
+        AprilaireCloudApiClient, "async_get_user", AsyncMock(return_value=build_user())
+    )
+    monkeypatch.setattr(
+        AprilaireCloudApiClient,
+        "async_get_hierarchy",
+        AsyncMock(return_value=build_thermostat_hierarchy()),
+    )
+    monkeypatch.setattr(
+        AprilaireCloudApiClient,
+        "async_get_device_settings",
+        AsyncMock(return_value=build_thermostat_settings()),
+    )
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.config_flow.async_collect_location_messages",
+        AsyncMock(return_value=build_thermostat_initial_messages()),
+    )
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_USER},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_USERNAME: USERNAME, CONF_PASSWORD: PASSWORD},
+    )
+
+    assert result["type"] == "create_entry"
 
 
 async def test_options_flow_updates_refresh_settings(
