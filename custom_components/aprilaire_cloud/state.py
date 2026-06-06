@@ -8,12 +8,18 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .models import DeviceRecord, HierarchyDevice, HierarchyLocation, merge_settings_payload
-from .profiles import evaluate_profile
+from .profiles import (
+    evaluate_profile,
+    record_has_thermostat_hint,
+    thermostat_iaq_status_key_for_message,
+    thermostat_status_key_from_message,
+)
 
 _MISSING = object()
 STATUS_MESSAGE_KEYS = {
     "DehumidifierStatus": "dehumidifier",
 }
+THERMOSTAT_STATUS_MESSAGE_TYPE = "ThermostatStatus"
 
 
 @dataclass(slots=True)
@@ -117,6 +123,18 @@ def apply_confirmed_device_settings(record: DeviceRecord, settings: dict[str, An
     )
 
 
+def apply_full_device_settings(record: DeviceRecord, settings: dict[str, Any]) -> DeviceRecord:
+    """Replace confirmed remote settings from a full REST settings payload."""
+    confirmed_settings = deepcopy(settings)
+    return replace(
+        record,
+        device_settings=confirmed_settings,
+        pending_device_settings=remove_matching_settings(
+            record.pending_device_settings, confirmed_settings
+        ),
+    )
+
+
 def clear_pending_device_settings(record: DeviceRecord, payload: dict[str, Any]) -> DeviceRecord:
     """Remove matching optimistic override paths from the pending layer."""
     return replace(
@@ -156,6 +174,14 @@ def apply_status_payload(
 def apply_device_message(record: DeviceRecord, message: dict[str, Any]) -> DeviceRecord:
     """Apply one websocket payload to a device record."""
     message_type = message.get("_type")
+    if message_type == THERMOSTAT_STATUS_MESSAGE_TYPE:
+        return apply_status_payload(
+            record,
+            thermostat_status_key_from_message(record, message),
+            message,
+        )
+    if iaq_status_key := thermostat_iaq_status_key_for_message(record, message):
+        return apply_status_payload(record, iaq_status_key, message)
     if message_type in STATUS_MESSAGE_KEYS:
         return apply_status_payload(record, STATUS_MESSAGE_KEYS[message_type], message)
     if message_type == "DeviceSettings":
@@ -177,8 +203,13 @@ def apply_rest_refresh(
     status_payloads: dict[str, dict[str, Any]] | None = None,
 ) -> DeviceRecord:
     """Apply a REST refresh to a device record."""
+    settings_applier = (
+        apply_full_device_settings
+        if record_has_thermostat_hint(record)
+        else apply_confirmed_device_settings
+    )
     updated = replace(
-        apply_confirmed_device_settings(record, settings),
+        settings_applier(record, settings),
         device_status=device_status,
     )
     for key, payload in (status_payloads or {}).items():

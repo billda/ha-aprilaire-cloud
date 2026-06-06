@@ -19,6 +19,8 @@ from .const import (
     DEFAULT_SAFETY_REFRESH_MINUTES,
 )
 from .data import AprilaireCloudConfigEntry
+from .models import DeviceRecord
+from .profiles import NormalizedThermostatState, normalize_device, status_requests_for_record
 
 TO_REDACT = {
     CONF_PASSWORD,
@@ -38,6 +40,55 @@ def _hash_value(value: str | None) -> str | None:
         return None
     digest = hashlib.sha256(value.encode()).hexdigest()[:12]
     return f"sha256:{digest}"
+
+
+def _payload_shape(value: Any) -> Any:
+    """Return a compact payload shape without duplicating every raw value."""
+    if isinstance(value, dict):
+        return {key: _payload_shape(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_payload_shape(value[0])] if value else []
+    if value is None:
+        return None
+    return type(value).__name__
+
+
+def _profile_diagnostics(device: DeviceRecord) -> dict[str, Any]:
+    """Return profile-owned diagnostics for tester feedback."""
+    details: dict[str, Any] = {
+        "status_payload_keys": sorted(device.status_payloads),
+        "status_request_keys": [
+            {"key": request.key, "endpoint": request.endpoint}
+            for request in status_requests_for_record(device)
+        ],
+        "raw_write_support": list(device.supported_writes),
+        "payload_shapes": {
+            key: _payload_shape(payload) for key, payload in device.status_payloads.items()
+        },
+    }
+
+    if device.profile_key == "thermostat":
+        normalized = normalize_device(device)
+        if isinstance(normalized, NormalizedThermostatState):
+            details["thermostat"] = {
+                "zones": {
+                    zone_key: {
+                        "settings_key": zone.settings_key,
+                        "temperature_unit": zone.temperature_unit,
+                        "raw_mode": zone.raw_mode,
+                        "raw_fan": zone.raw_fan,
+                        "raw_hold_type": zone.raw_hold_type,
+                        "has_current_temperature": zone.current_temperature is not None,
+                        "has_current_humidity": zone.current_humidity is not None,
+                        "has_heat_setpoint": zone.heat_setpoint is not None,
+                        "has_cool_setpoint": zone.cool_setpoint is not None,
+                    }
+                    for zone_key, zone in normalized.zones.items()
+                },
+                "iaq_keys": sorted(normalized.iaq),
+            }
+
+    return details
 
 
 async def async_get_config_entry_diagnostics(
@@ -90,6 +141,7 @@ async def async_get_config_entry_diagnostics(
                         "pending_device_settings": device.pending_device_settings,
                         "effective_device_settings": device.effective_device_settings,
                         "status_payloads": device.status_payloads,
+                        "profile_diagnostics": _profile_diagnostics(device),
                     }
                     for device_id, device in coordinator.data.devices.items()
                 },

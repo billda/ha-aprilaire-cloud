@@ -12,6 +12,7 @@ DOMAIN = "aprilaire_cloud"
 MANUFACTURER = "AprilAire"
 
 PLATFORMS: list[Platform] = [
+    Platform.CLIMATE,
     Platform.HUMIDIFIER,
     Platform.SENSOR,
     Platform.BINARY_SENSOR,

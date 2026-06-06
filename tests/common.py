@@ -15,6 +15,7 @@ PASSWORD = "Trueblue1!"
 USER_ID = "user-123"
 DEVICE_ID = "BC8D7EEC97E2"
 SECOND_DEVICE_ID = "DEADBEEF0001"
+THERMOSTAT_DEVICE_ID = "THERMO0001"
 LOCATION_ID = "bcf1939c-1111-2222-3333-a80ac86d"
 SECOND_LOCATION_ID = "bcf1939c-4444-5555-6666-a80ac86d"
 
@@ -36,6 +37,25 @@ def build_hierarchy(include_second_device: bool = False) -> dict:
                 "name": "Home",
                 "timeZone": "America/New_York",
                 "rooms": [{"name": "Crawl Space", "devices": devices}],
+            }
+        ]
+    }
+
+
+def build_thermostat_hierarchy(device_id: str = THERMOSTAT_DEVICE_ID) -> dict:
+    """Return a sample thermostat hierarchy payload."""
+    return {
+        "locations": [
+            {
+                "locationId": LOCATION_ID,
+                "name": "Home",
+                "timeZone": "America/Chicago",
+                "rooms": [
+                    {
+                        "name": "Main Floor",
+                        "devices": [{"deviceId": device_id, "access": "manage", "zone": 1}],
+                    }
+                ],
             }
         ]
     }
@@ -177,6 +197,116 @@ def build_sensor_hub_status(device_id: str = DEVICE_ID) -> dict:
     }
 
 
+def build_thermostat_setup(
+    device_id: str = THERMOSTAT_DEVICE_ID,
+    *,
+    humidifier_installed: bool = True,
+    dehumidifier_installed: bool = False,
+    freshair_installed: bool = False,
+    aircleaning_installed: bool = True,
+) -> dict:
+    """Return a sample thermostat DeviceSetup payload."""
+    return {
+        "_type": "DeviceSetup",
+        "deviceId": device_id,
+        "asOf": "2026-03-24T00:00:02.000Z",
+        "type": "thermostat",
+        "thermostat": {"temperatureUnit": "F"},
+        "humidifier": {"installed": humidifier_installed},
+        "dehumidifier": {"installed": dehumidifier_installed},
+        "freshAir": {"installed": freshair_installed},
+        "airCleaning": {"installed": aircleaning_installed},
+    }
+
+
+def build_thermostat_settings(device_id: str = THERMOSTAT_DEVICE_ID) -> dict:
+    """Return a sample multi-zone thermostat DeviceSettings payload."""
+    return {
+        "_type": "DeviceSettings",
+        "deviceId": device_id,
+        "asOf": "2026-03-24T00:00:01.000Z",
+        "thermostatPZ1": {
+            "mode": "heat",
+            "heatSetpoint": 68,
+            "coolSetpoint": 75,
+            "fan": "auto",
+            "holdType": "permanent",
+        },
+        "thermostatSZ2": {
+            "ModeId": 4,
+            "HeatSetpoint": 66,
+            "CoolSetpoint": 74,
+            "FanId": 3,
+            "HoldType": 1,
+        },
+        "thermostatSZ3": {
+            "mode": "cool",
+            "heatSetpoint": 65,
+            "coolSetpoint": 76,
+            "fan": "on",
+            "holdType": "none",
+        },
+    }
+
+
+def build_thermostat_status(
+    device_id: str = THERMOSTAT_DEVICE_ID,
+    *,
+    zone: str = "PZ1",
+    mode: str | None = None,
+    equipment_status: str = "heating",
+) -> dict:
+    """Return a sample ThermostatStatus payload."""
+    zone_offsets = {"PZ1": 0, "SZ2": 1, "SZ3": 2}
+    offset = zone_offsets.get(zone, 0)
+    payload = {
+        "_type": "ThermostatStatus",
+        "deviceId": device_id,
+        "asOf": "2026-03-24T00:00:03.000Z",
+        "zone": zone,
+        "currentTemperature": 70 + offset,
+        "currentHumidity": 45 + offset,
+        "outdoorTemperature": 35,
+        "outdoorHumidity": 62,
+        "equipmentStatus": equipment_status,
+        "hvacServiceRemaining": 88,
+    }
+    if mode is not None:
+        payload["mode"] = mode
+    return payload
+
+
+def build_iaq_status(
+    device_id: str = THERMOSTAT_DEVICE_ID,
+    *,
+    message_type: str = "HumidifierStatus",
+    status: str = "idle",
+    remaining: int = 80,
+) -> dict:
+    """Return a sample thermostat-owned IAQ status payload."""
+    return {
+        "_type": message_type,
+        "deviceId": device_id,
+        "asOf": "2026-03-24T00:00:04.000Z",
+        "equipmentStatus": status,
+        "filterService": {"needsService": False, "remaining": remaining},
+    }
+
+
+def build_thermostat_initial_messages(device_id: str = THERMOSTAT_DEVICE_ID) -> list[dict]:
+    """Return a thermostat bootstrap websocket message batch."""
+    return [
+        build_thermostat_setup(device_id),
+        build_thermostat_settings(device_id),
+        build_device_status(device_id, model="8920W"),
+        build_thermostat_status(device_id, zone="PZ1"),
+        build_thermostat_status(device_id, zone="SZ2", equipment_status="idle"),
+        build_thermostat_status(device_id, zone="SZ3", equipment_status="cooling"),
+        build_iaq_status(device_id, message_type="HumidifierStatus", status="humidifying"),
+        build_iaq_status(device_id, message_type="AirCleaningStatus", status="cleaning"),
+    ]
+
+
 def build_initial_messages(
     device_id: str = DEVICE_ID,
     *,
@@ -250,8 +380,18 @@ class FakeClient:
         self.requested_status_endpoints.append((device_id, endpoint))
         if ("status", f"{device_id}:{endpoint}") in self.rest_failures:
             raise self.rest_failures[("status", f"{device_id}:{endpoint}")]
+        if endpoint.startswith("thermostat/"):
+            return build_thermostat_status(device_id, zone=endpoint.rsplit("/", 1)[1])
         if endpoint == "dehumidifier":
+            if any(key.startswith("thermostat") for key in self.device_settings):
+                return build_iaq_status(device_id, message_type="DehumidifierStatus")
             return build_dehumidifier_status(device_id)
+        if endpoint == "humidifier":
+            return build_iaq_status(device_id, message_type="HumidifierStatus")
+        if endpoint == "freshair":
+            return build_iaq_status(device_id, message_type="FreshAirStatus")
+        if endpoint == "aircleaning":
+            return build_iaq_status(device_id, message_type="AirCleaningStatus")
         return {"_type": f"{endpoint.title()}Status", "deviceId": device_id}
 
     async def async_get_device_settings(self, device_id: str) -> dict:
@@ -338,6 +478,18 @@ class MultiLocationFakeWebSocket(FakeWebSocket):
         """Inject bootstrap data for the matching location."""
         device_id = DEVICE_ID if self._location_id == LOCATION_ID else SECOND_DEVICE_ID
         await self._message_callback(self._location_id, build_initial_messages(device_id))
+        await self._state_callback(
+            SocketState(location_id=self._location_id, connected=True, initial_sync_complete=True)
+        )
+        return True
+
+
+class ThermostatFakeWebSocket(FakeWebSocket):
+    """Fake websocket that boots a thermostat device."""
+
+    async def async_wait_for_initial_sync(self, wait_timeout: float) -> bool:
+        """Inject thermostat bootstrap data."""
+        await self._message_callback(self._location_id, build_thermostat_initial_messages())
         await self._state_callback(
             SocketState(location_id=self._location_id, connected=True, initial_sync_complete=True)
         )

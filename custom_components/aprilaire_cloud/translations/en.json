@@ -26,7 +26,7 @@
     "error": {
       "cannot_connect": "Failed to connect to AprilAire Cloud.",
       "invalid_auth": "Invalid AprilAire Cloud credentials.",
-      "no_supported_devices": "No supported AprilAire devices were found. This integration currently supports aprilaire.io dehumidifiers with internal %RH control and a writable humidity setpoint.",
+      "no_supported_devices": "No supported AprilAire devices were found. This integration currently supports aprilaire.io dehumidifiers with internal %RH control and writable humidity setpoints, plus beta/tester-ready AprilAire thermostats.",
       "unknown": "Unexpected error.",
       "wrong_account": "These credentials belong to a different AprilAire account."
     },
@@ -108,7 +108,7 @@
   "issues": {
     "no_supported_devices": {
       "title": "No supported AprilAire devices are available yet",
-      "description": "This AprilAire account currently has {unsupported_count} discovered device(s), but none match the supported AprilAire Cloud profile so no entities were added.\n\nReasons: {reason_summary}\n\nIf a device is still finishing setup in the AprilAire Healthy Air app, keep the integration installed and it will retry automatically."
+      "description": "This AprilAire account currently has {unsupported_count} discovered device(s), but none match the supported AprilAire Cloud dehumidifier or beta thermostat profiles so no entities were added.\n\nReasons: {reason_summary}\n\nIf a device is still finishing setup in the AprilAire Healthy Air app, keep the integration installed and it will retry automatically."
     },
     "unsupported_devices": {
       "title": "Some AprilAire devices were skipped",

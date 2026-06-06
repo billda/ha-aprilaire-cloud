@@ -19,7 +19,10 @@ from .common import (
     USERNAME,
     FakeClient,
     FakeWebSocket,
+    ThermostatFakeWebSocket,
     bootstrap_coordinator,
+    build_thermostat_hierarchy,
+    build_thermostat_settings,
     build_user,
 )
 
@@ -99,3 +102,56 @@ async def test_diagnostics_include_runtime_state_and_redact_credentials(
     assert diagnostics["snapshot"]["config_options"]["safety_refresh_minutes"] == 15
     assert diagnostics["snapshot"]["config_options"]["fallback_refresh_minutes"] == 2
     assert diagnostics["snapshot"]["config_options"]["enable_extra_diagnostics"] is False
+
+
+async def test_diagnostics_include_thermostat_profile_details(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+) -> None:
+    """Diagnostics should expose thermostat profile state for beta feedback."""
+    client = FakeClient()
+    client._hierarchy = build_thermostat_hierarchy()
+    client.device_settings = build_thermostat_settings()
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket",
+        ThermostatFakeWebSocket,
+    )
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title=USERNAME,
+        unique_id=build_user()["userId"],
+        data={"username": USERNAME, "password": PASSWORD},
+    )
+    entry.add_to_hass(hass)
+
+    coordinator = AprilaireCloudDataUpdateCoordinator(hass, config_entry=entry, client=client)
+    await bootstrap_coordinator(coordinator)
+
+    entry.runtime_data = AprilaireCloudRuntimeData(
+        client=client,
+        coordinator=coordinator,
+        integration=None,  # type: ignore[arg-type]
+    )
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, entry)
+    device_id = coordinator.data.supported_device_ids[0]
+    profile_details = diagnostics["snapshot"]["devices"][device_id]["profile_diagnostics"]
+
+    assert profile_details["status_payload_keys"] == [
+        "iaq_aircleaning",
+        "iaq_humidifier",
+        "thermostatPZ1",
+        "thermostatSZ2",
+        "thermostatSZ3",
+    ]
+    assert profile_details["raw_write_support"] == [
+        "mode",
+        "heatSetpoint",
+        "coolSetpoint",
+        "fan",
+        "holdType",
+    ]
+    assert profile_details["thermostat"]["zones"]["PZ1"]["raw_mode"] == "heat"
+    assert "payload_shapes" in profile_details

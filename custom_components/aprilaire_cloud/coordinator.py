@@ -44,6 +44,7 @@ from .data import AprilaireCloudConfigEntry
 from .models import AprilaireSnapshot, DeviceRecord, HierarchyLocation, SocketState
 from .profiles import (
     format_unsupported_reasons,
+    record_has_thermostat_hint,
     record_requires_rest_refresh,
     status_requests_for_record,
 )
@@ -51,6 +52,7 @@ from .state import (
     DeviceWriteState,
     apply_confirmed_device_settings,
     apply_device_message,
+    apply_full_device_settings,
     apply_hierarchy,
     apply_pending_device_settings,
     apply_rest_refresh,
@@ -355,6 +357,16 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         )
         self._sync_write_state(device_id, confirmed_settings=settings)
 
+    def _apply_full_device_settings(self, device_id: str, settings: dict[str, Any]) -> None:
+        """Replace confirmed remote settings from a REST settings payload."""
+        record = self._devices.get(device_id)
+        if record is None:
+            return
+        self._devices[device_id] = evaluate_device_support(
+            apply_full_device_settings(record, settings)
+        )
+        self._sync_write_state(device_id, confirmed_settings=settings)
+
     def _clear_pending_device_settings(self, device_id: str, payload: dict[str, Any]) -> None:
         """Remove matching optimistic override paths from the pending layer."""
         record = self._devices.get(device_id)
@@ -536,7 +548,11 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
     async def _async_refresh_device_settings(self, device_id: str) -> dict[str, Any]:
         """Refresh only the writable settings for one device."""
         settings = await self.client.async_get_device_settings(device_id)
-        self._apply_confirmed_device_settings(device_id, settings)
+        record = self._devices.get(device_id)
+        if record is not None and record_has_thermostat_hint(record):
+            self._apply_full_device_settings(device_id, settings)
+        else:
+            self._apply_confirmed_device_settings(device_id, settings)
         return settings
 
     async def _async_cleanup_removed_devices(self, removed_ids: set[str]) -> None:
