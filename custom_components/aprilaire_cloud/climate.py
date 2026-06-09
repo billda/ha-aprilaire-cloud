@@ -190,15 +190,23 @@ class AprilaireThermostatClimateEntity(AprilaireCloudEntity, ClimateEntity):
 
     @property
     def hvac_action(self) -> HVACAction | None:
-        """Return the current Home Assistant HVAC action."""
-        zone = self._zone
-        if zone is None:
-            return None
-        if zone.raw_mode == "off":
-            return HVACAction.OFF
-        if zone.equipment_status is None:
-            return None
-        return HA_ACTION_BY_STATUS.get(zone.equipment_status)
+        """Return the current running hvac action state to update the control card UI."""
+        # Pull the zone state dataclass object we populated in profiles.py
+        zone = self._zone 
+        if zone is None or zone.equipment_status is None:
+            return HVACAction.IDLE
+
+        status_lower = str(zone.equipment_status).lower()
+
+        # Map custom profile states to the official core Home Assistant HVACAction variables
+        if "cooling" in status_lower:
+            return HVACAction.COOLING
+        if "heating" in status_lower:
+            return HVACAction.HEATING
+        if "fan" in status_lower:
+            return HVACAction.FAN
+            
+        return HVACAction.IDLE
 
     @property
     def target_temperature(self) -> float | None:
@@ -226,11 +234,23 @@ class AprilaireThermostatClimateEntity(AprilaireCloudEntity, ClimateEntity):
 
     @property
     def fan_mode(self) -> str | None:
-        """Return the thermostat fan mode."""
+        """Return the current fan behavior mode."""
         zone = self._zone
-        if zone is None or zone.raw_fan not in FAN_MODES:
-            return None
-        return zone.raw_fan
+        if zone is None or zone.raw_fan is None:
+            return "auto"
+            
+        # Returns clean matching lowercase text string tokens (e.g., "on", "auto")
+        return str(zone.raw_fan).lower()
+
+    @property
+    def fan_modes(self) -> list[str]:
+        """Return the list of selectable fan operation choices dynamically from the profile dataclass."""
+        zone = self._zone
+        if zone is not None and hasattr(zone, "allowed_fan_modes"):
+            return zone.allowed_fan_modes
+            
+        # Hardcoded safe fallback baseline if dataclass initialization hasn't occurred yet
+        return ["auto", "on"]
 
     @property
     def preset_mode(self) -> str | None:
@@ -248,46 +268,78 @@ class AprilaireThermostatClimateEntity(AprilaireCloudEntity, ClimateEntity):
         await self._async_write_zone_settings({"mode": raw_mode})
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
-        """Set thermostat setpoints."""
+        """Set thermostat setpoints with explicit Fahrenheit-to-Celsius API conversion."""
         target_mode = _coerce_hvac_mode(kwargs.get(ATTR_HVAC_MODE)) or self.hvac_mode
         temperature = kwargs.get(ATTR_TEMPERATURE)
         low = kwargs.get(ATTR_TARGET_TEMP_LOW)
         high = kwargs.get(ATTR_TARGET_TEMP_HIGH)
 
-        payload: dict[str, int | float] = {}
-        if target_mode == HVACMode.HEAT:
-            value = temperature if temperature is not None else low
-            if value is not None:
-                payload["heatSetpoint"] = _temperature_for_patch(value)
-        elif target_mode == HVACMode.COOL:
-            value = temperature if temperature is not None else high
-            if value is not None:
-                payload["coolSetpoint"] = _temperature_for_patch(value)
-        elif target_mode == HVACMode.HEAT_COOL:
-            heat_value = low if low is not None else temperature
-            cool_value = high if high is not None else temperature
-            if heat_value is not None:
-                payload["heatSetpoint"] = _temperature_for_patch(heat_value)
-            if cool_value is not None:
-                payload["coolSetpoint"] = _temperature_for_patch(cool_value)
+        zone = self._zone
+        if zone is None:
+            raise HomeAssistantError("Thermostat zone data is temporarily unavailable")
+            
+        current_heat = zone.heat_setpoint
+        current_cool = zone.cool_setpoint
 
-        if not payload:
-            raise HomeAssistantError("No supported thermostat setpoint was provided")
-        await self._async_write_zone_settings(payload)
+        # 1. Determine target values based on user input
+        new_heat = low if low is not None else (temperature if target_mode == HVACMode.HEAT else current_heat)
+        new_cool = high if high is not None else (temperature if target_mode == HVACMode.COOL else current_cool)
+
+        # 2. Enforce the strict 3-degree deadband guard bands - API seems to reject changes otherwise
+        is_fahrenheit = self.temperature_unit == UnitOfTemperature.FAHRENHEIT
+        buffer = 3.0 if is_fahrenheit else 1.66
+
+        if target_mode == HVACMode.COOL or (high is not None):
+            if new_cool - new_heat < buffer:
+                new_heat = new_cool - buffer
+        elif target_mode == HVACMode.HEAT or (low is not None):
+            if new_cool - new_heat < buffer:
+                new_cool = new_heat + buffer
+        elif target_mode == HVACMode.HEAT_COOL:
+            if new_cool - new_heat < buffer:
+                new_cool = new_heat + buffer
+
+        # 3. CRITICAL PRODUCTION PATCH: Convert Fahrenheit down to native Celsius floats
+        # The Aprilaire cloud API endpoints only accept Celsius constraints values.
+        if is_fahrenheit:
+            final_heat = round((new_heat - 32) * 5 / 9, 2)
+            final_cool = round((new_cool - 32) * 5 / 9, 2)
+        else:
+            final_heat = round(new_heat, 2)
+            final_cool = round(new_cool, 2)
+
+        # 4. Package parameters into the flat dictionary payload format expected by existing code
+        settings_payload: dict[str, int | float] = {
+            "heat": _temperature_for_patch(final_heat),
+            "cool": _temperature_for_patch(final_cool)
+        }
+
+        # 5. Transmit the payload through the internal structural helper loop
+        await self._async_write_zone_settings(settings_payload)
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
-        """Set the thermostat fan mode."""
-        if fan_mode not in FAN_MODES:
-            raise HomeAssistantError(f"Unsupported AprilAire thermostat fan mode: {fan_mode}")
-        await self._async_write_zone_settings({"fan": fan_mode})
+        """Set new target fan mode for the thermostat zone."""
+        # 1. Standardize the incoming Home Assistant selection (e.g., "on", "auto", "diffuse")
+        fan_mode_lower = str(fan_mode).lower()
 
-    async def async_set_preset_mode(self, preset_mode: str) -> None:
-        """Set the thermostat hold mode."""
-        if preset_mode not in PRESET_MODES:
-            raise HomeAssistantError(
-                f"Unsupported AprilAire thermostat preset mode: {preset_mode}"
-            )
-        await self._async_write_zone_settings({"holdType": preset_mode})
+        # 2. Map standard HA string variables to the specific tokens your Aprilaire API requires
+        # Aprilaire hardware typically expects simple tokens like "on" or "auto"
+        if "auto" in fan_mode_lower:
+            target_fan = "auto"
+        elif "on" in fan_mode_lower:
+            target_fan = "on"
+        elif "circ" in fan_mode_lower or "continuous" in fan_mode_lower:
+            target_fan = "circ"  # Standard vendor shorthand for circulation modes
+        else:
+            target_fan = fan_mode_lower
+
+        # 3. Package the payload into the flat dictionary structure expected existing code
+        settings_payload = {
+            "fan": target_fan
+        }
+
+        # 4. Transmit the packet through the internal structural helper loop
+        await self._async_write_zone_settings(settings_payload)
 
     async def _async_write_zone_settings(self, settings: dict[str, Any]) -> None:
         """Write settings for this thermostat zone."""
