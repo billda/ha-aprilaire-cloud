@@ -101,9 +101,17 @@ class AprilaireCloudEntity(CoordinatorEntity[AprilaireCloudDataUpdateCoordinator
 
     @property
     def available(self) -> bool:
-        """Return whether the entity has current device data."""
+        """Return whether the entity is online and verified fresh by the data coordinator."""
         device = self.device
-        return super().available and device is not None and device.supported
+        if device is None or not device.supported:
+            return False
+
+        # Read our custom hardware offline flag injected during the snapshot build step
+        status = getattr(device, "device_status", {})
+        if isinstance(status, dict) and status.get("_hardware_offline") is True:
+            return False
+
+        return super().available
 
     @property
     def profile(self) -> DeviceProfile | None:
