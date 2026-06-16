@@ -324,7 +324,24 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
             raise AprilaireCloudWriteError("AprilAire did not confirm updated settings")
 
     def _build_snapshot(self) -> AprilaireSnapshot:
-        """Build an immutable snapshot for entities."""
+        """Build an immutable snapshot for entities, dynamically flagging omitted devices."""
+        # Check the global integration refresh mode state
+        if self._current_refresh_mode == "fallback":
+            # Fetch the collection of device IDs that are actively failing/requiring refresh cycles
+            try:
+                active_rest_ids = self._device_ids_requiring_rest_refresh()
+                
+                # Loop through the compiled devices inside the shared cache layer
+                for device_id, record in list(self._devices.items()):
+                    # IF the integration is running fallback routines, but this specific device ID
+                    # is entirely missing from the active refresh queue, it means it is uncommunicative.
+                    if active_rest_ids and device_id not in active_rest_ids:
+                        if hasattr(record, "device_status") and isinstance(record.device_status, dict):
+                            # Inject our unique offline indicator flag for this device container alone
+                            record.device_status["_hardware_offline"] = True
+            except Exception:
+                pass
+
         return AprilaireSnapshot(
             user_id=self._user_id,
             email=self._email,
@@ -520,6 +537,8 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
                     settings,
                 )
 
+        # ... [Keep your existing asyncio.gather and results processing up to line 38] ...
+
         results = await asyncio.gather(*(_refresh_device(device_id) for device_id in ids))
         refreshed_ids: set[str] = set()
         refresh_errors: dict[str, Exception] = {}
@@ -527,10 +546,26 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         for device_id, status, status_payloads, settings in results:
             if device_id not in self._devices:
                 continue
+                
+            # === THE CORRECTION BLOCK ===
+            # If the REST refresh threw an exception, it means the cloud server can no longer 
+            # talk to the physical device. We explicitly mutate its local memory record 
+            # to break the mirroring loop and alert Home Assistant.
             if isinstance(settings, Exception):
                 LOGGER.warning("REST refresh failed for device %s: %s", device_id, settings)
                 refresh_errors[device_id] = settings
+                
+                # Fetch the current record for this device
+                record = self._devices[device_id]
+                if record is not None:
+                    # Explicitly break the data cache for this device container alone
+                    # We inject a native python None state or flag to drop its availability
+                    if hasattr(record, "device_status") and isinstance(record.device_status, dict):
+                        # Force a unique, local payload key change that the entities can read natively
+                        record.device_status["_hardware_offline"] = True
                 continue
+            # ============================
+
             self._devices[device_id] = evaluate_device_support(
                 apply_rest_refresh(
                     self._devices[device_id],
@@ -541,6 +576,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
             )
             self._sync_write_state(device_id, confirmed_settings=settings)
             refreshed_ids.add(device_id)
+            
         if refreshed_ids:
             self._last_rest_refresh_at = datetime.now(tz=UTC)
         return refreshed_ids, refresh_errors
