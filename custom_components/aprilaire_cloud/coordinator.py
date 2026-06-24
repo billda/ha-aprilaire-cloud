@@ -91,7 +91,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
                     )
                 )
             ),
-            always_update=False,
+            always_update=True,
         )
         self.client = client
         self._user_id = ""
@@ -198,9 +198,16 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         location_id: str,
         messages: list[dict[str, Any]],
     ) -> None:
-        """Merge websocket messages into the live snapshot."""
+        """Merge websocket messages into the live snapshot, tracking explicit hardware connection fault events."""
+        from datetime import datetime, UTC
+
         changed = False
         support_changed = False
+        
+        # Initialize our persistent local connectivity registry on the coordinator if it doesn't exist yet
+        if not hasattr(self, "_hardware_offline_registry"):
+            self._hardware_offline_registry = {}
+
         for message in messages:
             message_type = message.get("_type")
             if message_type == "RefreshEvent":
@@ -211,12 +218,33 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
             device_id = message.get("deviceId")
             if device_id is None:
                 continue
-            LOGGER.debug(
-                "WebSocket message %s for device %s in location %s",
-                message_type,
-                device_id,
-                location_id,
-            )
+
+            # =====================================================================
+            # MODIFIED AVAILABILITY CHECK FOR THERMOSTATS
+            # Detecting availability for thermostats is tricky - the Aprilaire API sends fully-populated status messages for offline devices with last-known values and no easy way to identify that the device is actually disconnected
+            # To detect availability, look only for specific "DeviceEvent" messages with a type of "offline". 
+            # If an "offline" DeviceEvent message has an "occurred" timestamp only, it is announcing a device outage.  
+            # If an "offline" DeviceEvent has both "occurred" and "rescinded" timestamps, it is announcing the device is back online. 
+            # If a device is offline, a DeviceEvent will be dispatched when the websocket is established, so devices that are already offline when the integration loads will be detected immediately.  
+            # Devices that go offline during runtime will take 20-30 minutes to be detected as it takes about this long for the Aprilaire API itself to catagorize them as offline (and this is consistent with the Aprilaire app behavior)
+            # Availability for thermostats should be evaluated based only on these DeviceEvent "offline" messages and ignore all other payloads
+            # =====================================================================
+            if message_type == "DeviceEvent" and message.get("type") == "offline":
+                occurred = message.get("occurred")
+                rescinded = message.get("rescinded")
+
+                if occurred and not rescinded:
+                    # CASE A: Active connection fault with no resolution stamp. Device is offline!
+                    LOGGER.warning("APRILAIRE SYSTEM STATE | Device %s announced OFFLINE status via fault event.", device_id)
+                    self._hardware_offline_registry[device_id] = True
+                    changed = True
+                elif occurred and rescinded:
+                    # CASE B: Fault event contains a rescinded resolution stamp. Device is online!
+                    LOGGER.warning("APRILAIRE SYSTEM STATE | Device %s announced ONLINE recovery via rescinded event.", device_id)
+                    self._hardware_offline_registry[device_id] = False
+                    changed = True
+            # =====================================================================
+
             if device_id not in self._devices:
                 LOGGER.debug("Caching message for unknown device %s", device_id)
                 self._cache_unknown_device_message(device_id, message)
@@ -229,6 +257,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
                 continue
             self._devices[device_id] = updated_record
             changed = True
+
             if (
                 updated_record.supported != record.supported
                 or updated_record.unsupported_reason != record.unsupported_reason
@@ -324,24 +353,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
             raise AprilaireCloudWriteError("AprilAire did not confirm updated settings")
 
     def _build_snapshot(self) -> AprilaireSnapshot:
-        """Build an immutable snapshot for entities, dynamically flagging omitted devices."""
-        # Check the global integration refresh mode state
-        if self._current_refresh_mode == "fallback":
-            # Fetch the collection of device IDs that are actively failing/requiring refresh cycles
-            try:
-                active_rest_ids = self._device_ids_requiring_rest_refresh()
-                
-                # Loop through the compiled devices inside the shared cache layer
-                for device_id, record in list(self._devices.items()):
-                    # IF the integration is running fallback routines, but this specific device ID
-                    # is entirely missing from the active refresh queue, it means it is uncommunicative.
-                    if active_rest_ids and device_id not in active_rest_ids:
-                        if hasattr(record, "device_status") and isinstance(record.device_status, dict):
-                            # Inject our unique offline indicator flag for this device container alone
-                            record.device_status["_hardware_offline"] = True
-            except Exception:
-                pass
-
+        """Build an immutable snapshot for entities."""
         return AprilaireSnapshot(
             user_id=self._user_id,
             email=self._email,
@@ -537,8 +549,6 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
                     settings,
                 )
 
-        # ... [Keep your existing asyncio.gather and results processing up to line 38] ...
-
         results = await asyncio.gather(*(_refresh_device(device_id) for device_id in ids))
         refreshed_ids: set[str] = set()
         refresh_errors: dict[str, Exception] = {}
@@ -546,26 +556,10 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         for device_id, status, status_payloads, settings in results:
             if device_id not in self._devices:
                 continue
-                
-            # === THE CORRECTION BLOCK ===
-            # If the REST refresh threw an exception, it means the cloud server can no longer 
-            # talk to the physical device. We explicitly mutate its local memory record 
-            # to break the mirroring loop and alert Home Assistant.
             if isinstance(settings, Exception):
                 LOGGER.warning("REST refresh failed for device %s: %s", device_id, settings)
                 refresh_errors[device_id] = settings
-                
-                # Fetch the current record for this device
-                record = self._devices[device_id]
-                if record is not None:
-                    # Explicitly break the data cache for this device container alone
-                    # We inject a native python None state or flag to drop its availability
-                    if hasattr(record, "device_status") and isinstance(record.device_status, dict):
-                        # Force a unique, local payload key change that the entities can read natively
-                        record.device_status["_hardware_offline"] = True
                 continue
-            # ============================
-
             self._devices[device_id] = evaluate_device_support(
                 apply_rest_refresh(
                     self._devices[device_id],
@@ -576,7 +570,6 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
             )
             self._sync_write_state(device_id, confirmed_settings=settings)
             refreshed_ids.add(device_id)
-            
         if refreshed_ids:
             self._last_rest_refresh_at = datetime.now(tz=UTC)
         return refreshed_ids, refresh_errors
