@@ -101,14 +101,17 @@ class AprilaireCloudEntity(CoordinatorEntity[AprilaireCloudDataUpdateCoordinator
 
     @property
     def available(self) -> bool:
-        """Return whether the entity is online and verified fresh by the data coordinator."""
+        """Return whether the entity is online, enforcing explicit cloud connection event registries."""
         device = self.device
         if device is None or not device.supported:
             return False
 
-        # Read our custom hardware offline flag injected during the snapshot build step
-        status = getattr(device, "device_status", {})
-        if isinstance(status, dict) and status.get("_hardware_offline") is True:
+        # Read our local, tamper-proof hardware connection registry from the data coordinator
+        offline_registry = getattr(self.coordinator, "_hardware_offline_registry", {})
+        
+        # If this device ID has been explicitly flagged as offline by an unresolved fault event,
+        # forcefully return False, completely ignoring any stale or cached climate variables!
+        if offline_registry.get(self._device_id) is True:
             return False
 
         return super().available
