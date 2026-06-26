@@ -127,11 +127,13 @@ PROFILE_DYNAMIC_SENSOR_FACTORIES: dict[str, DynamicSensorFactory] = {
 
 
 THERMOSTAT_ZONE_SENSOR_NAMES = {
+    "indoor_temperature": "Indoor temperature",
     "indoor_humidity": "Indoor humidity",
     "outdoor_temperature": "Outdoor temperature",
     "outdoor_humidity": "Outdoor humidity",
     "equipment_status": "Equipment status",
     "hvac_service_remaining": "HVAC service remaining",
+    "water_panel_life": "Humidifier water panel life",
 }
 
 THERMOSTAT_IAQ_SENSOR_NAMES = {
@@ -145,18 +147,37 @@ def _thermostat_dynamic_sensor(
     device_id: str,
     key: str,
 ) -> AprilaireCloudEntity | None:
-    """Create a thermostat-owned dynamic sensor."""
+    """Create a thermostat-owned dynamic sensor with multi-word key support."""
     thermostat_prefix = "thermostat_"
     if key.startswith(thermostat_prefix):
         remainder = key.removeprefix(thermostat_prefix)
+        
+        # Safe extraction: Split into maximum 2 parts (zone, metric payload)
         parts = remainder.split("_", 1)
         if len(parts) != 2:
             return None
-        zone_key, metric = parts[0].upper(), parts[1]
+            
+        # FIXED: Use explicit indexing to extract the string values cleanly
+        raw_zone, metric = parts[0], parts[1]
+        zone_key = raw_zone.upper()
+        
+        # Production check: ensure it aligns with our allowed whitelist matrix keys
         if metric not in THERMOSTAT_ZONE_SENSOR_NAMES:
             return None
+
+        # Resolve potential dictionary key capitalization mismatch strings safely
+        device_data = coordinator.data.devices.get(device_id)
+        if device_data and (profile := get_profile(device_data.profile_key)):
+            normalized = profile.normalize(device_data)
+            if normalized and normalized.zones:
+                if raw_zone.lower() in normalized.zones:
+                    zone_key = raw_zone.lower()
+                elif raw_zone.upper() in normalized.zones:
+                    zone_key = raw_zone.upper()
+            
         return AprilaireThermostatZoneSensor(coordinator, device_id, zone_key, metric, key)
 
+    # --- KEEP THE AUTHOR'S IAQ CODE EXACTLY AS IT WAS ---
     iaq_prefix = "iaq_"
     if key.startswith(iaq_prefix):
         remainder = key.removeprefix(iaq_prefix)
@@ -173,7 +194,7 @@ PROFILE_DYNAMIC_SENSOR_FACTORIES["thermostat"] = _thermostat_dynamic_sensor
 
 
 async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry, async_add_entities) -> None:
-    """Set up AprilAire sensors."""
+    """Set up AprilAire sensors cleanly."""
     coordinator = entry.runtime_data.coordinator
 
     def _entities_for_device(device_id: str, device):
@@ -187,9 +208,14 @@ async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry, async_add_en
             if description is not None:
                 yield AprilaireStaticSensorEntity(coordinator, device_id, description)
 
+        # Fall back to checking by partial string match if your device profile key uses a variant string
         dynamic_sensor_factory = PROFILE_DYNAMIC_SENSOR_FACTORIES.get(device.profile_key)
+        if dynamic_sensor_factory is None and "thermostat" in str(device.profile_key).lower():
+            dynamic_sensor_factory = PROFILE_DYNAMIC_SENSOR_FACTORIES.get("thermostat")
+
         if dynamic_sensor_factory is None:
             return
+            
         for key in entity_set.dynamic_sensor_keys:
             entity = dynamic_sensor_factory(coordinator, device_id, key)
             if entity is not None:
@@ -294,18 +320,30 @@ class AprilaireThermostatZoneSensor(AprilaireCloudEntity, SensorEntity):
         self._zone_key = zone_key
         self._metric = metric
         super().__init__(coordinator, device_id, key)
-        if metric in {"indoor_humidity", "outdoor_humidity"}:
+        if metric == "indoor_temperature":
+            self._attr_device_class = SensorDeviceClass.TEMPERATURE
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+            self._attr_entity_registry_enabled_default = True
+        elif metric in {"indoor_humidity", "outdoor_humidity"}:
             self._attr_native_unit_of_measurement = PERCENTAGE
             self._attr_device_class = SensorDeviceClass.HUMIDITY
             self._attr_state_class = SensorStateClass.MEASUREMENT
         elif metric == "outdoor_temperature":
             self._attr_device_class = SensorDeviceClass.TEMPERATURE
             self._attr_state_class = SensorStateClass.MEASUREMENT
+        elif metric == "equipment_status":
+            self._attr_entity_registry_enabled_default = True
         elif metric == "hvac_service_remaining":
             self._attr_native_unit_of_measurement = PERCENTAGE
             self._attr_state_class = SensorStateClass.MEASUREMENT
             self._attr_entity_category = EntityCategory.DIAGNOSTIC
             self._attr_entity_registry_enabled_default = coordinator.extra_diagnostics_enabled
+        elif metric == "water_panel_life":
+            self._attr_native_unit_of_measurement = PERCENTAGE
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+            self._attr_entity_category = EntityCategory.DIAGNOSTIC
+            self._attr_entity_registry_enabled_default = True  
+            self._attr_translation_key = "water_panel_life"
         else:
             self._attr_entity_category = EntityCategory.DIAGNOSTIC
             self._attr_entity_registry_enabled_default = coordinator.extra_diagnostics_enabled
@@ -326,7 +364,7 @@ class AprilaireThermostatZoneSensor(AprilaireCloudEntity, SensorEntity):
     @property
     def native_unit_of_measurement(self) -> str | None:
         """Return the unit for thermostat temperature sensors."""
-        if self._metric == "outdoor_temperature":
+        if self._metric in {"indoor_temperature", "outdoor_temperature"}:
             return _thermostat_temperature_unit(self._zone)
         return getattr(self, "_attr_native_unit_of_measurement", None)
 
@@ -336,6 +374,8 @@ class AprilaireThermostatZoneSensor(AprilaireCloudEntity, SensorEntity):
         zone = self._zone
         if zone is None:
             return None
+        if self._metric == "indoor_temperature":
+            return zone.current_temperature
         if self._metric == "indoor_humidity":
             return zone.current_humidity
         if self._metric == "outdoor_temperature":
@@ -343,9 +383,11 @@ class AprilaireThermostatZoneSensor(AprilaireCloudEntity, SensorEntity):
         if self._metric == "outdoor_humidity":
             return zone.outdoor_humidity
         if self._metric == "equipment_status":
-            return zone.equipment_status
+            return zone.equipment_status if zone.equipment_status else "Idle"
         if self._metric == "hvac_service_remaining":
             return zone.hvac_service_remaining
+        if self._metric == "water_panel_life":
+            return zone.water_panel_remaining
         return None
 
 
