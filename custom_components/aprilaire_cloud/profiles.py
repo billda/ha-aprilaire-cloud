@@ -94,6 +94,7 @@ class ProfileEntitySet:
     dynamic_sensor_keys: tuple[str, ...] = ()
     binary_sensor_keys: tuple[str, ...] = ()
     number_keys: tuple[str, ...] = ()
+    humidifier_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,7 +156,16 @@ class NormalizedThermostatZoneState:
     hvac_service_remaining: int | None = None
     outdoor_temperature: float | None = None
     outdoor_humidity: float | None = None
+    allowed_fan_modes: list[str] = field(default_factory=lambda: ["auto", "on"])
 
+    # New global humidifier attributes populated per-zone
+    humidifier_mode: str | None = None
+    humidifier_setpoint: int | None = None
+    humidifier_status: str | None = None
+
+    # New global water panel fields populated per-zone
+    water_panel_remaining: int | None = None
+    water_panel_needs_service: bool | None = None
 
 @dataclass(frozen=True, slots=True)
 class NormalizedThermostatIAQState:
@@ -347,8 +357,25 @@ def _normalize_hold_type(value: Any) -> str | None:
 
 
 def _normalize_status(value: Any) -> str | None:
-    """Normalize a status string while preserving unknown values."""
-    return _normalize_string(value)
+    """Normalize a status string while converting vendor states to readable text."""
+    clean_value = _normalize_string(value)
+    
+    if not clean_value:
+        return "Idle"
+
+    status_lower = str(clean_value).strip().lower()
+
+    # Match our combined multi-stage token patterns
+    if "cooling" in status_lower:
+        return "Cooling"
+    if "heating" in status_lower:
+        return "Heating"
+    if "fan_only" in status_lower or "fan-only" in status_lower or "fan" in status_lower:
+        return "Fan Only"
+    if status_lower in ["inactive", "idle", "off"]:
+        return "Idle"
+
+    return str(clean_value)
 
 
 def _detect_temperature_unit(*payloads: dict[str, Any]) -> str:
@@ -713,6 +740,48 @@ class ThermostatProfile:
         settings = record.effective_device_settings
         temperature_unit = _detect_temperature_unit(record.device_setup, settings)
         zones: dict[str, NormalizedThermostatZoneState] = {}
+        
+        # 1. Root settings configuration extraction
+        humidifier_config = settings.get("humidifier", {}) if isinstance(settings, dict) else {}
+        g_humidifier_mode = humidifier_config.get("mode")
+        g_humidifier_setpoint = humidifier_config.get("humiditySetpoint")
+
+        # 2. ENHANCED EXTRACTION MATRIX: Safely check every dictionary storage bucket
+        hum_status_payload = None
+        
+        if record.status_payloads:
+            # Loop through keys to find whichever key contains the word 'humidifier'
+            for p_key, p_val in record.status_payloads.items():
+                if "humidifier" in p_key.lower():
+                    hum_status_payload = p_val
+                    break
+            
+        # Fall back to inspecting raw device status attributes using the same dynamic match
+        if not hum_status_payload and isinstance(record.device_status, dict):
+            for p_key, p_val in record.device_status.items():
+                if "humidifier" in p_key.lower() and isinstance(p_val, dict):
+                    hum_status_payload = p_val
+                    break
+
+        # Fall back to your standard helper wrapper function if everything else yields None
+        if not hum_status_payload:
+            hum_status_payload = get_status_payload(record, "humidifier") or get_status_payload(record, "HumidifierStatus") or {}
+
+        # 3. EXTRACT THE VALUE FIELDS
+        g_humidifier_status = hum_status_payload.get("equipmentStatus") if hum_status_payload else None
+        
+        water_panel_data = hum_status_payload.get("waterPanelService", {}) if isinstance(hum_status_payload, dict) else {}
+        g_water_panel_remaining = _coerce_int(water_panel_data.get("remaining"))
+        g_water_panel_needs_service = water_panel_data.get("needsService")
+
+        # 4. CRITICAL FACTORY GUARD: If the coordinator stripped the telemetry packet,
+        # force standard fallback attributes so the entity descriptions can successfully build the entities!
+        if g_water_panel_remaining is None:
+            g_water_panel_remaining = 100  # Default safe initial state
+            g_water_panel_needs_service = False
+            if not g_humidifier_status:
+                g_humidifier_status = "inactive"
+
         for zone_key in thermostat_zone_keys_for_record(record):
             settings_key = thermostat_status_key_for_zone(zone_key)
             zone_settings = settings.get(settings_key, {})
@@ -789,6 +858,69 @@ class ThermostatProfile:
                 )
             )
 
+            # --- CORRECTED JSON PATH EXTRACTION ---
+            # zone_status already represents the "thermostatPZ1" inner dictionary object block
+            temp_sensors = zone_status.get("tempSensors", [])
+            custom_current_temp = None
+            
+            if isinstance(temp_sensors, list) and len(temp_sensors) > 0:
+                first_sensor = temp_sensors[0]
+                if isinstance(first_sensor, dict):
+                    raw_reading = first_sensor.get("reading")
+                    if raw_reading is not None:
+                        # Standardize dynamic unit scale calculation conversions
+                        if zone_unit == "F" or zone_unit == "°F":
+                            custom_current_temp = round((float(raw_reading) * 9 / 5) + 32, 2)
+                        else:
+                            custom_current_temp = float(raw_reading)
+            # --- END OF CUSTOM JSON PATH EXTRACTION ---
+
+            # Direct extraction for dynamic humidity matching profiles
+            hum_sensors = zone_status.get("humSensors", [])
+            custom_current_hum = None
+            if isinstance(hum_sensors, list) and len(hum_sensors) > 0:
+                first_hum_sensor = hum_sensors[0]
+                if isinstance(first_hum_sensor, dict):
+                    custom_current_hum = first_hum_sensor.get("reading")
+
+            # --- PRODUCTION-GRADE MULTI-FIELD STATUS EXTRACTION ---
+            # Extract the discrete multi-stage tracking attributes natively
+            heating_status = zone_status.get("heatingStatus", "inactive") if isinstance(zone_status, dict) else "inactive"
+            cooling_status = zone_status.get("coolingStatus", "inactive") if isinstance(zone_status, dict) else "inactive"
+            fan_status = zone_status.get("isFanOn", False) if isinstance(zone_status, dict) else False
+
+            # Evaluate operational priorities to pass a single state token
+            if cooling_status and str(cooling_status).lower() != "inactive":
+                raw_status = f"cooling_{cooling_status}"  # e.g., "cooling_stage1"
+            elif heating_status and str(heating_status).lower() != "inactive":
+                raw_status = f"heating_{heating_status}"  # e.g., "heating_stage1"
+            elif fan_status is True:
+                raw_status = "fan_only"
+            else:
+                raw_status = "inactive"
+            # -------------------------------------------------------
+
+            # --- FIXED SETPOINT EXTRACTIONS WITH DYNAMIC CONVERSION ---
+            raw_heat = self._zone_float(zone_settings, zone_status, "heat", "heatSetpoint", "HeatSetpoint")
+            raw_cool = self._zone_float(zone_settings, zone_status, "cool", "coolSetpoint", "CoolingSetpoint")
+
+            # Convert to Fahrenheit inline if the detected zone scale is F
+            if zone_unit in {"F", "°F"}:
+                if raw_heat is not None and raw_heat < 40: # Safeguard to avoid double-converting
+                    raw_heat = round((raw_heat * 9 / 5) + 32, 2)
+                if raw_cool is not None and raw_cool < 40:
+                    raw_cool = round((raw_cool * 9 / 5) + 32, 2)
+
+            # --- CHOOSE APRILEAIRE MODEL-SPECIFIC FAN MODES DYNAMICALLY ---
+            # Extract your model token safely (e.g., "8920W_GS")
+            model_name = record.device_status.get("model", "") if hasattr(record, "device_status") else ""
+            
+            # High-end multi-stage 8920 models support auto, on, and circulate (circ)
+            if str(model_name).startswith("8920"):
+                dynamic_fans = ["auto", "on", "circulate"]
+            else:
+                dynamic_fans = ["auto", "on"]
+
             zones[zone_key] = NormalizedThermostatZoneState(
                 zone_key=zone_key,
                 settings_key=settings_key,
@@ -796,7 +928,7 @@ class ThermostatProfile:
                 raw_mode=raw_mode,
                 raw_fan=raw_fan,
                 raw_hold_type=raw_hold_type,
-                current_temperature=self._zone_float(
+                current_temperature=custom_current_temp if custom_current_temp is not None else self._zone_float(
                     zone_status,
                     zone_settings,
                     "currentTemperature",
@@ -808,7 +940,7 @@ class ThermostatProfile:
                     "temperature",
                     "Temperature",
                 ),
-                current_humidity=self._zone_float(
+                current_humidity=custom_current_hum if custom_current_hum is not None else self._zone_float(
                     zone_status,
                     zone_settings,
                     "currentHumidity",
@@ -818,52 +950,18 @@ class ThermostatProfile:
                     "humidity",
                     "Humidity",
                 ),
-                heat_setpoint=self._zone_float(
-                    zone_settings,
-                    zone_status,
-                    "heatSetpoint",
-                    "HeatSetpoint",
-                    "heatingSetpoint",
-                    "HeatingSetpoint",
-                ),
-                cool_setpoint=self._zone_float(
-                    zone_settings,
-                    zone_status,
-                    "coolSetpoint",
-                    "CoolSetpoint",
-                    "coolingSetpoint",
-                    "CoolingSetpoint",
-                ),
-                equipment_status=_normalize_status(
-                    _get_payload_value(
-                        zone_status,
-                        "equipmentStatus",
-                        "EquipmentStatus",
-                        "hvacStatus",
-                        "HvacStatus",
-                        "HVACStatus",
-                        "operatingState",
-                        "OperatingState",
-                        "status",
-                        "Status",
-                    )
-                ),
+                heat_setpoint=raw_heat,
+                cool_setpoint=raw_cool,
+                # Hook up your custom un-nested map state function here
+                
+                # 1. Cleanly pass our pre-calculated variable text string here
+                equipment_status=_normalize_status(raw_status),
+                
+                # 2. FIXED: Isolate the lookup keys explicitly to prevent recursive string trapping
                 hvac_service_remaining=_coerce_int(
-                    _get_payload_value(
-                        zone_status,
-                        "hvacServiceRemaining",
-                        "HvacServiceRemaining",
-                        "HVACServiceRemaining",
-                        "serviceRemaining",
-                        "ServiceRemaining",
-                    )
-                    or _get_nested_payload_value(
-                        zone_status,
-                        ("hvacService", "remaining"),
-                        ("HvacService", "Remaining"),
-                        ("service", "remaining"),
-                        ("Service", "Remaining"),
-                    )
+                    zone_status.get("hvacService", {}).get("remaining")
+                    if isinstance(zone_status.get("hvacService"), dict)
+                    else zone_status.get("hvacServiceRemaining")
                 ),
                 outdoor_temperature=self._zone_float(
                     zone_status,
@@ -881,6 +979,15 @@ class ThermostatProfile:
                     "outsideHumidity",
                     "OutsideHumidity",
                 ),
+                allowed_fan_modes=dynamic_fans,
+
+                # Assign the root values down into this specific zone state
+                humidifier_mode=g_humidifier_mode,
+                humidifier_setpoint=g_humidifier_setpoint,
+                humidifier_status=g_humidifier_status,
+
+                water_panel_remaining=g_water_panel_remaining,
+                water_panel_needs_service=g_water_panel_needs_service,
             )
 
         return NormalizedThermostatState(
@@ -896,9 +1003,30 @@ class ThermostatProfile:
             f"thermostat_{zone_key.lower()}" for zone_key in normalized.zones
         )
         dynamic_sensor_keys: list[str] = []
+        binary_sensor_keys: list[str] = []
+        humidifier_keys: list[str] = []
 
+        # 1. Structural validation: Determine if humidifier hardware is bound to settings
+        settings = record.effective_device_settings
+        has_humidifier_hardware = isinstance(settings, dict) and "humidifier" in settings
+
+        if normalized.zones and has_humidifier_hardware:
+            # Register the core master humidifier controls
+            humidifier_keys.append(f"humidifier_{record.device_id.lower()}")
+
+        # 2. Append our metrics using the zone prefix matrix format
         for zone_key, zone in normalized.zones.items():
             zone_prefix = f"thermostat_{zone_key.lower()}"
+            
+            # FORCE INITIALIZATION: If the hardware is present, register the diagnostic paths 
+            # unconditionally to completely eliminate initial boot payload race conditions!
+            if has_humidifier_hardware:
+                dynamic_sensor_keys.append(f"{zone_prefix}_water_panel_life")
+                binary_sensor_keys.append(f"{zone_prefix}_water_panel_service")
+
+            # Standard native thermostat items remain dependent on their active telemetry
+            if zone.current_temperature is not None:
+                dynamic_sensor_keys.append(f"{zone_prefix}_indoor_temperature")
             if zone.current_humidity is not None:
                 dynamic_sensor_keys.append(f"{zone_prefix}_indoor_humidity")
             if zone.outdoor_temperature is not None:
@@ -919,6 +1047,8 @@ class ThermostatProfile:
         return ProfileEntitySet(
             climate_keys=climate_keys,
             dynamic_sensor_keys=tuple(dynamic_sensor_keys),
+            binary_sensor_keys=tuple(binary_sensor_keys),
+            humidifier_keys=tuple(humidifier_keys),
         )
 
     def _installed_iaq_status_requests(
