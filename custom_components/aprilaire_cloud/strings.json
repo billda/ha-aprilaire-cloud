@@ -40,6 +40,9 @@
     "humidifier": {
       "dehumidifier": {
         "name": "Dehumidifier"
+      },
+      "humidifier": {
+        "name": "Humidifier"
       }
     },
     "sensor": {
@@ -60,6 +63,9 @@
       },
       "equipment_status": {
         "name": "Equipment status"
+      },
+      "water_panel_life": {
+        "name": "Humidifier water panel life"
       }
     },
     "binary_sensor": {
@@ -89,6 +95,9 @@
       },
       "websocket_connection": {
         "name": "Cloud connection"
+      },
+      "water_panel_service": {
+        "name": "Humidifier water panel replacement alert"
       }
     },
     "number": {
