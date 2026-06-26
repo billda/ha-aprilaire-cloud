@@ -19,7 +19,7 @@ from .coordinator import AprilaireCloudDataUpdateCoordinator
 from .data import AprilaireCloudConfigEntry
 from .entity import AprilaireCloudEntity, setup_dynamic_platform_entities
 from .models import SocketState
-from .profiles import NormalizedDehumidifierState, get_profile
+from .profiles import NormalizedDehumidifierState, NormalizedThermostatState, get_profile
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -33,6 +33,11 @@ class AprilaireBinarySensorDescription(BinarySensorEntityDescription):
 def _dehumidifier_state(normalized: object) -> NormalizedDehumidifierState:
     """Return dehumidifier-normalized state."""
     return cast(NormalizedDehumidifierState, normalized)
+
+
+def _thermostat_state(normalized: object) -> NormalizedThermostatState:
+    """Return thermostat-normalized state."""
+    return cast(NormalizedThermostatState, normalized)
 
 
 DEHUMIDIFIER_BINARY_SENSORS: dict[str, AprilaireBinarySensorDescription] = {
@@ -91,12 +96,29 @@ DEHUMIDIFIER_BINARY_SENSORS: dict[str, AprilaireBinarySensorDescription] = {
         enabled_default=False,
     ),
 }
+
+THERMOSTAT_BINARY_SENSORS: dict[str, AprilaireBinarySensorDescription] = {
+    "water_panel_service": AprilaireBinarySensorDescription(
+        key="water_panel_service",
+        translation_key="water_panel_service",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        value_fn=lambda normalized: next(
+            (
+                zone.water_panel_needs_service
+                for zone in getattr(normalized, "zones", {}).values()
+                if zone.water_panel_needs_service is not None
+            ),
+            False, # Safeguard default to match Home Assistant state initialization profiles
+        ),
+    ),
+}
+
 PROFILE_BINARY_SENSOR_DESCRIPTIONS: dict[
     str, dict[str, AprilaireBinarySensorDescription]
 ] = {
     "dehumidifier": DEHUMIDIFIER_BINARY_SENSORS,
+    "thermostat": THERMOSTAT_BINARY_SENSORS,
 }
-
 
 async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry, async_add_entities) -> None:
     """Set up AprilAire binary sensors."""
@@ -108,10 +130,14 @@ async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry, async_add_en
             return
         entity_set = profile.entity_descriptions(coordinator.data.devices[device_id])
         descriptions = PROFILE_BINARY_SENSOR_DESCRIPTIONS.get(device.profile_key, {})
+        
         for key in entity_set.binary_sensor_keys:
-            description = descriptions.get(key)
+            suffix_key = key.split("_", 2)[-1] if "thermostat_" in key else key
+            description = descriptions.get(suffix_key) or descriptions.get(key)
+            
             if description is not None:
-                yield AprilaireBinarySensorEntity(coordinator, device_id, description)
+                # Passes the true, fully-qualified key string into your new optional parameter
+                yield AprilaireBinarySensorEntity(coordinator, device_id, description, key)
 
     setup_dynamic_platform_entities(entry, async_add_entities, _entities_for_device)
 
@@ -150,9 +176,16 @@ class AprilaireBinarySensorEntity(AprilaireCloudEntity, BinarySensorEntity):
         coordinator: AprilaireCloudDataUpdateCoordinator,
         device_id: str,
         description: AprilaireBinarySensorDescription,
+        entity_key: str | None = None,  # <-- 1. ADD THIS OPTIONAL PARAMETER
     ) -> None:
         """Initialize the entity."""
-        super().__init__(coordinator, device_id, description.key)
+        
+        # 2. Safely capture the dynamic zone-prefixed key string if provided
+        target_key = entity_key if entity_key is not None else description.key
+        
+        # 3. Pass target_key instead of description.key so it satisfies base registry rules
+        super().__init__(coordinator, device_id, target_key)
+        
         self.entity_description = description
         self._attr_translation_key = description.translation_key
         self._attr_entity_category = description.entity_category
