@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable
+from collections.abc import Awaitable, Iterable
+from contextlib import suppress
 from copy import deepcopy
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from time import monotonic
 from typing import Any
 
@@ -16,14 +19,6 @@ from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.issue_registry import IssueSeverity
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import (
-    AprilaireCloudApiClient,
-    AprilaireCloudApiError,
-    AprilaireCloudAuthenticationError,
-    AprilaireCloudCommunicationError,
-    AprilaireCloudRateLimitError,
-    AprilaireCloudWriteError,
-)
 from .const import (
     CONF_ENABLE_EXTRA_DIAGNOSTICS,
     CONF_FALLBACK_REFRESH_MINUTES,
@@ -36,15 +31,25 @@ from .const import (
     LOGGER,
     MAX_PARALLEL_REST_REQUESTS,
     POST_WRITE_CONFIRM_TIMEOUT,
+    POST_WRITE_RECONCILIATION_ATTEMPTS,
+    POST_WRITE_RECONCILIATION_DELAY_SECONDS,
     UNKNOWN_DEVICE_MESSAGE_MAX_PER_DEVICE,
     UNKNOWN_DEVICE_MESSAGE_TTL_SECONDS,
     WEBSOCKET_INITIAL_SYNC_TIMEOUT,
 )
 from .data import AprilaireCloudConfigEntry
-from .models import AprilaireSnapshot, DeviceRecord, HierarchyLocation, SocketState
+from .models import (
+    AprilaireSnapshot,
+    DeviceRecord,
+    HierarchyLocation,
+    SocketState,
+    StateSource,
+)
 from .profiles import (
+    DeviceCommand,
+    EncodedCommand,
     format_unsupported_reasons,
-    record_has_thermostat_hint,
+    get_profile,
     record_requires_rest_refresh,
     status_requests_for_record,
 )
@@ -55,14 +60,52 @@ from .state import (
     apply_full_device_settings,
     apply_hierarchy,
     apply_pending_device_settings,
-    apply_rest_refresh,
+    apply_rest_device_status,
+    apply_status_payload,
     clear_pending_device_settings,
     evaluate_device_support,
     format_leaf_paths,
     pending_payload_is_current,
-    settings_match_payload,
 )
-from .websocket import AprilaireLocationWebSocket
+from .vendor import (
+    AprilaireCloudApiClient,
+    AprilaireCloudApiError,
+    AprilaireCloudAuthenticationError,
+    AprilaireCloudAuthenticationProtocolError,
+    AprilaireCloudAuthenticationTransientError,
+    AprilaireCloudCommunicationError,
+    AprilaireCloudInvalidCredentialsError,
+    AprilaireCloudRateLimitError,
+    AprilaireCloudWriteError,
+)
+from .vendor.websocket import AprilaireLocationWebSocket
+
+
+class RestFailureKind(StrEnum):
+    """Sanitized REST endpoint failure categories."""
+
+    AUTH = "auth"
+    RATE_LIMIT = "rate_limit"
+    TRANSPORT = "transport"
+    UNSUPPORTED = "unsupported"
+    HTTP = "http"
+
+
+def _classify_rest_failure(error: Exception) -> RestFailureKind:
+    """Classify a REST failure without retaining its message."""
+    if isinstance(error, AprilaireCloudAuthenticationError):
+        return RestFailureKind.AUTH
+    if isinstance(error, AprilaireCloudRateLimitError):
+        return RestFailureKind.RATE_LIMIT
+    if isinstance(error, AprilaireCloudCommunicationError):
+        return RestFailureKind.TRANSPORT
+    if (
+        isinstance(error, AprilaireCloudApiError)
+        and error.context is not None
+        and error.context.status == 404
+    ):
+        return RestFailureKind.UNSUPPORTED
+    return RestFailureKind.HTTP
 
 
 class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapshot]):
@@ -106,20 +149,45 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         self._last_rest_refresh_at: datetime | None = None
         self._last_websocket_message_at: dict[str, datetime] = {}
         self._current_refresh_mode: str = "safety"
+        self._optional_404_fingerprints: dict[tuple[str, str], str] = {}
+        self._optional_endpoint_failures: dict[tuple[str, str], RestFailureKind] = {}
+        self._rest_freshness_window = timedelta(
+            minutes=max(
+                int(
+                    config_entry.options.get(
+                        CONF_SAFETY_REFRESH_MINUTES,
+                        DEFAULT_SAFETY_REFRESH_MINUTES,
+                    )
+                )
+                * 2,
+                int(
+                    config_entry.options.get(
+                        CONF_FALLBACK_REFRESH_MINUTES,
+                        DEFAULT_FALLBACK_REFRESH_MINUTES,
+                    )
+                )
+                * 3,
+            )
+        )
 
     async def _async_setup(self) -> None:
         """Perform one-time startup work."""
         try:
             user = await self.client.async_get_user()
             hierarchy = await self.client.async_get_hierarchy()
-        except AprilaireCloudAuthenticationError as err:
+        except AprilaireCloudInvalidCredentialsError as err:
             raise ConfigEntryAuthFailed from err
         except AprilaireCloudRateLimitError as err:
             raise UpdateFailed(
                 "AprilAire REST API rate limited during setup",
                 retry_after=err.retry_after,
             ) from err
-        except (AprilaireCloudApiError, AprilaireCloudCommunicationError) as err:
+        except (
+            AprilaireCloudApiError,
+            AprilaireCloudAuthenticationProtocolError,
+            AprilaireCloudAuthenticationTransientError,
+            AprilaireCloudCommunicationError,
+        ) as err:
             raise UpdateFailed(f"Unable to initialize AprilAire integration: {err}") from err
 
         self._user_id = str(user["userId"])
@@ -128,7 +196,12 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         self.data = self._build_snapshot()
 
         await self._async_sync_location_websockets(wait_for_ready=True)
-        await self._async_rest_refresh_devices(self._device_ids_requiring_rest_refresh())
+        refreshed_ids, refresh_errors = await self._async_rest_refresh_devices(
+            self._device_ids_requiring_rest_refresh()
+        )
+        blocking_errors = self._errors_without_healthy_push(refresh_errors)
+        if blocking_errors and not refreshed_ids:
+            self._raise_refresh_error(next(iter(blocking_errors.values())))
         self._update_support_issue()
         self._publish_snapshot()
 
@@ -153,20 +226,26 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
                 refreshed_ids, refresh_errors = await self._async_rest_refresh_devices(
                     rest_refresh_ids
                 )
-                if refresh_errors and not refreshed_ids:
-                    self._raise_refresh_error(next(iter(refresh_errors.values())))
+                blocking_errors = self._errors_without_healthy_push(refresh_errors)
+                if blocking_errors and not refreshed_ids:
+                    self._raise_refresh_error(next(iter(blocking_errors.values())))
 
             await self._async_cleanup_removed_locations(removed_location_ids)
             await self._async_cleanup_removed_devices(removed_ids)
             self._update_support_issue()
-        except AprilaireCloudAuthenticationError as err:
+        except AprilaireCloudInvalidCredentialsError as err:
             raise ConfigEntryAuthFailed from err
         except AprilaireCloudRateLimitError as err:
             raise UpdateFailed(
                 "AprilAire REST API rate limited",
                 retry_after=err.retry_after,
             ) from err
-        except (AprilaireCloudCommunicationError, AprilaireCloudApiError) as err:
+        except (
+            AprilaireCloudAuthenticationProtocolError,
+            AprilaireCloudAuthenticationTransientError,
+            AprilaireCloudCommunicationError,
+            AprilaireCloudApiError,
+        ) as err:
             raise UpdateFailed(f"Unable to refresh AprilAire data: {err}") from err
 
         snapshot = self._build_snapshot()
@@ -177,6 +256,9 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         """Tear down runtime resources."""
         if self._refresh_event_task is not None:
             self._refresh_event_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._refresh_event_task
+            self._refresh_event_task = None
         ir.async_delete_issue(
             self.hass,
             DOMAIN,
@@ -202,46 +284,9 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         changed = False
         support_changed = False
         for message in messages:
-            message_type = message.get("_type")
-            if message_type == "RefreshEvent":
-                LOGGER.debug("RefreshEvent received for location %s", location_id)
-                self._schedule_refresh()
-                continue
-
-            device_id = message.get("deviceId")
-            if device_id is None:
-                continue
-            LOGGER.debug(
-                "WebSocket message %s for device %s in location %s",
-                message_type,
-                device_id,
-                location_id,
-            )
-            if device_id not in self._devices:
-                LOGGER.debug("Caching message for unknown device %s", device_id)
-                self._cache_unknown_device_message(device_id, message)
-                self._schedule_refresh()
-                continue
-
-            record = self._devices[device_id]
-            updated_record = evaluate_device_support(apply_device_message(record, message))
-            if updated_record == record:
-                continue
-            self._devices[device_id] = updated_record
-            changed = True
-            if (
-                updated_record.supported != record.supported
-                or updated_record.unsupported_reason != record.unsupported_reason
-            ):
-                support_changed = True
-            if message_type == "DeviceSettings":
-                write_state = self._write_states.get(device_id)
-                if (
-                    write_state is not None
-                    and write_state.inflight_event is not None
-                    and settings_match_payload(message, write_state.inflight_expected)
-                ):
-                    write_state.inflight_event.set()
+            message_changed, message_support_changed = self._process_message(message)
+            changed = changed or message_changed
+            support_changed = support_changed or message_support_changed
 
         if changed:
             if support_changed:
@@ -249,23 +294,111 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
             self._last_websocket_message_at[location_id] = datetime.now(tz=UTC)
             self._publish_snapshot()
 
+    def _process_message(self, message: dict[str, Any]) -> tuple[bool, bool]:
+        """Apply one push message and report state/support changes."""
+        message_type = message.get("_type")
+        if message_type == "RefreshEvent":
+            LOGGER.debug("RefreshEvent received")
+            self._schedule_refresh()
+            return False, False
+
+        device_id = message.get("deviceId")
+        if device_id is None:
+            return False, False
+        LOGGER.debug("WebSocket message received: %s", message_type)
+        if device_id not in self._devices:
+            LOGGER.debug("Caching message for an unknown device")
+            self._cache_unknown_device_message(device_id, message)
+            self._schedule_refresh()
+            return False, False
+
+        record = self._devices[device_id]
+        updated = evaluate_device_support(apply_device_message(record, message))
+        updated = replace(
+            updated,
+            health=replace(
+                updated.health,
+                last_push_received_at=datetime.now(tz=UTC),
+            ),
+        )
+        if updated == record:
+            return False, False
+        self._devices[device_id] = updated
+        self._confirm_inflight_settings(message_type, device_id, updated)
+        support_changed = (
+            updated.supported != record.supported
+            or updated.unsupported_reason != record.unsupported_reason
+        )
+        return True, support_changed
+
+    def _confirm_inflight_settings(
+        self,
+        message_type: Any,
+        device_id: str,
+        record: DeviceRecord,
+    ) -> None:
+        """Signal a pending write when confirmed by DeviceSettings."""
+        if message_type != "DeviceSettings":
+            return
+        write_state = self._write_states.get(device_id)
+        profile = get_profile(record.profile_key)
+        if (
+            write_state is not None
+            and write_state.inflight_event is not None
+            and write_state.inflight_command is not None
+            and profile is not None
+            and profile.command_confirmed(record, write_state.inflight_command)
+        ):
+            write_state.inflight_event.set()
+
     async def async_socket_state_changed(self, state: SocketState) -> None:
         """Track websocket connection state."""
         self._socket_states[state.location_id] = state
         self._publish_snapshot()
 
-    async def async_write_device_settings(
+    def device_is_available(self, device_id: str) -> bool:
+        """Return source-aware availability for one device."""
+        record = self._devices.get(device_id)
+        if record is None or not record.supported or record.health.offline:
+            return False
+        socket = self._socket_states.get(record.hierarchy.location_id)
+        if (
+            socket is not None
+            and socket.transport_connected
+            and socket.initial_sync_complete
+        ):
+            return True
+        last_rest = record.health.last_rest_received_at
+        return (
+            last_rest is not None
+            and datetime.now(tz=UTC) - last_rest <= self._rest_freshness_window
+        )
+
+    async def async_execute_command(
         self,
         device_id: str,
-        payload: dict[str, Any],
+        command: DeviceCommand,
     ) -> None:
-        """Write settings and wait briefly for a matching settings confirmation."""
-        if device_id not in self._devices:
-            return
+        """Validate, encode, and execute a profile-owned command."""
+        record = self._devices.get(device_id)
+        if record is None:
+            raise AprilaireCloudWriteError("AprilAire device is unavailable")
+        profile = get_profile(record.profile_key)
+        if profile is None:
+            raise AprilaireCloudWriteError("AprilAire device profile is unavailable")
+        encoded = profile.encode_command(record, command)
+        await self._async_write_device_settings(device_id, encoded)
 
+    async def _async_write_device_settings(
+        self,
+        device_id: str,
+        encoded: EncodedCommand,
+    ) -> None:
+        """Write one validated command and reconcile normalized intent."""
+        payload = encoded.payload
         write_state = self._write_states.setdefault(device_id, DeviceWriteState())
         payload_paths = format_leaf_paths(payload)
-        LOGGER.debug("Write started for device %s: %s", device_id, payload_paths)
+        LOGGER.debug("Device write started for paths: %s", payload_paths)
         self._apply_pending_device_settings(device_id, payload)
         self._sync_write_state(device_id, confirmed_settings=None)
         pending_paths = set(write_state.pending_paths)
@@ -282,6 +415,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
                 inflight_event = asyncio.Event()
                 write_state.inflight_paths = payload_paths
                 write_state.inflight_expected = deepcopy(payload)
+                write_state.inflight_command = encoded.command
                 write_state.inflight_event = inflight_event
 
                 await self.client.async_patch_device_settings(device_id, payload)
@@ -289,20 +423,30 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
                     await asyncio.wait_for(
                         inflight_event.wait(), timeout=POST_WRITE_CONFIRM_TIMEOUT
                     )
-                    LOGGER.debug("Write confirmed via WebSocket for device %s", device_id)
+                    LOGGER.debug("Device write confirmed via WebSocket")
                     return
                 except TimeoutError:
-                    LOGGER.debug(
-                        "Write confirmation timed out for device %s, checking REST",
-                        device_id,
-                    )
-                    settings = await self._async_refresh_device_settings(device_id)
-                    self._publish_snapshot()
-                    if settings_match_payload(settings, payload):
-                        LOGGER.debug("Write confirmed via REST for device %s", device_id)
-                        return
+                    LOGGER.debug("Device write confirmation timed out; checking REST")
+                    for attempt in range(POST_WRITE_RECONCILIATION_ATTEMPTS):
+                        await self._async_refresh_device_settings(device_id)
+                        self._publish_snapshot()
+                        record = self._devices.get(device_id)
+                        profile = get_profile(record.profile_key) if record else None
+                        if (
+                            record is not None
+                            and profile is not None
+                            and profile.command_confirmed(record, encoded.command)
+                        ):
+                            LOGGER.debug("Device write confirmed via REST")
+                            return
+                        if not self._pending_payload_is_current(device_id, payload):
+                            return
+                        if attempt + 1 < POST_WRITE_RECONCILIATION_ATTEMPTS:
+                            await asyncio.sleep(
+                                POST_WRITE_RECONCILIATION_DELAY_SECONDS
+                            )
 
-                    should_raise = self._pending_payload_is_current(device_id, payload)
+                    should_raise = True
         except (AprilaireCloudApiError, AprilaireCloudCommunicationError):
             should_raise = should_raise or self._pending_payload_is_current(device_id, payload)
             if should_raise:
@@ -314,6 +458,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         finally:
             write_state.inflight_paths = ()
             write_state.inflight_expected = {}
+            write_state.inflight_command = None
             write_state.inflight_event = None
             self._sync_write_state(device_id, confirmed_settings=None)
 
@@ -393,13 +538,38 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         self._replay_unknown_device_messages()
         new_device_ids = set(self._devices) - old_device_ids
         if new_device_ids:
-            LOGGER.debug("Devices added to hierarchy: %s", new_device_ids)
+            LOGGER.debug("%d device(s) added to hierarchy", len(new_device_ids))
         if removed_ids:
-            LOGGER.debug("Devices removed from hierarchy: %s", removed_ids)
+            LOGGER.debug("%d device(s) removed from hierarchy", len(removed_ids))
         for device_id in removed_ids:
             self._write_states.pop(device_id, None)
             self._unknown_device_messages.pop(device_id, None)
+            for cache in (
+                self._optional_404_fingerprints,
+                self._optional_endpoint_failures,
+            ):
+                for cache_key in tuple(cache):
+                    if cache_key[0] == device_id:
+                        cache.pop(cache_key, None)
         return removed_ids
+
+    def _errors_without_healthy_push(
+        self,
+        errors: dict[str, Exception],
+    ) -> dict[str, Exception]:
+        """Return failures not covered by a synchronized push connection."""
+        return {
+            device_id: error
+            for device_id, error in errors.items()
+            if (
+                (record := self._devices.get(device_id)) is None
+                or (
+                    (socket := self._socket_states.get(record.hierarchy.location_id)) is None
+                    or not socket.transport_connected
+                    or not socket.initial_sync_complete
+                )
+            )
+        }
 
     def _device_ids_requiring_rest_refresh(self) -> set[str]:
         """Return device IDs that still need REST fallback refreshes."""
@@ -474,92 +644,192 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         self,
         device_ids: Iterable[str],
     ) -> tuple[set[str], dict[str, Exception]]:
-        """Refresh device state via REST."""
+        """Hydrate devices through independent critical and optional REST stages."""
         ids = list(device_ids)
         if not ids:
             return set(), {}
-        LOGGER.debug("REST refresh starting for %d device(s): %s", len(ids), ids)
+        LOGGER.debug("REST refresh starting for %d device(s)", len(ids))
 
         semaphore = asyncio.Semaphore(MAX_PARALLEL_REST_REQUESTS)
-
-        async def _refresh_device(
-            device_id: str,
-        ) -> tuple[
-            str,
-            dict[str, Any],
-            dict[str, dict[str, Any]],
-            dict[str, Any] | Exception,
-        ]:
-            async with semaphore:
-                try:
-                    status_requests = status_requests_for_record(self._devices[device_id])
-                    status, settings, *profile_statuses = await asyncio.gather(
-                        self.client.async_get_device_status(device_id),
-                        self.client.async_get_device_settings(device_id),
-                        *(
-                            self.client.async_get_status(device_id, request.endpoint)
-                            for request in status_requests
-                        ),
-                    )
-                except (
-                    AprilaireCloudApiError,
-                    AprilaireCloudAuthenticationError,
-                    AprilaireCloudCommunicationError,
-                    AprilaireCloudRateLimitError,
-                ) as err:
-                    return device_id, {}, {}, err
-                return (
-                    device_id,
-                    status,
-                    {
-                        request.key: payload
-                        for request, payload in zip(
-                            status_requests, profile_statuses, strict=True
-                        )
-                    },
-                    settings,
-                )
-
-        results = await asyncio.gather(*(_refresh_device(device_id) for device_id in ids))
+        results = await asyncio.gather(
+            *(self._async_rest_refresh_device(device_id, semaphore) for device_id in ids)
+        )
         refreshed_ids: set[str] = set()
         refresh_errors: dict[str, Exception] = {}
 
-        for device_id, status, status_payloads, settings in results:
-            if device_id not in self._devices:
-                continue
-            if isinstance(settings, Exception):
-                LOGGER.warning("REST refresh failed for device %s: %s", device_id, settings)
-                refresh_errors[device_id] = settings
-                continue
-            self._devices[device_id] = evaluate_device_support(
-                apply_rest_refresh(
-                    self._devices[device_id],
-                    device_status=status,
-                    settings=settings,
-                    status_payloads=status_payloads,
+        for device_id, progressed, critical_errors in results:
+            if progressed:
+                refreshed_ids.add(device_id)
+            elif critical_errors:
+                error = critical_errors[0]
+                LOGGER.warning(
+                    "Critical REST hydration failed for a device (%s)",
+                    _classify_rest_failure(error).value,
                 )
-            )
-            self._sync_write_state(device_id, confirmed_settings=settings)
-            refreshed_ids.add(device_id)
+                refresh_errors[device_id] = error
         if refreshed_ids:
             self._last_rest_refresh_at = datetime.now(tz=UTC)
         return refreshed_ids, refresh_errors
 
+    async def _capture_rest_result(
+        self,
+        semaphore: asyncio.Semaphore,
+        request: Awaitable[dict[str, Any]],
+    ) -> dict[str, Any] | Exception:
+        """Run one bounded REST request and retain only typed failures."""
+        try:
+            async with semaphore:
+                return await request
+        except (
+            AprilaireCloudApiError,
+            AprilaireCloudAuthenticationError,
+            AprilaireCloudCommunicationError,
+            AprilaireCloudRateLimitError,
+        ) as err:
+            return err
+
+    async def _async_rest_refresh_device(
+        self,
+        device_id: str,
+        semaphore: asyncio.Semaphore,
+    ) -> tuple[str, bool, list[Exception]]:
+        """Hydrate one device in critical then profile-specific stages."""
+        status_result, settings_result = await asyncio.gather(
+            self._capture_rest_result(
+                semaphore, self.client.async_get_device_status(device_id)
+            ),
+            self._capture_rest_result(
+                semaphore, self.client.async_get_device_settings(device_id)
+            ),
+        )
+        if device_id not in self._devices:
+            return device_id, False, []
+
+        progressed, critical_errors = self._apply_critical_rest_results(
+            device_id, status_result, settings_result
+        )
+        record = self._devices[device_id]
+        fingerprint = self._optional_request_fingerprint(record)
+        requests = [
+            request
+            for request in status_requests_for_record(record)
+            if self._optional_404_fingerprints.get((device_id, request.key))
+            != fingerprint
+        ]
+        optional_results = await asyncio.gather(
+            *(
+                self._capture_rest_result(
+                    semaphore,
+                    self.client.async_get_status(device_id, request.endpoint),
+                )
+                for request in requests
+            )
+        )
+        progressed = self._apply_optional_rest_results(
+            device_id,
+            requests,
+            optional_results,
+            fingerprint,
+        ) or progressed
+        if progressed:
+            self._mark_rest_progress(device_id)
+        return device_id, progressed, critical_errors
+
+    def _apply_critical_rest_results(
+        self,
+        device_id: str,
+        status_result: dict[str, Any] | Exception,
+        settings_result: dict[str, Any] | Exception,
+    ) -> tuple[bool, list[Exception]]:
+        """Apply independent critical status/settings responses."""
+        errors: list[Exception] = []
+        progressed = False
+        if isinstance(status_result, Exception):
+            errors.append(status_result)
+        else:
+            self._devices[device_id] = evaluate_device_support(
+                apply_rest_device_status(self._devices[device_id], status_result)
+            )
+            progressed = True
+        if isinstance(settings_result, Exception):
+            errors.append(settings_result)
+        else:
+            self._devices[device_id] = evaluate_device_support(
+                apply_full_device_settings(self._devices[device_id], settings_result)
+            )
+            self._sync_write_state(device_id, confirmed_settings=settings_result)
+            progressed = True
+        return progressed, errors
+
+    @staticmethod
+    def _optional_request_fingerprint(record: DeviceRecord) -> str:
+        """Fingerprint facts that determine optional endpoint support."""
+        return repr(
+            (
+                record.profile_key,
+                record.hierarchy.access,
+                record.hierarchy.zone,
+                record.device_setup,
+                record.device_settings,
+            )
+        )
+
+    def _apply_optional_rest_results(
+        self,
+        device_id: str,
+        requests,
+        results: list[dict[str, Any] | Exception],
+        fingerprint: str,
+    ) -> bool:
+        """Apply optional results independently and cache unsupported routes."""
+        progressed = False
+        for request, result in zip(requests, results, strict=True):
+            cache_key = (device_id, request.key)
+            if isinstance(result, Exception):
+                failure_kind = _classify_rest_failure(result)
+                self._optional_endpoint_failures[cache_key] = failure_kind
+                if failure_kind is RestFailureKind.UNSUPPORTED:
+                    self._optional_404_fingerprints[cache_key] = fingerprint
+                LOGGER.debug("Optional REST endpoint failed (%s)", failure_kind.value)
+                continue
+            self._optional_endpoint_failures.pop(cache_key, None)
+            self._optional_404_fingerprints.pop(cache_key, None)
+            self._devices[device_id] = evaluate_device_support(
+                apply_status_payload(
+                    self._devices[device_id],
+                    request.key,
+                    result,
+                    source=StateSource.REST,
+                    full=True,
+                )
+            )
+            progressed = True
+        return progressed
+
+    def _mark_rest_progress(self, device_id: str) -> None:
+        """Record per-device REST freshness after any usable progress."""
+        record = self._devices.get(device_id)
+        if record is None:
+            return
+        self._devices[device_id] = replace(
+            record,
+            health=replace(
+                record.health,
+                last_rest_received_at=datetime.now(tz=UTC),
+            ),
+        )
+
     async def _async_refresh_device_settings(self, device_id: str) -> dict[str, Any]:
         """Refresh only the writable settings for one device."""
         settings = await self.client.async_get_device_settings(device_id)
-        record = self._devices.get(device_id)
-        if record is not None and record_has_thermostat_hint(record):
-            self._apply_full_device_settings(device_id, settings)
-        else:
-            self._apply_confirmed_device_settings(device_id, settings)
+        self._apply_full_device_settings(device_id, settings)
         return settings
 
     async def _async_cleanup_removed_devices(self, removed_ids: set[str]) -> None:
         """Remove stale entity registry entries for devices no longer in the hierarchy."""
         if not removed_ids:
             return
-        LOGGER.debug("Cleaning up removed devices: %s", removed_ids)
+        LOGGER.debug("Cleaning up %d removed device(s)", len(removed_ids))
         device_registry = dr.async_get(self.hass)
         entity_registry = er.async_get(self.hass)
         stale_registry_device_ids = {
@@ -593,7 +863,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         """Remove stale entity and device registry entries for removed locations."""
         if not removed_location_ids:
             return
-        LOGGER.debug("Cleaning up removed locations: %s", removed_location_ids)
+        LOGGER.debug("Cleaning up %d removed location(s)", len(removed_location_ids))
         device_registry = dr.async_get(self.hass)
         entity_registry = er.async_get(self.hass)
         stale_registry_device_ids = {
@@ -769,14 +1039,22 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
 
     def _raise_refresh_error(self, err: Exception) -> None:
         """Raise the correct coordinator refresh error for a REST failure."""
-        if isinstance(err, AprilaireCloudAuthenticationError):
+        if isinstance(err, AprilaireCloudInvalidCredentialsError):
             raise ConfigEntryAuthFailed from err
         if isinstance(err, AprilaireCloudRateLimitError):
             raise UpdateFailed(
                 "AprilAire REST API rate limited",
                 retry_after=err.retry_after,
             ) from err
-        if isinstance(err, (AprilaireCloudCommunicationError, AprilaireCloudApiError)):
+        if isinstance(
+            err,
+            (
+                AprilaireCloudAuthenticationProtocolError,
+                AprilaireCloudAuthenticationTransientError,
+                AprilaireCloudCommunicationError,
+                AprilaireCloudApiError,
+            ),
+        ):
             raise UpdateFailed(f"Unable to refresh AprilAire data: {err}") from err
         raise UpdateFailed(f"Unable to refresh AprilAire data: {err}") from err
 

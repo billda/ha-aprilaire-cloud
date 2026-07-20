@@ -10,6 +10,10 @@ body:
         Thanks for taking the time to report a bug.
 
         Please include as much concrete detail as you can, especially your AprilAire model, Home Assistant version, and diagnostics.
+        Review generated diagnostics before uploading them publicly. Current
+        releases pseudonymize identifiers and omit payload values, but
+        diagnostics made by older integration versions may contain stable
+        account, location, device, or entity identifiers.
   - type: input
     id: model
     attributes:
@@ -61,6 +65,11 @@ body:
     id: diagnostics
     attributes:
       label: Diagnostics and logs
-      description: Attach or paste diagnostics and any relevant logs. Please redact secrets before posting logs manually.
+      description: Attach current generated diagnostics after reviewing them. Redact credentials, tokens, names, addresses, stable identifiers, and raw response bodies from manually copied logs.
     validations:
       required: true
+  - type: textarea
+    id: payload_shape
+    attributes:
+      label: Payload shape or protocol evidence
+      description: If relevant, list field paths and value types or describe a before/after device test. Do not post credentials, tokens, raw account data, or unsanitized payloads.

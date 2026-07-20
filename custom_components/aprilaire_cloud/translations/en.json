@@ -40,6 +40,19 @@
     "humidifier": {
       "dehumidifier": {
         "name": "Dehumidifier"
+      },
+      "attached_humidifier": {
+        "name": "Attached humidifier"
+      }
+    },
+    "switch": {
+      "dehumidifier_power": {
+        "name": "Dehumidifier power"
+      }
+    },
+    "climate": {
+      "thermostat_zone": {
+        "name": "{zone} thermostat"
       }
     },
     "sensor": {
@@ -60,6 +73,48 @@
       },
       "equipment_status": {
         "name": "Equipment status"
+      },
+      "thermostat_indoor_humidity": {
+        "name": "{zone} indoor humidity"
+      },
+      "thermostat_outdoor_temperature": {
+        "name": "{zone} outdoor temperature"
+      },
+      "thermostat_outdoor_humidity": {
+        "name": "{zone} outdoor humidity"
+      },
+      "thermostat_equipment_status": {
+        "name": "{zone} equipment status"
+      },
+      "thermostat_hvac_service_remaining": {
+        "name": "{zone} HVAC service remaining"
+      },
+      "iaq_humidifier_status": {
+        "name": "Humidifier status"
+      },
+      "iaq_humidifier_service_remaining": {
+        "name": "Humidifier service remaining"
+      },
+      "iaq_dehumidifier_status": {
+        "name": "Dehumidifier status"
+      },
+      "iaq_dehumidifier_service_remaining": {
+        "name": "Dehumidifier service remaining"
+      },
+      "iaq_freshair_status": {
+        "name": "Fresh air status"
+      },
+      "iaq_freshair_service_remaining": {
+        "name": "Fresh air service remaining"
+      },
+      "iaq_aircleaning_status": {
+        "name": "Air cleaning status"
+      },
+      "iaq_aircleaning_service_remaining": {
+        "name": "Air cleaning service remaining"
+      },
+      "attached_humidifier_water_panel_remaining": {
+        "name": "Water panel remaining"
       }
     },
     "binary_sensor": {
@@ -89,6 +144,9 @@
       },
       "websocket_connection": {
         "name": "Cloud connection"
+      },
+      "attached_humidifier_water_panel_service": {
+        "name": "Water panel service"
       }
     },
     "number": {

@@ -1,0 +1,21 @@
+{
+  "locations": [
+    {
+      "locationId": "location-read-only-001",
+      "name": "Synthetic Shared Location",
+      "timeZone": "America/New_York",
+      "rooms": [
+        {
+          "name": "Shared Room",
+          "devices": [
+            {
+              "deviceId": "device-read-only-001",
+              "access": "read",
+              "zone": 1
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

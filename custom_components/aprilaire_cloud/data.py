@@ -10,8 +10,8 @@ from homeassistant.config_entries import ConfigEntry
 if TYPE_CHECKING:
     from homeassistant.loader import Integration
 
-    from .api import AprilaireCloudApiClient
     from .coordinator import AprilaireCloudDataUpdateCoordinator
+    from .vendor import AprilaireCloudApiClient
 
 
 @dataclass(slots=True)

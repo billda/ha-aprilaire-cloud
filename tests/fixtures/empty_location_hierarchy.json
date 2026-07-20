@@ -1,0 +1,10 @@
+{
+  "locations": [
+    {
+      "locationId": "location-empty-001",
+      "name": "Synthetic Empty Location",
+      "timeZone": "America/New_York",
+      "rooms": []
+    }
+  ]
+}

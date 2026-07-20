@@ -4,7 +4,8 @@
 [![Validate](https://github.com/billda/ha-aprilaire-cloud/actions/workflows/validate.yml/badge.svg)](https://github.com/billda/ha-aprilaire-cloud/actions/workflows/validate.yml)
 [![Open in HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=billda&repository=ha-aprilaire-cloud&category=integration)
 
-Home Assistant custom integration for AprilAire Healthy Air cloud-connected dehumidifiers and beta/tester-ready thermostats.
+Home Assistant custom integration for AprilAire Healthy Air cloud-connected
+dehumidifiers and evidence-backed beta thermostat support.
 
 This integration connects to the modern `aprilaire.io` platform used by the AprilAire Healthy Air app. It is built as a standard Home Assistant config-entry integration for HACS, with automatic device discovery, WebSocket-first updates, diagnostics support, and dynamic entity creation when new supported devices appear on the account.
 
@@ -22,11 +23,11 @@ This project is unofficial and is not affiliated with AprilAire.
 | --- | --- |
 | Platform | Home Assistant custom integration via HACS |
 | Cloud | `aprilaire.io` |
-| Device focus | Supported AprilAire Healthy Air dehumidifiers and beta AprilAire thermostats |
+| Device focus | Capability-matched AprilAire dehumidifiers and beta 8920W thermostat support |
 | Setup style | UI-only config entry |
 | Update model | WebSocket-first with bounded REST fallback |
 | Multi-device support | Yes, across multiple locations on one account |
-| Tested live | AprilAire E100W; thermostat support needs tester confirmation |
+| Tested live | E100W by the maintainer; selected 8920W behavior by community testers |
 
 ## Highlights
 
@@ -35,52 +36,66 @@ This project is unofficial and is not affiliated with AprilAire.
 - Automatic discovery of supported dehumidifiers and beta thermostats on the configured account
 - Support for multiple devices and multiple locations on one account
 - Standard Home Assistant behavior: device registry, config entries, reauth, diagnostics, dynamic entity creation
-- Conservative capability detection so unsupported devices are skipped instead of exposed in a misleading or partially broken way
+- Granular capability detection so read-only and partial-control devices retain
+  honest, useful entities
 - Defensive auth refresh and rate-limit handling for an undocumented API
+- Per-device offline handling and privacy-preserving diagnostics
 
 ## What This Integration Supports
 
-This integration supports AprilAire Healthy Air dehumidifiers available through the `aprilaire.io` cloud API when they expose:
+The integration recognizes a dehumidifier independently of its control mode.
+Entities and writes are then selected from fields the device actually reports:
 
-- equipment type `dehumidifier`
-- `controlType == internal`
-- `scale == %RH`
-- a writable `humiditySetpoint`
+- internal `%RH` control with explicit `mode` and `humiditySetpoint` receives
+  the full dehumidifier entity;
+- external or partial control retains understood sensors and receives an
+  on/off switch only when the vendor reports an applicable `mode`;
+- read/shared access receives state but no controls;
+- dryness/dew-point and non-applicable humidity target writes remain disabled.
 
-The integration is designed to discover devices by capability rather than by a hardcoded model allowlist. If you have a different AprilAire dehumidifier model that uses the same capability profile, there is a good chance it will work, but I need real-world testing reports to confirm broader model support.
+This capability model is intentionally more conservative than a model
+allowlist. It does not imply that every Healthy Air device is compatible.
 
 ### Beta Thermostat Support
 
-Thermostat support is beta/tester-ready. It is based on the same `aprilaire.io` API research as the dehumidifier support, but live thermostat payloads still need confirmation from owners.
-
-Expected thermostat support includes:
+Thermostat support is beta. Community testing on an 8920W confirms:
 
 - climate entities for zones `PZ1`, `SZ2`, and `SZ3` when those zones are reported
-- heat, cool, auto, and off HVAC modes
-- heat and cool setpoints
-- fan modes `auto`, `on`, and `circulate`
-- hold/preset modes `none`, `temporary`, `permanent`, and `vacation`
-- read-only thermostat humidity, outdoor conditions, equipment status, and HVAC service sensors when reported
-- read-only status/service sensors for thermostat-connected humidifier, dehumidifier, fresh-air, and air-cleaning equipment when installed
+- indoor temperature/humidity from the reported sensor arrays;
+- HVAC action from separate heating, cooling, and fan state;
+- off, heat, cool, and auto mode writes;
+- `auto`, `on`, and `circulate` fan writes;
+- `none`, `temporary`, `permanent`, and `vacation` hold writes;
+- read-only outdoor, equipment, service, and explicitly installed IAQ state
+  when reported.
 
-Expected model families include the AprilAire Wi-Fi thermostat families that use the AprilAire Healthy Air / `aprilaire.io` platform, including the 8920W. Please file a compatibility report with diagnostics if your thermostat appears, partly works, or is skipped.
+Heat and cool setpoints are displayed, but setpoint writes are deliberately
+disabled: the PATCH unit and heat/cool deadband have not been proven. The
+integration does not infer temperature units from numeric values.
+
+An explicitly installed thermostat-attached humidifier receives one
+thermostat-global humidifier entity rather than being assigned to an arbitrary
+zone. Community-confirmed power/target keys are writable with `manage` access;
+current humidity, action, and water-panel state remain unknown when not
+reported.
 
 Live validation has been performed against a real AprilAire cloud account and a real AprilAire E100W. If your device authenticates successfully but does not show up in Home Assistant, the most likely reason is that it exposes an unsupported capability profile rather than a bad login.
+
+See [AprilAire Cloud protocol evidence](docs/protocol-evidence.md) for the
+source, evidence level, and remaining gaps behind every protocol claim.
 
 ## Explicitly Out Of Scope
 
 The following are not supported:
 
 - `aprilairestat.com`
-- devices that use `drynessSetpoint`
-- devices using `remote`, `external`, or other non-internal control modes
-- devices using dew-point style control instead of `%RH`
+- dryness/dew-point target writes
+- unreported or inferred control capabilities
 - thermostat schedule editing
-- thermostat-connected IAQ controls
 - thermostat emergency-heat writes
 - YAML configuration
 
-Unsupported devices are intentionally ignored rather than approximated.
+Unknown behavior is kept read-only or unavailable rather than approximated.
 
 ## Installation
 
@@ -138,16 +153,19 @@ The exact set of entities depends on what each device reports.
 | Entity type | Purpose |
 | --- | --- |
 | `climate` | Thermostat zone control |
-| `humidifier` | Main dehumidifier control and target humidity |
+| `humidifier` | Full dehumidifier control or an explicitly installed attached humidifier |
+| `switch` | Honest on/off-only control for a partial-control dehumidifier |
 | `sensor` | Humidity, temperature, filter life, and diagnostics |
 | `binary_sensor` | Alerts and running-state diagnostics |
 | `number` | Writable alert thresholds when supported |
 
 ### Primary Control
 
-Each supported dehumidifier creates one primary `humidifier` entity using Home Assistant's dehumidifier device class.
+An internal `%RH` dehumidifier with applicable target and power settings
+creates one primary `humidifier` entity. A device with only proven power
+control receives a switch instead. A read-only device receives sensors only.
 
-Supported controls:
+Full dehumidifier controls:
 
 - turn the dehumidifier on
 - turn the dehumidifier off
@@ -168,18 +186,20 @@ Depending on device payloads, the integration may expose:
 - extra temperature sensors
 - writable high humidity alert limit
 
-### Thermostat Controls
+### Thermostat And Attached-Humidifier Controls
 
 Each supported thermostat creates one `climate` entity per reported zone.
 
-Supported controls:
+For a confirmed 8920W contract and `manage` account access:
 
 - set HVAC mode to off, heat, cool, or heat/cool auto
-- set heat and cool setpoints
 - set fan mode
 - set hold/preset mode
 
-Thermostat schedule editing, emergency-heat writes, and controls for thermostat-connected IAQ equipment are intentionally deferred.
+Temperature setpoint, schedule, and emergency-heat writes are disabled. An
+explicitly installed attached humidifier can expose power and humidity-target
+controls plus reported water-panel service state. Other attached IAQ equipment
+is read-only.
 
 ## Update Model
 
@@ -201,8 +221,19 @@ Commands such as turning the device on or changing target humidity are sent with
 - Credentials are stored in the Home Assistant config entry, not in YAML.
 - Access, ID, and refresh tokens are kept in memory only.
 - Tokens are refreshed automatically before expiry.
+- A rejected refresh token falls back to a full login.
+- A jittered proactive full login refreshes the long-lived session before
+  normal refresh-token aging becomes user-visible.
 - `401 Unauthorized` responses trigger automatic token recovery.
-- If recovery fails, Home Assistant reauthentication is triggered using the standard reauth flow.
+- Only definite credential/account failures start Home Assistant reauth;
+  network, service, throttling, and unknown protocol failures remain retryable.
+
+### Availability
+
+Availability is tracked per device. A confirmed offline `DeviceEvent` makes
+only that device unavailable, and a newer rescinded event restores it without
+recreating entities. Fresh REST state may keep a device available during a
+location WebSocket outage.
 
 ### Rate Limiting
 
@@ -232,6 +263,10 @@ If you file a bug, please include:
 - whether you have multiple devices or locations
 - what action failed
 - a diagnostics download from the integration if possible
+
+Default diagnostics omit raw vendor payloads and pseudonymize identifiers
+within each export. Still review the file before publishing it. Never post
+credentials, tokens, raw API captures, or identifying location/device data.
 
 ## Contributing
 

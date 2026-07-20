@@ -1,5 +1,5 @@
 name: Model compatibility report
-description: Report how the integration behaves with a specific AprilAire dehumidifier model
+description: Report how the integration behaves with a specific AprilAire cloud device
 title: "[Compatibility]: "
 labels:
   - device support
@@ -11,6 +11,8 @@ body:
         Compatibility reports are especially helpful right now.
 
         Even if a device only partly works, please report it.
+        Review generated diagnostics before public upload. Diagnostics from
+        older integration versions may expose stable identifiers.
   - type: input
     id: model
     attributes:
@@ -22,6 +24,18 @@ body:
     id: firmware
     attributes:
       label: Firmware version
+  - type: input
+    id: app_version
+    attributes:
+      label: AprilAire Healthy Air app version
+  - type: dropdown
+    id: access
+    attributes:
+      label: Account access
+      options:
+        - Manage
+        - Shared or read-only
+        - Unknown
   - type: dropdown
     id: discovery
     attributes:
@@ -40,7 +54,7 @@ body:
         - Login succeeds
         - Device shows up
         - Humidity sensors update
-        - Target humidity changes work
+        - Advertised controls work
     validations:
       required: true
   - type: textarea
@@ -57,4 +71,9 @@ body:
     id: diagnostics
     attributes:
       label: Diagnostics or observations
-      description: Include diagnostics, logs, or anything unusual you noticed
+      description: Include reviewed diagnostics or sanitized field paths and value types. Never include credentials, tokens, names, addresses, stable identifiers, or a raw account payload.
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Behavior evidence
+      description: Describe what changed on the physical device and what changed in Home Assistant. Clearly note anything inferred rather than directly observed.

@@ -13,7 +13,9 @@ from custom_components.aprilaire_cloud.profiles import (
 )
 from custom_components.aprilaire_cloud.state import (
     apply_confirmed_device_settings,
+    apply_device_event,
     apply_device_message,
+    apply_full_device_settings,
     apply_hierarchy,
     apply_pending_device_settings,
     apply_rest_refresh,
@@ -22,6 +24,7 @@ from custom_components.aprilaire_cloud.state import (
 
 from .common import (
     DEVICE_ID,
+    LOCATION_ID,
     SECOND_DEVICE_ID,
     THERMOSTAT_DEVICE_ID,
     build_dehumidifier_status,
@@ -46,13 +49,106 @@ def _build_supported_record() -> DeviceRecord:
     return record
 
 
+def test_older_websocket_settings_cannot_overwrite_newer_state() -> None:
+    """WebSocket updates are ordered by their vendor `asOf` timestamp."""
+    _, devices, _ = apply_hierarchy(build_hierarchy(), {})
+    record = devices[DEVICE_ID]
+    newer = build_device_settings(humidity=61)
+    newer["asOf"] = "2026-03-24T00:10:00.000Z"
+    older = build_device_settings(humidity=41)
+    older["asOf"] = "2026-03-24T00:09:00.000Z"
+
+    record = apply_device_message(record, newer)
+    record = apply_device_message(record, older)
+
+    assert record.device_settings["dehumidifier"]["humiditySetpoint"] == 61
+
+
+def test_rest_ordering_and_equal_timestamp_source_precedence() -> None:
+    """Stale/equal REST cannot beat push, while newer REST can reconcile it."""
+    _, devices, _ = apply_hierarchy(build_hierarchy(), {})
+    websocket = build_device_settings(humidity=61)
+    websocket["asOf"] = "2026-03-24T00:10:00.000Z"
+    record = apply_device_message(devices[DEVICE_ID], websocket)
+
+    older_rest = build_device_settings(humidity=41)
+    older_rest["asOf"] = "2026-03-24T00:09:00.000Z"
+    equal_rest = build_device_settings(humidity=42)
+    equal_rest["asOf"] = websocket["asOf"]
+    newer_rest = build_device_settings(humidity=62)
+    newer_rest["asOf"] = "2026-03-24T00:11:00.000Z"
+
+    record = apply_full_device_settings(record, older_rest)
+    record = apply_full_device_settings(record, equal_rest)
+    assert record.device_settings["dehumidifier"]["humiditySetpoint"] == 61
+
+    record = apply_full_device_settings(record, newer_rest)
+    assert record.device_settings["dehumidifier"]["humiditySetpoint"] == 62
+
+
+def test_partial_settings_deep_merge_preserves_falsy_values_and_unrelated_fields() -> None:
+    """Push settings are deltas; false, zero, and empty values are data."""
+    _, devices, _ = apply_hierarchy(build_hierarchy(), {})
+    initial = build_device_settings(humidity=52)
+    record = apply_device_message(devices[DEVICE_ID], initial)
+    partial = {
+        "_type": "DeviceSettings",
+        "deviceId": DEVICE_ID,
+        "asOf": "2026-03-24T00:10:00.000Z",
+        "dehumidifier": {
+            "mode": "off",
+            "forceHvacFan": False,
+            "sampleRate": 0,
+            "sensors": [],
+        },
+    }
+
+    record = apply_device_message(record, partial)
+
+    dehumidifier = record.device_settings["dehumidifier"]
+    assert dehumidifier["humiditySetpoint"] == 52
+    assert dehumidifier["forceHvacFan"] is False
+    assert dehumidifier["sampleRate"] == 0
+    assert dehumidifier["sensors"] == []
+
+
+def test_offline_and_rescinded_events_are_timestamp_ordered() -> None:
+    """A newer health event wins; a rescinded event marks recovery."""
+    _, devices, _ = apply_hierarchy(build_thermostat_hierarchy(), {})
+    record = devices[THERMOSTAT_DEVICE_ID]
+    offline = {
+        "_type": "DeviceEvent",
+        "deviceId": THERMOSTAT_DEVICE_ID,
+        "type": "offline",
+        "occurred": "2026-03-24T00:10:00.000Z",
+    }
+    stale_recovery = {
+        **offline,
+        "occurred": "2026-03-24T00:08:00.000Z",
+        "rescinded": "2026-03-24T00:09:00.000Z",
+    }
+    recovery = {
+        **offline,
+        "rescinded": "2026-03-24T00:11:00.000Z",
+    }
+
+    record = apply_device_event(record, offline)
+    assert record.health.offline is True
+    record = apply_device_event(record, stale_recovery)
+    assert record.health.offline is True
+    record = apply_device_event(record, recovery)
+    assert record.health.offline is False
+    record = apply_device_event(record, offline)
+    assert record.health.offline is False
+
+
 def test_apply_hierarchy_tracks_removed_devices() -> None:
     """Hierarchy refreshes should preserve surviving devices and report removals."""
     locations, devices, removed_ids = apply_hierarchy(
         build_hierarchy(include_second_device=True), {}
     )
 
-    assert set(locations) == {"00000000000000000000000000000000"}
+    assert set(locations) == {LOCATION_ID}
     assert set(devices) == {DEVICE_ID, SECOND_DEVICE_ID}
     assert removed_ids == set()
 
@@ -62,16 +158,25 @@ def test_apply_hierarchy_tracks_removed_devices() -> None:
     assert removed_ids == {SECOND_DEVICE_ID}
 
 
-def test_evaluate_device_support_rejects_dryness_setpoint_devices() -> None:
-    """Devices exposing drynessSetpoint should remain unsupported."""
+def test_dryness_setpoint_disables_only_inapplicable_target_writes() -> None:
+    """A partial-control dehumidifier remains useful without a target write."""
     record = _build_supported_record()
     settings = build_device_settings()
     settings["dehumidifier"]["drynessSetpoint"] = 5
 
     updated = evaluate_device_support(apply_confirmed_device_settings(record, settings))
 
-    assert updated.supported is False
-    assert updated.unsupported_reason == "dryness_setpoint_unsupported"
+    assert updated.supported is True
+    assert updated.profile_key == "dehumidifier"
+    profile = profiles_module.get_profile(updated.profile_key)
+    assert profile is not None
+    capabilities = profile.capabilities(updated)
+    assert capabilities.commands[
+        profiles_module.CommandType.DEHUMIDIFIER_POWER
+    ].writable is True
+    target = capabilities.commands[profiles_module.CommandType.DEHUMIDIFIER_TARGET]
+    assert target.writable is False
+    assert target.unavailable_reason == "humidity_target_not_applicable"
 
 
 def test_status_messages_populate_generic_status() -> None:
@@ -87,7 +192,7 @@ def test_status_messages_populate_generic_status() -> None:
 def test_dehumidifier_profile_exposes_status_requirements() -> None:
     """The dehumidifier profile should advertise its existing REST status endpoint."""
     _, devices, _ = apply_hierarchy(build_hierarchy(), {})
-    record = devices[DEVICE_ID]
+    record = apply_device_message(devices[DEVICE_ID], build_device_settings())
 
     assert [
         (request.key, request.endpoint) for request in status_requests_for_record(record)
@@ -223,12 +328,16 @@ def test_apply_rest_refresh_clears_matching_pending_settings() -> None:
         {"dehumidifier": {"humiditySetpoint": 58}},
     )
 
+    settings = build_device_settings(humidity=58)
+    settings["asOf"] = "2026-03-24T00:10:00.000Z"
+    status = build_dehumidifier_status(humidity=51)
+    status["asOf"] = "2026-03-24T00:10:00.000Z"
     refreshed = evaluate_device_support(
         apply_rest_refresh(
             record,
             device_status=build_initial_messages()[3],
-            settings=build_device_settings(humidity=58),
-            status_payloads={"dehumidifier": build_dehumidifier_status(humidity=51)},
+            settings=settings,
+            status_payloads={"dehumidifier": status},
         )
     )
 
@@ -241,32 +350,42 @@ def test_apply_rest_refresh_accepts_generic_status_payloads() -> None:
     """REST reconciliation should accept profile-owned status payloads."""
     record = _build_supported_record()
 
+    settings = build_device_settings(humidity=58)
+    settings["asOf"] = "2026-03-24T00:10:00.000Z"
+    status = build_dehumidifier_status(humidity=51)
+    status["asOf"] = "2026-03-24T00:10:00.000Z"
     refreshed = evaluate_device_support(
         apply_rest_refresh(
             record,
             device_status=build_initial_messages()[3],
-            settings=build_device_settings(humidity=58),
-            status_payloads={"dehumidifier": build_dehumidifier_status(humidity=51)},
+            settings=settings,
+            status_payloads={"dehumidifier": status},
         )
     )
 
     assert refreshed.status_payloads["dehumidifier"]["humSensors"][0]["reading"] == 51
 
 
-def test_dehumidifier_rest_refresh_preserves_prior_merge_behavior() -> None:
-    """Existing dehumidifier REST reconciliation should still merge settings payloads."""
+def test_dehumidifier_rest_settings_are_a_full_replacement() -> None:
+    """A REST settings document replaces fields absent from the response."""
     record = _build_supported_record()
+    settings = {
+        "_type": "DeviceSettings",
+        "deviceId": DEVICE_ID,
+        "asOf": "2026-03-24T00:10:00.000Z",
+        "dehumidifier": {"humiditySetpoint": 58},
+    }
     refreshed = evaluate_device_support(
         apply_rest_refresh(
             record,
             device_status=build_device_status(DEVICE_ID),
-            settings={"dehumidifier": {"humiditySetpoint": 58}},
+            settings=settings,
             status_payloads={"dehumidifier": build_dehumidifier_status(humidity=51)},
         )
     )
 
     assert refreshed.device_settings["dehumidifier"]["humiditySetpoint"] == 58
-    assert refreshed.device_settings["dehumidifier"]["alertLimits"]["highHum"] == 65
+    assert "alertLimits" not in refreshed.device_settings["dehumidifier"]
 
 
 def test_thermostat_settings_profile_becomes_supported_without_affecting_dehumidifier() -> None:
@@ -390,14 +509,19 @@ def test_rest_refresh_removes_stale_thermostat_zones_from_entity_descriptions() 
 
     refreshed_settings = build_thermostat_settings()
     refreshed_settings.pop("thermostatSZ3")
+    refreshed_settings["asOf"] = "2026-03-24T00:10:00.000Z"
+    pz1_status = build_thermostat_status(zone="PZ1")
+    pz1_status["asOf"] = "2026-03-24T00:10:00.000Z"
+    sz2_status = build_thermostat_status(zone="SZ2")
+    sz2_status["asOf"] = "2026-03-24T00:10:00.000Z"
     refreshed = evaluate_device_support(
         apply_rest_refresh(
             record,
             device_status=build_device_status(THERMOSTAT_DEVICE_ID, model="8920W"),
             settings=refreshed_settings,
             status_payloads={
-                "thermostatPZ1": build_thermostat_status(zone="PZ1"),
-                "thermostatSZ2": build_thermostat_status(zone="SZ2"),
+                "thermostatPZ1": pz1_status,
+                "thermostatSZ2": sz2_status,
             },
         )
     )

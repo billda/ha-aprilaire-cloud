@@ -7,19 +7,30 @@ from dataclasses import replace
 from unittest.mock import AsyncMock
 
 import pytest
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.aprilaire_cloud.api import (
-    AprilaireCloudCommunicationError,
-    AprilaireCloudWriteError,
-)
 from custom_components.aprilaire_cloud.const import (
     DOMAIN,
     ISSUE_NO_SUPPORTED_DEVICES,
 )
 from custom_components.aprilaire_cloud.coordinator import AprilaireCloudDataUpdateCoordinator
 from custom_components.aprilaire_cloud.models import SocketState
+from custom_components.aprilaire_cloud.profiles import (
+    CommandValidationError,
+    SetDehumidifierTarget,
+    SetHighHumidityAlert,
+)
+from custom_components.aprilaire_cloud.vendor import (
+    ApiErrorContext,
+    AprilaireCloudApiError,
+    AprilaireCloudAuthenticationTransientError,
+    AprilaireCloudCommunicationError,
+    AprilaireCloudInvalidCredentialsError,
+    AprilaireCloudWriteError,
+    AuthOperation,
+)
 
 from .common import (
     DEVICE_ID,
@@ -27,10 +38,12 @@ from .common import (
     PASSWORD,
     SECOND_DEVICE_ID,
     SECOND_LOCATION_ID,
+    THERMOSTAT_DEVICE_ID,
     USERNAME,
     FakeClient,
     FakeWebSocket,
     MultiLocationFakeWebSocket,
+    UnavailableWebSocket,
     bootstrap_coordinator,
     build_dehumidifier_status,
     build_device_settings,
@@ -38,10 +51,155 @@ from .common import (
     build_device_status,
     build_hierarchy,
     build_initial_messages,
+    build_thermostat_hierarchy,
+    build_thermostat_settings,
     build_two_location_hierarchy,
     build_user,
     wait_until,
 )
+
+
+async def test_thermostat_cold_start_hydrates_after_settings_classification(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """REST settings classify a thermostat before optional routes are planned."""
+    client = FakeClient()
+    client._hierarchy = build_thermostat_hierarchy()
+    client.device_settings = build_thermostat_settings()
+    client.device_settings["humidifier"] = {
+        "mode": "on",
+        "humiditySetpoint": 40,
+    }
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket",
+        UnavailableWebSocket,
+    )
+    coordinator = AprilaireCloudDataUpdateCoordinator(
+        hass, config_entry=config_entry, client=client
+    )
+
+    await coordinator._async_setup()
+
+    record = coordinator.data.devices[THERMOSTAT_DEVICE_ID]
+    assert record.supported is True
+    assert record.profile_key == "thermostat"
+    endpoints = [endpoint for _, endpoint in client.requested_status_endpoints]
+    assert "dehumidifier" not in endpoints
+    assert {"thermostat/PZ1", "thermostat/SZ2", "thermostat/SZ3"}.issubset(endpoints)
+
+
+async def test_optional_iaq_404_preserves_data_and_is_conservatively_cached(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """One unsupported optional endpoint cannot invalidate thermostat hydration."""
+    client = FakeClient()
+    client._hierarchy = build_thermostat_hierarchy()
+    client.device_settings = build_thermostat_settings()
+    client.device_settings["humidifier"] = {
+        "mode": "on",
+        "humiditySetpoint": 40,
+    }
+    client.rest_failures[
+        ("status", f"{THERMOSTAT_DEVICE_ID}:humidifier")
+    ] = AprilaireCloudApiError(
+        context=ApiErrorContext(
+            status=404,
+            method="GET",
+            route="/devices/{device_id}/status/{status}",
+        )
+    )
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket",
+        UnavailableWebSocket,
+    )
+    coordinator = AprilaireCloudDataUpdateCoordinator(
+        hass, config_entry=config_entry, client=client
+    )
+
+    await coordinator._async_setup()
+    await coordinator._async_rest_refresh_devices({THERMOSTAT_DEVICE_ID})
+
+    record = coordinator.data.devices[THERMOSTAT_DEVICE_ID]
+    assert record.supported is True
+    assert record.device_settings
+    assert record.device_status["model"] == "8920W"
+    assert "thermostatPZ1" in record.status_payloads
+    humidifier_calls = [
+        call
+        for call in client.requested_status_endpoints
+        if call == (THERMOSTAT_DEVICE_ID, "humidifier")
+    ]
+    assert len(humidifier_calls) == 1
+
+    client.device_settings["asOf"] = "2026-03-24T00:10:00.000Z"
+    client.device_settings["humidifier"]["humiditySetpoint"] = 41
+    await coordinator._async_rest_refresh_devices({THERMOSTAT_DEVICE_ID})
+    humidifier_calls = [
+        call
+        for call in client.requested_status_endpoints
+        if call == (THERMOSTAT_DEVICE_ID, "humidifier")
+    ]
+    assert len(humidifier_calls) == 2
+
+
+async def test_one_critical_device_failure_preserves_another_device_success(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """Independent hydration keeps successful device data."""
+    client = FakeClient()
+    client._hierarchy = build_hierarchy(include_second_device=True)
+    failure = AprilaireCloudCommunicationError()
+    client.rest_failures[("device_status", SECOND_DEVICE_ID)] = failure
+    client.rest_failures[("device_settings", SECOND_DEVICE_ID)] = failure
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket",
+        UnavailableWebSocket,
+    )
+    coordinator = AprilaireCloudDataUpdateCoordinator(
+        hass, config_entry=config_entry, client=client
+    )
+
+    await coordinator._async_setup()
+
+    assert coordinator.data.devices[DEVICE_ID].device_settings
+    assert coordinator.data.devices[DEVICE_ID].device_status
+    assert SECOND_DEVICE_ID in coordinator.data.devices
+    assert coordinator.data.devices[SECOND_DEVICE_ID].device_settings == {}
+
+
+async def test_shutdown_cancels_and_awaits_refresh_event_task(
+    hass,
+    enable_custom_integrations,
+    config_entry,
+) -> None:
+    """Coordinator shutdown owns the complete refresh-event task lifecycle."""
+    client = FakeClient()
+    coordinator = AprilaireCloudDataUpdateCoordinator(
+        hass, config_entry=config_entry, client=client
+    )
+    started = asyncio.Event()
+    blocked = asyncio.Event()
+
+    async def _blocked_refresh() -> None:
+        started.set()
+        await blocked.wait()
+
+    coordinator.async_request_refresh = _blocked_refresh  # type: ignore[method-assign]
+    coordinator._schedule_refresh()
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    await coordinator.async_shutdown()
+
+    assert coordinator._refresh_event_task is None
 
 
 @pytest.fixture
@@ -62,9 +220,39 @@ async def _async_set_target_humidity(
     humidity: int,
 ) -> None:
     """Write the dehumidifier humidity setpoint."""
-    await coordinator.async_write_device_settings(
+    await coordinator.async_execute_command(
         DEVICE_ID,
-        {"dehumidifier": {"humiditySetpoint": humidity}},
+        SetDehumidifierTarget(humidity=humidity),
+    )
+
+
+async def test_command_validation_precedes_optimistic_state(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """An invalid command cannot mutate pending state or reach the client."""
+    client = FakeClient()
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket",
+        FakeWebSocket,
+    )
+    coordinator = AprilaireCloudDataUpdateCoordinator(
+        hass, config_entry=config_entry, client=client
+    )
+    await bootstrap_coordinator(coordinator)
+
+    before = coordinator.data.devices[DEVICE_ID]
+    with pytest.raises(CommandValidationError):
+        await coordinator.async_execute_command(
+            DEVICE_ID,
+            SetDehumidifierTarget(humidity=1),
+        )
+
+    assert client.patched_payloads == []
+    assert coordinator.data.devices[DEVICE_ID].pending_device_settings == (
+        before.pending_device_settings
     )
 
 
@@ -74,9 +262,10 @@ async def _async_set_alert_limit(
     value: int,
 ) -> None:
     """Write a dehumidifier alert limit."""
-    await coordinator.async_write_device_settings(
+    assert key == "highHum"
+    await coordinator.async_execute_command(
         DEVICE_ID,
-        {"dehumidifier": {"alertLimits": {key: value}}},
+        SetHighHumidityAlert(humidity=value),
     )
 
 
@@ -148,6 +337,49 @@ async def test_rate_limit_maps_to_retry_after(
         await coordinator._async_update_data()
 
     assert err.value.retry_after == 120
+
+
+async def test_transient_auth_outage_is_retryable_not_reauth(
+    hass,
+    enable_custom_integrations,
+    config_entry,
+) -> None:
+    """A Cognito outage during setup must remain an UpdateFailed retry."""
+    client = FakeClient()
+    client.async_get_user = AsyncMock(
+        side_effect=AprilaireCloudAuthenticationTransientError(
+            "ServiceUnavailableException", AuthOperation.FULL_LOGIN
+        )
+    )
+    coordinator = AprilaireCloudDataUpdateCoordinator(
+        hass, config_entry=config_entry, client=client
+    )
+
+    with pytest.raises(UpdateFailed) as err:
+        await coordinator._async_setup()
+
+    assert "ServiceUnavailableException" in str(err.value)
+    assert not isinstance(err.value.__cause__, ConfigEntryAuthFailed)
+
+
+async def test_definite_invalid_credentials_start_reauth(
+    hass,
+    enable_custom_integrations,
+    config_entry,
+) -> None:
+    """A definite full-login rejection maps to ConfigEntryAuthFailed."""
+    client = FakeClient()
+    client.async_get_user = AsyncMock(
+        side_effect=AprilaireCloudInvalidCredentialsError(
+            "NotAuthorizedException", AuthOperation.FULL_LOGIN
+        )
+    )
+    coordinator = AprilaireCloudDataUpdateCoordinator(
+        hass, config_entry=config_entry, client=client
+    )
+
+    with pytest.raises(ConfigEntryAuthFailed):
+        await coordinator._async_setup()
 
 
 async def test_single_humidity_write_is_optimistic_and_requires_device_settings_confirmation(
@@ -382,6 +614,7 @@ async def test_partial_device_settings_confirmation_clears_only_matching_pending
             {
                 "_type": "DeviceSettings",
                 "deviceId": DEVICE_ID,
+                "asOf": "2026-03-24T00:10:00.000Z",
                 "dehumidifier": {"humiditySetpoint": 60},
             }
         ],
@@ -577,7 +810,9 @@ async def test_timeout_rest_refresh_matching_value_succeeds(
 ) -> None:
     """A timeout should still succeed if REST settings match the desired value."""
     client = FakeClient()
-    client.set_remote_settings(build_device_settings(humidity=55))
+    remote_settings = build_device_settings(humidity=55)
+    remote_settings["asOf"] = "2026-03-24T00:10:00.000Z"
+    client.set_remote_settings(remote_settings)
     monkeypatch.setattr(
         "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket", FakeWebSocket
     )
@@ -615,6 +850,10 @@ async def test_timeout_rest_refresh_mismatch_reverts_latest_pending_write(
     monkeypatch.setattr(
         "custom_components.aprilaire_cloud.coordinator.POST_WRITE_CONFIRM_TIMEOUT", 0.01
     )
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.POST_WRITE_RECONCILIATION_DELAY_SECONDS",
+        0,
+    )
 
     coordinator = AprilaireCloudDataUpdateCoordinator(
         hass, config_entry=config_entry, client=client
@@ -631,6 +870,44 @@ async def test_timeout_rest_refresh_mismatch_reverts_latest_pending_write(
         ]
         == 52
     )
+
+
+async def test_delayed_rest_observation_confirms_on_second_bounded_check(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """A successful PATCH may take one bounded REST cycle to become visible."""
+    client = FakeClient()
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket",
+        FakeWebSocket,
+    )
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.POST_WRITE_CONFIRM_TIMEOUT",
+        0.01,
+    )
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.POST_WRITE_RECONCILIATION_DELAY_SECONDS",
+        0,
+    )
+    coordinator = AprilaireCloudDataUpdateCoordinator(
+        hass, config_entry=config_entry, client=client
+    )
+    await bootstrap_coordinator(coordinator)
+    stale = build_device_settings(humidity=52)
+    stale["asOf"] = "2026-03-24T00:10:00.000Z"
+    confirmed = build_device_settings(humidity=55)
+    confirmed["asOf"] = "2026-03-24T00:11:00.000Z"
+    client.async_get_device_settings = AsyncMock(
+        side_effect=[stale, confirmed],
+    )
+
+    await _async_set_target_humidity(coordinator, 55)
+
+    assert client.async_get_device_settings.await_count == 2
+    assert coordinator.data.devices[DEVICE_ID].pending_device_settings == {}
 
 
 async def test_alert_limit_write_uses_nested_settings_confirmation(
@@ -682,9 +959,16 @@ async def test_no_supported_devices_issue_created_when_account_has_only_unsuppor
 
     class UnsupportedOnlyFakeWebSocket(FakeWebSocket):
         async def async_wait_for_initial_sync(self, wait_timeout: float) -> bool:
+            messages = build_initial_messages()
+            messages[2] = {
+                "_type": "DeviceSetup",
+                "deviceId": DEVICE_ID,
+                "asOf": "2026-03-24T00:00:02.000Z",
+                "type": "ventilator",
+            }
             await self._message_callback(
                 self._location_id,
-                build_initial_messages(control_type="external"),
+                messages,
             )
             await self._state_callback(
                 SocketState(location_id=self._location_id, connected=True, initial_sync_complete=True)

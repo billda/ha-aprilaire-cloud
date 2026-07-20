@@ -17,9 +17,13 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import ATTRIBUTION, DOMAIN, MANUFACTURER
 from .coordinator import AprilaireCloudDataUpdateCoordinator
 from .data import AprilaireCloudConfigEntry
-from .entity import AprilaireCloudEntity, setup_dynamic_platform_entities
+from .entity import (
+    AprilaireCloudEntity,
+    DynamicEntityDescriptor,
+    setup_dynamic_platform_entities,
+)
 from .models import SocketState
-from .profiles import NormalizedDehumidifierState, get_profile
+from .profiles import NormalizedDehumidifierState, NormalizedThermostatState, get_profile
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -98,46 +102,75 @@ PROFILE_BINARY_SENSOR_DESCRIPTIONS: dict[
 }
 
 
-async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry, async_add_entities) -> None:
-    """Set up AprilAire binary sensors."""
-    coordinator = entry.runtime_data.coordinator
+def _descriptors_for_device(
+    coordinator: AprilaireCloudDataUpdateCoordinator,
+    device_id: str,
+    device: Any,
+):
+    """Build stable descriptors for one device's binary sensors."""
+    profile = get_profile(device.profile_key)
+    if profile is None:
+        return
+    entity_set = profile.entity_descriptions(device)
+    descriptions = PROFILE_BINARY_SENSOR_DESCRIPTIONS.get(device.profile_key, {})
+    for key in entity_set.binary_sensor_keys:
+        description = descriptions.get(key)
+        if description is not None:
+            yield DynamicEntityDescriptor(
+                unique_id=f"{device_id}_{description.key}",
+                factory=AprilaireBinarySensorEntity,
+                args=(coordinator, device_id, description),
+            )
+        elif key == "attached_humidifier_water_panel_service":
+            yield DynamicEntityDescriptor(
+                unique_id=f"{device_id}_attached_humidifier_water_panel_service",
+                factory=AprilaireAttachedHumidifierServiceEntity,
+                args=(coordinator, device_id),
+            )
 
-    def _entities_for_device(device_id: str, device):
-        profile = get_profile(coordinator.data.devices[device_id].profile_key)
-        if profile is None:
-            return
-        entity_set = profile.entity_descriptions(coordinator.data.devices[device_id])
-        descriptions = PROFILE_BINARY_SENSOR_DESCRIPTIONS.get(device.profile_key, {})
-        for key in entity_set.binary_sensor_keys:
-            description = descriptions.get(key)
-            if description is not None:
-                yield AprilaireBinarySensorEntity(coordinator, device_id, description)
 
-    setup_dynamic_platform_entities(entry, async_add_entities, _entities_for_device)
+def _setup_websocket_status_entities(
+    coordinator: AprilaireCloudDataUpdateCoordinator,
+    entry: AprilaireCloudConfigEntry,
+    async_add_entities,
+) -> None:
+    """Synchronize location-scoped WebSocket diagnostic entities."""
+    active: dict[str, AprilaireWebSocketStatusEntity] = {}
 
-    active_ws_entities: dict[str, AprilaireWebSocketStatusEntity] = {}
-
-    def _sync_ws_entities() -> None:
+    def _sync() -> None:
         wanted = set(coordinator.data.locations)
-        current = set(active_ws_entities)
+        current = set(active)
 
-        removed = current - wanted
-        for location_id in removed:
-            entity = active_ws_entities.pop(location_id)
+        for location_id in current - wanted:
+            entity = active.pop(location_id)
             if entity.hass is not None:
                 coordinator.hass.async_create_task(entity.async_remove(force_remove=False))
 
         new_entities = []
         for location_id in wanted - current:
             entity = AprilaireWebSocketStatusEntity(coordinator, location_id)
-            active_ws_entities[location_id] = entity
+            active[location_id] = entity
             new_entities.append(entity)
 
         if new_entities:
             async_add_entities(new_entities)
 
-    _sync_ws_entities()
-    entry.async_on_unload(coordinator.async_add_listener(_sync_ws_entities))
+    _sync()
+    entry.async_on_unload(coordinator.async_add_listener(_sync))
+
+
+async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry, async_add_entities) -> None:
+    """Set up AprilAire binary sensors."""
+    coordinator = entry.runtime_data.coordinator
+
+    setup_dynamic_platform_entities(
+        entry,
+        async_add_entities,
+        lambda device_id, device: _descriptors_for_device(
+            coordinator, device_id, device
+        ),
+    )
+    _setup_websocket_status_entities(coordinator, entry, async_add_entities)
 
 
 class AprilaireBinarySensorEntity(AprilaireCloudEntity, BinarySensorEntity):
@@ -168,6 +201,37 @@ class AprilaireBinarySensorEntity(AprilaireCloudEntity, BinarySensorEntity):
         if normalized is None:
             return None
         return self.entity_description.value_fn(normalized)
+
+
+class AprilaireAttachedHumidifierServiceEntity(
+    AprilaireCloudEntity,
+    BinarySensorEntity,
+):
+    """Reported water-panel service alert for an attached humidifier."""
+
+    _attr_translation_key = "attached_humidifier_water_panel_service"
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(
+        self,
+        coordinator: AprilaireCloudDataUpdateCoordinator,
+        device_id: str,
+    ) -> None:
+        """Initialize the water-panel service entity."""
+        super().__init__(
+            coordinator,
+            device_id,
+            "attached_humidifier_water_panel_service",
+        )
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return the reported service flag."""
+        normalized = cast(NormalizedThermostatState | None, self.normalized_state)
+        if normalized is None or normalized.attached_humidifier is None:
+            return None
+        return normalized.attached_humidifier.water_panel_needs_service
 
 
 class AprilaireWebSocketStatusEntity(

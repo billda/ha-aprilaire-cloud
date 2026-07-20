@@ -8,18 +8,24 @@ from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.const import PERCENTAGE
 from homeassistant.helpers.entity import EntityCategory
 
-from .api import AprilaireCloudApiError, AprilaireCloudRateLimitError
 from .coordinator import AprilaireCloudDataUpdateCoordinator
 from .data import AprilaireCloudConfigEntry
 from .entity import (
     AprilaireCloudEntity,
+    DynamicEntityDescriptor,
     raise_ha_write_error,
     setup_dynamic_platform_entities,
 )
-from .profiles import NormalizedDehumidifierState, get_profile
+from .profiles import (
+    AprilaireCommandError,
+    NormalizedDehumidifierState,
+    SetHighHumidityAlert,
+    get_profile,
+)
+from .vendor import AprilaireCloudApiError, AprilaireCloudRateLimitError
 
 ALERT_LIMIT_DESCRIPTIONS: dict[str, dict[str, str | float]] = {
-    "highHum": {
+    "high_humidity": {
         "key": "alert_limit_high_humidity",
         "translation_key": "alert_limit_high_humidity",
         "min": 40,
@@ -32,16 +38,25 @@ async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry, async_add_en
     """Set up AprilAire number entities."""
     coordinator = entry.runtime_data.coordinator
 
-    def _entities_for_device(device_id: str, device):
+    def _descriptors_for_device(device_id: str, device):
         profile = get_profile(coordinator.data.devices[device_id].profile_key)
         if profile is None:
             return
         entity_set = profile.entity_descriptions(coordinator.data.devices[device_id])
         for key in entity_set.number_keys:
             if key in ALERT_LIMIT_DESCRIPTIONS:
-                yield AprilaireAlertLimitNumber(coordinator, device_id, key)
+                entity_key = str(ALERT_LIMIT_DESCRIPTIONS[key]["key"])
+                yield DynamicEntityDescriptor(
+                    unique_id=f"{device_id}_{entity_key}",
+                    factory=AprilaireAlertLimitNumber,
+                    args=(coordinator, device_id, key),
+                )
 
-    setup_dynamic_platform_entities(entry, async_add_entities, _entities_for_device)
+    setup_dynamic_platform_entities(
+        entry,
+        async_add_entities,
+        _descriptors_for_device,
+    )
 
 
 class AprilaireAlertLimitNumber(AprilaireCloudEntity, NumberEntity):
@@ -69,14 +84,19 @@ class AprilaireAlertLimitNumber(AprilaireCloudEntity, NumberEntity):
         normalized = cast(NormalizedDehumidifierState | None, self.normalized_state)
         if normalized is None:
             return None
-        return normalized.alert_limits.get(self._limit_key)
+        if self._limit_key == "high_humidity":
+            return normalized.high_humidity_alert_limit
+        return None
 
     async def async_set_native_value(self, value: float) -> None:
         """Write a new alert threshold."""
         try:
-            await self.coordinator.async_write_device_settings(
-                self._device_id,
-                {"dehumidifier": {"alertLimits": {self._limit_key: int(value)}}},
+            await self.coordinator.async_execute_command(
+                self._device_id, SetHighHumidityAlert(humidity=int(value))
             )
-        except (AprilaireCloudRateLimitError, AprilaireCloudApiError) as err:
+        except (
+            AprilaireCommandError,
+            AprilaireCloudRateLimitError,
+            AprilaireCloudApiError,
+        ) as err:
             raise_ha_write_error(err)

@@ -11,24 +11,54 @@ from homeassistant.components.humidifier import (
 )
 from homeassistant.const import PERCENTAGE
 
-from .api import AprilaireCloudApiError, AprilaireCloudRateLimitError
 from .coordinator import AprilaireCloudDataUpdateCoordinator
 from .data import AprilaireCloudConfigEntry
-from .entity import AprilaireCloudEntity, raise_ha_write_error, setup_dynamic_platform_entities
-from .profiles import NormalizedDehumidifierState, get_profile
+from .entity import (
+    AprilaireCloudEntity,
+    DynamicEntityDescriptor,
+    raise_ha_write_error,
+    setup_dynamic_platform_entities,
+)
+from .profiles import (
+    AprilaireCommandError,
+    NormalizedAttachedHumidifierState,
+    NormalizedDehumidifierState,
+    NormalizedThermostatState,
+    SetAttachedHumidifierPower,
+    SetAttachedHumidifierTarget,
+    SetDehumidifierPower,
+    SetDehumidifierTarget,
+    get_profile,
+)
+from .vendor import AprilaireCloudApiError, AprilaireCloudRateLimitError
 
 
 async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry, async_add_entities) -> None:
     """Set up the AprilAire humidifier entities."""
     coordinator = entry.runtime_data.coordinator
+
+    def _descriptors_for_device(device_id: str, device):
+        profile = get_profile(device.profile_key)
+        if profile is None:
+            return
+        for key in profile.entity_descriptions(device).humidifier_keys:
+            if key == "dehumidifier":
+                yield DynamicEntityDescriptor(
+                    unique_id=f"{device_id}_dehumidifier",
+                    factory=AprilaireCloudHumidifierEntity,
+                    args=(coordinator, device_id),
+                )
+            elif key == "attached_humidifier":
+                yield DynamicEntityDescriptor(
+                    unique_id=f"{device_id}_attached_humidifier",
+                    factory=AprilaireAttachedHumidifierEntity,
+                    args=(coordinator, device_id),
+                )
+
     setup_dynamic_platform_entities(
         entry,
         async_add_entities,
-        lambda device_id, device: (
-            [AprilaireCloudHumidifierEntity(coordinator, device_id)]
-            if device.profile_key == "dehumidifier" and get_profile(device.profile_key) is not None
-            else []
-        ),
+        _descriptors_for_device,
     )
 
 
@@ -84,7 +114,7 @@ class AprilaireCloudHumidifierEntity(AprilaireCloudEntity, HumidifierEntity):
         if self.is_on is False:
             return HumidifierAction.OFF
         equipment_status = normalized.equipment_status
-        if equipment_status in {"dehumidifying", "defrosting"}:
+        if equipment_status in {"active", "dehumidifying", "defrosting"}:
             return HumidifierAction.DRYING
         if equipment_status in {"inactive", "air-sampling"}:
             return HumidifierAction.IDLE
@@ -93,31 +123,40 @@ class AprilaireCloudHumidifierEntity(AprilaireCloudEntity, HumidifierEntity):
     async def async_turn_on(self, **kwargs) -> None:
         """Turn the device on."""
         try:
-            await self.coordinator.async_write_device_settings(
-                self._device_id,
-                {"dehumidifier": {"mode": "on"}},
+            await self.coordinator.async_execute_command(
+                self._device_id, SetDehumidifierPower(enabled=True)
             )
-        except (AprilaireCloudRateLimitError, AprilaireCloudApiError) as err:
+        except (
+            AprilaireCommandError,
+            AprilaireCloudRateLimitError,
+            AprilaireCloudApiError,
+        ) as err:
             raise_ha_write_error(err)
 
     async def async_turn_off(self, **kwargs) -> None:
         """Turn the device off."""
         try:
-            await self.coordinator.async_write_device_settings(
-                self._device_id,
-                {"dehumidifier": {"mode": "off"}},
+            await self.coordinator.async_execute_command(
+                self._device_id, SetDehumidifierPower(enabled=False)
             )
-        except (AprilaireCloudRateLimitError, AprilaireCloudApiError) as err:
+        except (
+            AprilaireCommandError,
+            AprilaireCloudRateLimitError,
+            AprilaireCloudApiError,
+        ) as err:
             raise_ha_write_error(err)
 
     async def async_set_humidity(self, humidity: int) -> None:
         """Set the target humidity."""
         try:
-            await self.coordinator.async_write_device_settings(
-                self._device_id,
-                {"dehumidifier": {"humiditySetpoint": humidity}},
+            await self.coordinator.async_execute_command(
+                self._device_id, SetDehumidifierTarget(humidity=humidity)
             )
-        except (AprilaireCloudRateLimitError, AprilaireCloudApiError) as err:
+        except (
+            AprilaireCommandError,
+            AprilaireCloudRateLimitError,
+            AprilaireCloudApiError,
+        ) as err:
             raise_ha_write_error(err)
 
     @property
@@ -128,4 +167,101 @@ class AprilaireCloudHumidifierEntity(AprilaireCloudEntity, HumidifierEntity):
         if normalized is not None:
             attrs["equipment_status"] = normalized.equipment_status
             attrs["setpoint_unit"] = PERCENTAGE
+        return attrs
+
+
+class AprilaireAttachedHumidifierEntity(AprilaireCloudEntity, HumidifierEntity):
+    """A central humidifier explicitly installed on a thermostat."""
+
+    _attr_device_class = HumidifierDeviceClass.HUMIDIFIER
+    _attr_translation_key = "attached_humidifier"
+    _attr_target_humidity_step = 1
+
+    def __init__(
+        self,
+        coordinator: AprilaireCloudDataUpdateCoordinator,
+        device_id: str,
+    ) -> None:
+        """Initialize the global attached humidifier entity."""
+        super().__init__(coordinator, device_id, "attached_humidifier")
+
+    @property
+    def _normalized_humidifier(self) -> NormalizedAttachedHumidifierState | None:
+        """Return the normalized global humidifier state."""
+        normalized = cast(NormalizedThermostatState | None, self.normalized_state)
+        return None if normalized is None else normalized.attached_humidifier
+
+    @property
+    def current_humidity(self) -> float | None:
+        """Return current humidity only when the vendor reports it."""
+        state = self._normalized_humidifier
+        return None if state is None else state.current_humidity
+
+    @property
+    def target_humidity(self) -> float | None:
+        """Return the configured target only when it is reported."""
+        state = self._normalized_humidifier
+        return None if state is None else state.target_humidity
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return the reported global humidifier mode."""
+        state = self._normalized_humidifier
+        if state is None or state.mode not in {"on", "off"}:
+            return None
+        return state.mode == "on"
+
+    @property
+    def action(self) -> HumidifierAction | None:
+        """Map only understood attached-humidifier statuses."""
+        state = self._normalized_humidifier
+        if state is None:
+            return None
+        if self.is_on is False:
+            return HumidifierAction.OFF
+        if state.equipment_status in {"active", "humidifying"}:
+            return HumidifierAction.HUMIDIFYING
+        if state.equipment_status in {"idle", "inactive"}:
+            return HumidifierAction.IDLE
+        return None
+
+    async def async_turn_on(self, **kwargs) -> None:
+        """Enable the attached humidifier."""
+        await self._async_execute(SetAttachedHumidifierPower(enabled=True))
+
+    async def async_turn_off(self, **kwargs) -> None:
+        """Disable the attached humidifier."""
+        await self._async_execute(SetAttachedHumidifierPower(enabled=False))
+
+    async def async_set_humidity(self, humidity: int) -> None:
+        """Set the attached humidifier target."""
+        await self._async_execute(SetAttachedHumidifierTarget(humidity=humidity))
+
+    async def _async_execute(
+        self,
+        command: SetAttachedHumidifierPower | SetAttachedHumidifierTarget,
+    ) -> None:
+        """Execute one profile-owned attached-humidifier command."""
+        try:
+            await self.coordinator.async_execute_command(self._device_id, command)
+        except (
+            AprilaireCommandError,
+            AprilaireCloudRateLimitError,
+            AprilaireCloudApiError,
+        ) as err:
+            raise_ha_write_error(err)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, str | int | bool | None]:
+        """Expose understood service state without fabricating missing values."""
+        attrs = dict(super().extra_state_attributes)
+        state = self._normalized_humidifier
+        if state is not None:
+            attrs.update(
+                {
+                    "equipment_status": state.equipment_status,
+                    "water_panel_remaining": state.water_panel_remaining,
+                    "water_panel_needs_service": state.water_panel_needs_service,
+                }
+            )
         return attrs

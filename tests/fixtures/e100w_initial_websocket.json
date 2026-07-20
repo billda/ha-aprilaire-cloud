@@ -1,0 +1,44 @@
+[
+  {
+    "_type": "DeviceStatus",
+    "deviceId": "device-001",
+    "asOf": "2026-03-24T00:00:00.000Z",
+    "model": "E100W",
+    "hardwareRev": "synthetic-hardware",
+    "firmwareRev": "synthetic-firmware"
+  },
+  {
+    "_type": "DeviceSettings",
+    "deviceId": "device-001",
+    "asOf": "2026-03-24T00:00:01.000Z",
+    "dehumidifier": {
+      "mode": "on",
+      "humiditySetpoint": 52
+    }
+  },
+  {
+    "_type": "DeviceSetup",
+    "deviceId": "device-001",
+    "asOf": "2026-03-24T00:00:02.000Z",
+    "type": "dehumidifier",
+    "dehumidifier": {
+      "controlType": "internal",
+      "installation": "standalone",
+      "scale": "%RH"
+    }
+  },
+  {
+    "_type": "DehumidifierStatus",
+    "deviceId": "device-001",
+    "asOf": "2026-03-24T00:00:03.000Z",
+    "equipmentStatus": "inactive",
+    "humSensors": [
+      {
+        "uid": 1,
+        "reading": 49,
+        "isControlling": true,
+        "status": "reporting"
+      }
+    ]
+  }
+]

@@ -1,0 +1,16 @@
+{
+  "_type": "DeviceSetup",
+  "deviceId": "device-001",
+  "asOf": "2026-03-24T00:00:02.000Z",
+  "type": "dehumidifier",
+  "dehumidifier": {
+    "controlType": "internal",
+    "installation": "standalone",
+    "hvacType": "none",
+    "scale": "%RH",
+    "allowWithAC": false,
+    "forceHvacFan": false,
+    "sampleRate": 60,
+    "servicePeriod": 720
+  }
+}

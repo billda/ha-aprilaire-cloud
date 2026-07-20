@@ -1,0 +1,21 @@
+{
+  "locations": [
+    {
+      "locationId": "location-001",
+      "name": "Synthetic Home",
+      "timeZone": "America/New_York",
+      "rooms": [
+        {
+          "name": "Utility Room",
+          "devices": [
+            {
+              "deviceId": "device-001",
+              "access": "manage",
+              "zone": 1
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

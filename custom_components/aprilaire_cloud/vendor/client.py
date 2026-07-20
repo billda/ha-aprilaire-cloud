@@ -1,24 +1,19 @@
-"""Async API client for AprilAire Cloud."""
+"""AprilAire REST transport."""
 
 from __future__ import annotations
 
 import asyncio
 import json
-from base64 import urlsafe_b64decode
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from socket import gaierror
 from typing import Any
 
 from aiohttp import ClientError, ClientResponse, ClientSession, ClientTimeout
-from pycognito import Cognito
 
-from .const import (
+from ..const import (
     ACCOUNT_API,
-    AUTH_REFRESH_MARGIN_SECONDS,
-    COGNITO_CLIENT_ID,
-    COGNITO_REGION,
-    COGNITO_USER_POOL_ID,
     DEFAULT_RATE_LIMIT_RETRY_SECONDS,
     DEFAULT_REQUEST_TIMEOUT,
     DEVICE_API,
@@ -26,14 +21,47 @@ from .const import (
     MAX_RATE_LIMIT_RETRY_SECONDS,
     SHORT_WRITE_RETRY_THRESHOLD_SECONDS,
 )
+from .auth import (
+    AprilaireCloudAuthenticationTransientError,
+    AuthOperation,
+    CognitoAuthProvider,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ApiErrorContext:
+    """Sanitized context for an AprilAire HTTP failure."""
+
+    status: int | None = None
+    method: str | None = None
+    route: str | None = None
+    vendor_code: str | None = None
 
 
 class AprilaireCloudApiError(Exception):
-    """Base API error."""
+    """Base API error with optional value-free request context."""
 
-
-class AprilaireCloudAuthenticationError(AprilaireCloudApiError):
-    """Authentication failure."""
+    def __init__(
+        self,
+        message: str = "AprilAire API request failed",
+        *,
+        context: ApiErrorContext | None = None,
+    ) -> None:
+        """Initialize an API error."""
+        self.context = context
+        if context is not None:
+            parts = [
+                part
+                for part in (
+                    context.method,
+                    context.route,
+                    f"HTTP {context.status}" if context.status is not None else None,
+                    f"code={context.vendor_code}" if context.vendor_code else None,
+                )
+                if part
+            ]
+            message += f" ({', '.join(parts)})" if parts else ""
+        super().__init__(message)
 
 
 class AprilaireCloudCommunicationError(AprilaireCloudApiError):
@@ -51,47 +79,6 @@ class AprilaireCloudWriteError(AprilaireCloudApiError):
     """A requested write could not be confirmed."""
 
 
-def _sync_authenticate(username: str, password: str) -> dict[str, str]:
-    """Authenticate against Cognito."""
-    cognito = Cognito(
-        user_pool_id=COGNITO_USER_POOL_ID,
-        client_id=COGNITO_CLIENT_ID,
-        user_pool_region=COGNITO_REGION,
-        username=username,
-    )
-    cognito.authenticate(password=password)
-    return {
-        "id_token": cognito.id_token,
-        "access_token": cognito.access_token,
-        "refresh_token": cognito.refresh_token,
-    }
-
-
-def _sync_refresh(username: str, refresh_token: str) -> dict[str, str]:
-    """Refresh an existing Cognito session."""
-    cognito = Cognito(
-        user_pool_id=COGNITO_USER_POOL_ID,
-        client_id=COGNITO_CLIENT_ID,
-        user_pool_region=COGNITO_REGION,
-        username=username,
-        refresh_token=refresh_token,
-    )
-    cognito.renew_access_token()
-    return {
-        "id_token": cognito.id_token,
-        "access_token": cognito.access_token,
-        "refresh_token": cognito.refresh_token or refresh_token,
-    }
-
-
-def _decode_expiry(token: str) -> datetime:
-    """Decode the `exp` timestamp from a JWT without verifying it."""
-    payload = token.split(".")[1]
-    payload += "=" * (-len(payload) % 4)
-    data = json.loads(urlsafe_b64decode(payload.encode()))
-    return datetime.fromtimestamp(data["exp"], tz=UTC)
-
-
 def _sanitize_retry_after(value: str | None) -> float:
     """Clamp a retry delay to a reasonable range."""
     if value is None:
@@ -103,6 +90,21 @@ def _sanitize_retry_after(value: str | None) -> float:
     return max(1.0, min(parsed, float(MAX_RATE_LIMIT_RETRY_SECONDS)))
 
 
+def _sanitized_vendor_code(body: str) -> str | None:
+    """Extract a short machine code without retaining arbitrary response text."""
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    for key in ("code", "errorCode", "error", "__type"):
+        candidate = payload.get(key)
+        if isinstance(candidate, str) and re.fullmatch(r"[A-Za-z0-9_.:#-]{1,64}", candidate):
+            return candidate
+    return None
+
+
 class AprilaireCloudApiClient:
     """AprilAire Cloud REST client."""
 
@@ -111,15 +113,13 @@ class AprilaireCloudApiClient:
         username: str,
         password: str,
         session: ClientSession,
+        *,
+        auth_provider: CognitoAuthProvider | None = None,
     ) -> None:
         """Initialize the client."""
         self._username = username
-        self._password = password
         self._session = session
-        self._auth_lock = asyncio.Lock()
-        self._id_token: str | None = None
-        self._refresh_token: str | None = None
-        self._token_expires_at: datetime | None = None
+        self._auth = auth_provider or CognitoAuthProvider(username, password)
         self._rate_limited_until: datetime | None = None
 
     @property
@@ -137,82 +137,58 @@ class AprilaireCloudApiClient:
         """Return the current REST throttle deadline."""
         return self._rate_limited_until
 
+    @property
+    def auth_metadata(self) -> dict[str, str | None]:
+        """Return token-free authentication lifecycle diagnostics."""
+        return self._auth.metadata.as_diagnostics()
+
     async def async_authenticate(self) -> None:
-        """Perform a full authentication."""
-        try:
-            tokens = await asyncio.get_running_loop().run_in_executor(
-                None,
-                _sync_authenticate,
-                self._username,
-                self._password,
-            )
-        except Exception as err:
-            raise AprilaireCloudAuthenticationError(str(err)) from err
-        self._store_tokens(tokens)
+        """Perform a full Cognito authentication."""
+        await self._auth.async_authenticate()
 
     async def async_get_id_token(self, *, force_refresh: bool = False) -> str:
         """Return a valid ID token."""
-        async with self._auth_lock:
-            if (
-                not force_refresh
-                and self._id_token is not None
-                and self._token_expires_at is not None
-                and datetime.now(tz=UTC)
-                < self._token_expires_at - timedelta(seconds=AUTH_REFRESH_MARGIN_SECONDS)
-            ):
-                return self._id_token
-
-            if self._refresh_token is not None:
-                try:
-                    tokens = await asyncio.get_running_loop().run_in_executor(
-                        None,
-                        _sync_refresh,
-                        self._username,
-                        self._refresh_token,
-                    )
-                except Exception as err:
-                    LOGGER.debug("Refresh token flow failed, falling back to full login: %s", err)
-                else:
-                    LOGGER.debug("Token refreshed successfully")
-                    self._store_tokens(tokens)
-                    assert self._id_token is not None
-                    return self._id_token
-
-            try:
-                await self.async_authenticate()
-            except Exception as err:
-                raise AprilaireCloudAuthenticationError(str(err)) from err
-
-            if self._id_token is None:
-                raise AprilaireCloudAuthenticationError("Authentication did not return an ID token")
-
-            return self._id_token
+        return await self._auth.async_get_id_token(force_refresh=force_refresh)
 
     async def async_token_expires_within(self, seconds: int) -> bool:
         """Return whether the ID token expires within the given interval."""
-        if self._token_expires_at is None:
-            return True
-        return datetime.now(tz=UTC) >= self._token_expires_at - timedelta(seconds=seconds)
+        return await self._auth.async_token_expires_within(seconds)
 
     async def async_get_user(self) -> dict[str, Any]:
         """Fetch the authenticated user profile."""
-        return await self._async_request_json("GET", f"{ACCOUNT_API}/user")
+        return await self._async_request_json(
+            "GET", f"{ACCOUNT_API}/user", route_template="/user"
+        )
 
     async def async_get_hierarchy(self) -> dict[str, Any]:
         """Fetch the full hierarchy."""
-        return await self._async_request_json("GET", f"{DEVICE_API}/hierarchy")
+        return await self._async_request_json(
+            "GET", f"{DEVICE_API}/hierarchy", route_template="/hierarchy"
+        )
 
     async def async_get_device_status(self, device_id: str) -> dict[str, Any]:
         """Fetch device status."""
-        return await self._async_request_json("GET", f"{DEVICE_API}/{device_id}/status")
+        return await self._async_request_json(
+            "GET",
+            f"{DEVICE_API}/{device_id}/status",
+            route_template="/devices/{device_id}/status",
+        )
 
     async def async_get_status(self, device_id: str, endpoint: str) -> dict[str, Any]:
         """Fetch a profile-specific status payload."""
-        return await self._async_request_json("GET", f"{DEVICE_API}/{device_id}/status/{endpoint}")
+        return await self._async_request_json(
+            "GET",
+            f"{DEVICE_API}/{device_id}/status/{endpoint}",
+            route_template="/devices/{device_id}/status/{status}",
+        )
 
     async def async_get_device_settings(self, device_id: str) -> dict[str, Any]:
         """Fetch writable device settings."""
-        return await self._async_request_json("GET", f"{DEVICE_API}/{device_id}/settings")
+        return await self._async_request_json(
+            "GET",
+            f"{DEVICE_API}/{device_id}/settings",
+            route_template="/devices/{device_id}/settings",
+        )
 
     async def async_patch_device_settings(
         self,
@@ -225,6 +201,7 @@ class AprilaireCloudApiClient:
                 "PATCH",
                 f"{DEVICE_API}/{device_id}/settings",
                 payload=payload,
+                route_template="/devices/{device_id}/settings",
                 user_initiated=True,
             )
         except AprilaireCloudRateLimitError as err:
@@ -237,16 +214,11 @@ class AprilaireCloudApiClient:
                     "PATCH",
                     f"{DEVICE_API}/{device_id}/settings",
                     payload=payload,
+                    route_template="/devices/{device_id}/settings",
                     user_initiated=True,
                 )
                 return
             raise
-
-    def _store_tokens(self, tokens: dict[str, str]) -> None:
-        """Persist freshly-issued tokens in memory."""
-        self._id_token = tokens["id_token"]
-        self._refresh_token = tokens["refresh_token"]
-        self._token_expires_at = _decode_expiry(self._id_token)
 
     async def _async_request_json(
         self,
@@ -254,6 +226,7 @@ class AprilaireCloudApiClient:
         url: str,
         *,
         payload: dict[str, Any] | None = None,
+        route_template: str = "/redacted",
         allow_retry: bool = True,
         user_initiated: bool = False,
     ) -> dict[str, Any]:
@@ -283,6 +256,7 @@ class AprilaireCloudApiClient:
                     response,
                     method=method,
                     url=url,
+                    route_template=route_template,
                     payload=payload,
                     allow_retry=allow_retry,
                     user_initiated=user_initiated,
@@ -290,7 +264,9 @@ class AprilaireCloudApiClient:
         except AprilaireCloudApiError:
             raise
         except (ClientError, TimeoutError, gaierror) as err:
-            raise AprilaireCloudCommunicationError(str(err)) from err
+            raise AprilaireCloudCommunicationError(
+                context=ApiErrorContext(method=method, route=route_template)
+            ) from err
 
     async def _async_handle_response(
         self,
@@ -298,6 +274,7 @@ class AprilaireCloudApiClient:
         *,
         method: str,
         url: str,
+        route_template: str = "/redacted",
         payload: dict[str, Any] | None,
         allow_retry: bool,
         user_initiated: bool,
@@ -305,12 +282,17 @@ class AprilaireCloudApiClient:
         """Convert a REST response into a Python object."""
         if response.status == 401:
             if not allow_retry:
-                raise AprilaireCloudAuthenticationError("Unauthorized")
+                raise AprilaireCloudAuthenticationTransientError(
+                    "http_session_rejected",
+                    operation=self._auth.metadata.last_operation
+                    or AuthOperation.REFRESH,
+                )
             await self.async_get_id_token(force_refresh=True)
             return await self._async_request_json(
                 method,
                 url,
                 payload=payload,
+                route_template=route_template,
                 allow_retry=False,
                 user_initiated=user_initiated,
             )
@@ -323,12 +305,20 @@ class AprilaireCloudApiClient:
 
         if response.status >= 400:
             text = await response.text()
+            context = ApiErrorContext(
+                status=response.status,
+                method=method,
+                route=route_template,
+                vendor_code=_sanitized_vendor_code(text),
+            )
             LOGGER.warning(
-                "%s %s failed with HTTP %d: %s", method, url, response.status, text[:200]
+                "%s %s failed with HTTP %d%s",
+                method,
+                route_template,
+                response.status,
+                f" ({context.vendor_code})" if context.vendor_code else "",
             )
-            raise AprilaireCloudApiError(
-                f"{method} {url} failed with HTTP {response.status}: {text[:200]}"
-            )
+            raise AprilaireCloudApiError(context=context)
 
         text = await response.text()
         if not text:
@@ -336,6 +326,11 @@ class AprilaireCloudApiClient:
 
         try:
             result: dict[str, Any] = json.loads(text)
+            if not isinstance(result, dict):
+                raise TypeError
             return result
-        except json.JSONDecodeError as err:
-            raise AprilaireCloudApiError(f"{method} {url} returned invalid JSON") from err
+        except (json.JSONDecodeError, TypeError) as err:
+            raise AprilaireCloudApiError(
+                "AprilAire API returned invalid JSON",
+                context=ApiErrorContext(method=method, route=route_template),
+            ) from err

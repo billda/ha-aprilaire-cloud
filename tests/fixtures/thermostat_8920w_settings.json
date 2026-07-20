@@ -1,0 +1,16 @@
+{
+  "_type": "DeviceSettings",
+  "deviceId": "device-thermostat-001",
+  "asOf": "2026-03-24T00:00:01.000Z",
+  "thermostatPZ1": {
+    "mode": "heat",
+    "heat": 20,
+    "cool": 24,
+    "fan": "auto",
+    "holdType": "permanent"
+  },
+  "humidifier": {
+    "mode": "on",
+    "humiditySetpoint": 40
+  }
+}

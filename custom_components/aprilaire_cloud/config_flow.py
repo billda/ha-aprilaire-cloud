@@ -10,11 +10,6 @@ from homeassistant import config_entries
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .api import (
-    AprilaireCloudApiClient,
-    AprilaireCloudAuthenticationError,
-    AprilaireCloudCommunicationError,
-)
 from .const import (
     CONF_ACCOUNT_EMAIL,
     CONF_ACCOUNT_USER_ID,
@@ -38,7 +33,14 @@ from .state import (
     apply_hierarchy,
     evaluate_device_support,
 )
-from .websocket import async_collect_location_messages
+from .vendor import (
+    AprilaireCloudApiClient,
+    AprilaireCloudAuthenticationProtocolError,
+    AprilaireCloudAuthenticationTransientError,
+    AprilaireCloudCommunicationError,
+    AprilaireCloudInvalidCredentialsError,
+)
+from .vendor.websocket import async_collect_location_messages
 
 STEP_USER_SCHEMA = vol.Schema(
     {
@@ -153,10 +155,15 @@ class AprilaireCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Validate credentials and translate exceptions into flow errors."""
         try:
             return await self._async_validate_user_input(user_input), {}
-        except AprilaireCloudAuthenticationError:
+        except AprilaireCloudInvalidCredentialsError:
             return None, {"base": "invalid_auth"}
-        except AprilaireCloudCommunicationError:
+        except (
+            AprilaireCloudAuthenticationTransientError,
+            AprilaireCloudCommunicationError,
+        ):
             return None, {"base": "cannot_connect"}
+        except AprilaireCloudAuthenticationProtocolError:
+            return None, {"base": "unknown"}
         except AprilaireCloudNoSupportedDevicesError:
             return None, {"base": "no_supported_devices"}
         except Exception:

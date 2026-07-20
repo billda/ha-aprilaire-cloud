@@ -1,0 +1,18 @@
+{
+  "_type": "DeviceSettings",
+  "deviceId": "device-001",
+  "asOf": "2026-03-24T00:00:01.000Z",
+  "dehumidifier": {
+    "mode": "on",
+    "humiditySetpoint": 52,
+    "alertLimits": {
+      "highHum": 65
+    },
+    "sensors": [
+      {
+        "uid": 1,
+        "dispName": "Sensor One"
+      }
+    ]
+  }
+}

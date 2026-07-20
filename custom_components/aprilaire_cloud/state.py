@@ -1,21 +1,33 @@
-"""Pure state reduction helpers for AprilAire Cloud."""
+"""Pure timestamp-aware state reduction helpers for AprilAire Cloud."""
 
 from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from typing import Any
 
-from .models import DeviceRecord, HierarchyDevice, HierarchyLocation, merge_settings_payload
+from .models import (
+    DeviceRecord,
+    HierarchyDevice,
+    HierarchyLocation,
+    StateSource,
+    StateVersion,
+    merge_settings_payload,
+)
 from .profiles import (
+    DeviceCommand,
     evaluate_profile,
-    record_has_thermostat_hint,
     thermostat_iaq_status_key_for_message,
     thermostat_status_key_from_message,
 )
 
 _MISSING = object()
+_SOURCE_PRECEDENCE = {
+    StateSource.REST: 1,
+    StateSource.WEBSOCKET: 2,
+}
 STATUS_MESSAGE_KEYS = {
     "DehumidifierStatus": "dehumidifier",
 }
@@ -30,6 +42,7 @@ class DeviceWriteState:
     pending_paths: tuple[str, ...] = ()
     inflight_paths: tuple[str, ...] = ()
     inflight_expected: dict[str, Any] = field(default_factory=dict)
+    inflight_command: DeviceCommand | None = None
     last_confirmed_settings: dict[str, Any] = field(default_factory=dict)
     inflight_event: asyncio.Event | None = None
 
@@ -45,11 +58,57 @@ class DeviceWriteState:
         }
 
 
+def parse_vendor_timestamp(value: Any) -> datetime | None:
+    """Parse an AprilAire timestamp as an aware UTC datetime."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _accept_version(
+    record: DeviceRecord,
+    section: str,
+    *,
+    source: StateSource,
+    as_of: datetime | None,
+) -> tuple[bool, dict[str, StateVersion]]:
+    """Return whether an update wins and the resulting version mapping."""
+    current = record.versions.get(section)
+    incoming = StateVersion(as_of=as_of, source=source)
+    if current is not None:
+        if as_of is None and current.as_of is not None:
+            return False, record.versions
+        if as_of is not None and current.as_of is not None:
+            if as_of < current.as_of:
+                return False, record.versions
+            if (
+                as_of == current.as_of
+                and _SOURCE_PRECEDENCE[source] < _SOURCE_PRECEDENCE[current.source]
+            ):
+                return False, record.versions
+        elif (
+            as_of is None
+            and current.as_of is None
+            and _SOURCE_PRECEDENCE[source] < _SOURCE_PRECEDENCE[current.source]
+        ):
+            return False, record.versions
+
+    versions = dict(record.versions)
+    versions[section] = incoming
+    return True, versions
+
+
 def iter_leaf_paths(
     data: dict[str, Any],
     prefix: tuple[str, ...] = (),
 ) -> list[tuple[tuple[str, ...], Any]]:
-    """Return all leaf paths from a nested payload."""
+    """Return all leaf paths from a nested payload, preserving falsy values."""
     leaves: list[tuple[tuple[str, ...], Any]] = []
     for key, value in data.items():
         path = (*prefix, key)
@@ -111,8 +170,21 @@ def apply_pending_device_settings(record: DeviceRecord, payload: dict[str, Any])
     )
 
 
-def apply_confirmed_device_settings(record: DeviceRecord, settings: dict[str, Any]) -> DeviceRecord:
-    """Update confirmed remote settings and clear matching optimistic overrides."""
+def apply_confirmed_device_settings(
+    record: DeviceRecord,
+    settings: dict[str, Any],
+    *,
+    source: StateSource = StateSource.WEBSOCKET,
+) -> DeviceRecord:
+    """Merge an incremental confirmed settings update when it is not stale."""
+    accepted, versions = _accept_version(
+        record,
+        "device_settings",
+        source=source,
+        as_of=parse_vendor_timestamp(settings.get("asOf")),
+    )
+    if not accepted:
+        return record
     confirmed_settings = merge_settings_payload(record.device_settings, settings)
     return replace(
         record,
@@ -120,11 +192,25 @@ def apply_confirmed_device_settings(record: DeviceRecord, settings: dict[str, An
         pending_device_settings=remove_matching_settings(
             record.pending_device_settings, confirmed_settings
         ),
+        versions=versions,
     )
 
 
-def apply_full_device_settings(record: DeviceRecord, settings: dict[str, Any]) -> DeviceRecord:
-    """Replace confirmed remote settings from a full REST settings payload."""
+def apply_full_device_settings(
+    record: DeviceRecord,
+    settings: dict[str, Any],
+    *,
+    source: StateSource = StateSource.REST,
+) -> DeviceRecord:
+    """Replace confirmed settings from a non-stale full REST payload."""
+    accepted, versions = _accept_version(
+        record,
+        "device_settings",
+        source=source,
+        as_of=parse_vendor_timestamp(settings.get("asOf")),
+    )
+    if not accepted:
+        return record
     confirmed_settings = deepcopy(settings)
     return replace(
         record,
@@ -132,6 +218,7 @@ def apply_full_device_settings(record: DeviceRecord, settings: dict[str, Any]) -
         pending_device_settings=remove_matching_settings(
             record.pending_device_settings, confirmed_settings
         ),
+        versions=versions,
     )
 
 
@@ -150,13 +237,13 @@ def pending_payload_is_current(record: DeviceRecord, payload: dict[str, Any]) ->
 
 def evaluate_device_support(record: DeviceRecord) -> DeviceRecord:
     """Determine whether a device should be exposed to Home Assistant."""
-    supported, reason, profile_key, supported_writes = evaluate_profile(record)
+    supported, reason, profile_key, capability_names = evaluate_profile(record)
     return replace(
         record,
         supported=supported,
         unsupported_reason=reason,
         profile_key=profile_key,
-        supported_writes=supported_writes,
+        capability_names=capability_names,
     )
 
 
@@ -164,15 +251,86 @@ def apply_status_payload(
     record: DeviceRecord,
     key: str,
     payload: dict[str, Any],
+    *,
+    source: StateSource = StateSource.WEBSOCKET,
+    full: bool = False,
 ) -> DeviceRecord:
-    """Apply a profile-owned status payload to a device record."""
+    """Apply a timestamp-ordered profile status payload."""
+    section = f"status:{key}"
+    accepted, versions = _accept_version(
+        record,
+        section,
+        source=source,
+        as_of=parse_vendor_timestamp(payload.get("asOf")),
+    )
+    if not accepted:
+        return record
     status_payloads = dict(record.status_payloads)
-    status_payloads[key] = deepcopy(payload)
-    return replace(record, status_payloads=status_payloads)
+    current = status_payloads.get(key, {})
+    status_payloads[key] = deepcopy(payload) if full else merge_settings_payload(current, payload)
+    return replace(record, status_payloads=status_payloads, versions=versions)
+
+
+def _apply_record_payload(
+    record: DeviceRecord,
+    *,
+    section: str,
+    attribute: str,
+    payload: dict[str, Any],
+    source: StateSource,
+    full: bool,
+) -> DeviceRecord:
+    """Apply one generic timestamped record section."""
+    accepted, versions = _accept_version(
+        record,
+        section,
+        source=source,
+        as_of=parse_vendor_timestamp(payload.get("asOf")),
+    )
+    if not accepted:
+        return record
+    current = getattr(record, attribute)
+    value = deepcopy(payload) if full else merge_settings_payload(current, payload)
+    if attribute == "device_setup":
+        return replace(record, device_setup=value, versions=versions)
+    if attribute == "device_status":
+        return replace(record, device_status=value, versions=versions)
+    if attribute == "sensor_hub_status":
+        return replace(record, sensor_hub_status=value, versions=versions)
+    raise ValueError("Unsupported state section")
+
+
+def apply_device_event(record: DeviceRecord, message: dict[str, Any]) -> DeviceRecord:
+    """Apply an evidence-backed offline or rescinded device event."""
+    if message.get("type") != "offline":
+        return record
+    occurred = parse_vendor_timestamp(message.get("occurred"))
+    rescinded = parse_vendor_timestamp(message.get("rescinded"))
+    event_time = rescinded or occurred
+    if event_time is None:
+        return record
+    accepted, versions = _accept_version(
+        record,
+        "health",
+        source=StateSource.WEBSOCKET,
+        as_of=event_time,
+    )
+    if not accepted:
+        return record
+    return replace(
+        record,
+        health=replace(
+            record.health,
+            offline=rescinded is None,
+            event_occurred_at=occurred,
+            event_rescinded_at=rescinded,
+        ),
+        versions=versions,
+    )
 
 
 def apply_device_message(record: DeviceRecord, message: dict[str, Any]) -> DeviceRecord:
-    """Apply one websocket payload to a device record."""
+    """Apply one timestamp-ordered WebSocket payload."""
     message_type = message.get("_type")
     if message_type == THERMOSTAT_STATUS_MESSAGE_TYPE:
         return apply_status_payload(
@@ -187,12 +345,50 @@ def apply_device_message(record: DeviceRecord, message: dict[str, Any]) -> Devic
     if message_type == "DeviceSettings":
         return apply_confirmed_device_settings(record, message)
     if message_type == "DeviceSetup":
-        return replace(record, device_setup=message)
+        return _apply_record_payload(
+            record,
+            section="device_setup",
+            attribute="device_setup",
+            payload=message,
+            source=StateSource.WEBSOCKET,
+            full=False,
+        )
     if message_type == "DeviceStatus":
-        return replace(record, device_status=message)
+        return _apply_record_payload(
+            record,
+            section="device_status",
+            attribute="device_status",
+            payload=message,
+            source=StateSource.WEBSOCKET,
+            full=False,
+        )
     if message_type == "SensorHubStatus":
-        return replace(record, sensor_hub_status=message)
+        return _apply_record_payload(
+            record,
+            section="sensor_hub_status",
+            attribute="sensor_hub_status",
+            payload=message,
+            source=StateSource.WEBSOCKET,
+            full=False,
+        )
+    if message_type == "DeviceEvent":
+        return apply_device_event(record, message)
     return record
+
+
+def apply_rest_device_status(
+    record: DeviceRecord,
+    payload: dict[str, Any],
+) -> DeviceRecord:
+    """Apply a full basic REST status response."""
+    return _apply_record_payload(
+        record,
+        section="device_status",
+        attribute="device_status",
+        payload=payload,
+        source=StateSource.REST,
+        full=True,
+    )
 
 
 def apply_rest_refresh(
@@ -202,18 +398,17 @@ def apply_rest_refresh(
     settings: dict[str, Any],
     status_payloads: dict[str, dict[str, Any]] | None = None,
 ) -> DeviceRecord:
-    """Apply a REST refresh to a device record."""
-    settings_applier = (
-        apply_full_device_settings
-        if record_has_thermostat_hint(record)
-        else apply_confirmed_device_settings
-    )
-    updated = replace(
-        settings_applier(record, settings),
-        device_status=device_status,
-    )
+    """Apply independently fetched REST sections in timestamp order."""
+    updated = apply_rest_device_status(record, device_status)
+    updated = apply_full_device_settings(updated, settings)
     for key, payload in (status_payloads or {}).items():
-        updated = apply_status_payload(updated, key, payload)
+        updated = apply_status_payload(
+            updated,
+            key,
+            payload,
+            source=StateSource.REST,
+            full=True,
+        )
     return updated
 
 

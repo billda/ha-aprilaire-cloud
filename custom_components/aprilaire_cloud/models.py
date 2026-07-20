@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 
@@ -40,6 +42,32 @@ class HierarchyDevice:
     zone: int | None = None
 
 
+class StateSource(StrEnum):
+    """Origin of confirmed device state."""
+
+    REST = "rest"
+    WEBSOCKET = "websocket"
+
+
+@dataclass(frozen=True, slots=True)
+class StateVersion:
+    """Ordering metadata for one logical state section."""
+
+    as_of: datetime | None
+    source: StateSource
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceHealth:
+    """Evidence-backed device availability state."""
+
+    offline: bool = False
+    event_occurred_at: datetime | None = None
+    event_rescinded_at: datetime | None = None
+    last_push_received_at: datetime | None = None
+    last_rest_received_at: datetime | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class DeviceRecord:
     """The merged state for a device."""
@@ -51,10 +79,12 @@ class DeviceRecord:
     device_setup: dict[str, Any] = field(default_factory=dict)
     status_payloads: dict[str, dict[str, Any]] = field(default_factory=dict)
     sensor_hub_status: dict[str, Any] = field(default_factory=dict)
+    versions: dict[str, StateVersion] = field(default_factory=dict)
+    health: DeviceHealth = field(default_factory=DeviceHealth)
     supported: bool = False
     unsupported_reason: str | None = None
     profile_key: str | None = None
-    supported_writes: tuple[str, ...] = ()
+    capability_names: tuple[str, ...] = ()
 
     @property
     def device_id(self) -> str:
@@ -76,6 +106,13 @@ class SocketState:
     initial_sync_complete: bool = False
     reconnect_attempt: int = 0
     last_error: str | None = None
+    subscription_acknowledged: bool = False
+    last_received_at: datetime | None = None
+
+    @property
+    def transport_connected(self) -> bool:
+        """Return whether the underlying WebSocket transport is open."""
+        return self.connected
 
 
 @dataclass(frozen=True, slots=True)

@@ -8,11 +8,14 @@ from homeassistant import config_entries
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.aprilaire_cloud.api import (
-    AprilaireCloudApiClient,
-    AprilaireCloudAuthenticationError,
-)
 from custom_components.aprilaire_cloud.const import DOMAIN
+from custom_components.aprilaire_cloud.vendor import (
+    AprilaireCloudApiClient,
+    AprilaireCloudAuthenticationProtocolError,
+    AprilaireCloudAuthenticationTransientError,
+    AprilaireCloudInvalidCredentialsError,
+    AuthOperation,
+)
 
 from .common import (
     PASSWORD,
@@ -142,7 +145,11 @@ async def test_invalid_auth_is_reported(hass, enable_custom_integrations, monkey
     monkeypatch.setattr(
         AprilaireCloudApiClient,
         "async_authenticate",
-        AsyncMock(side_effect=AprilaireCloudAuthenticationError("bad auth")),
+        AsyncMock(
+            side_effect=AprilaireCloudInvalidCredentialsError(
+                "NotAuthorizedException", AuthOperation.FULL_LOGIN
+            )
+        ),
     )
 
     result = await hass.config_entries.flow.async_init(
@@ -156,6 +163,84 @@ async def test_invalid_auth_is_reported(hass, enable_custom_integrations, monkey
 
     assert result["type"] == "form"
     assert result["errors"] == {"base": "invalid_auth"}
+
+
+async def test_transient_auth_failure_is_cannot_connect(
+    hass, enable_custom_integrations, monkeypatch
+) -> None:
+    """A Cognito outage must not be presented as invalid credentials."""
+    monkeypatch.setattr(
+        AprilaireCloudApiClient,
+        "async_authenticate",
+        AsyncMock(
+            side_effect=AprilaireCloudAuthenticationTransientError(
+                "ServiceUnavailableException", AuthOperation.FULL_LOGIN
+            )
+        ),
+    )
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_USER},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_USERNAME: USERNAME, CONF_PASSWORD: PASSWORD},
+    )
+
+    assert result["type"] == "form"
+    assert result["errors"] == {"base": "cannot_connect"}
+
+
+async def test_auth_protocol_failure_is_unknown(
+    hass, enable_custom_integrations, monkeypatch
+) -> None:
+    """Malformed Cognito output must not start a reauth flow."""
+    monkeypatch.setattr(
+        AprilaireCloudApiClient,
+        "async_authenticate",
+        AsyncMock(
+            side_effect=AprilaireCloudAuthenticationProtocolError(
+                "missing_token_field", AuthOperation.FULL_LOGIN
+            )
+        ),
+    )
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_USER},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_USERNAME: USERNAME, CONF_PASSWORD: PASSWORD},
+    )
+
+    assert result["type"] == "form"
+    assert result["errors"] == {"base": "unknown"}
+
+
+async def test_unexpected_validation_failure_is_unknown(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+) -> None:
+    """An unclassified local failure remains a generic flow error."""
+    monkeypatch.setattr(
+        AprilaireCloudApiClient,
+        "async_authenticate",
+        AsyncMock(side_effect=RuntimeError("private detail")),
+    )
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_USER},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_USERNAME: USERNAME, CONF_PASSWORD: PASSWORD},
+    )
+
+    assert result["errors"] == {"base": "unknown"}
 
 
 async def test_no_supported_devices_is_reported(
@@ -173,10 +258,14 @@ async def test_no_supported_devices_is_reported(
         "async_get_hierarchy",
         AsyncMock(return_value=build_hierarchy()),
     )
-    _mock_supported_device_discovery(
-        monkeypatch,
-        messages=build_initial_messages(control_type="external"),
-    )
+    messages = build_initial_messages()
+    messages[2] = {
+        "_type": "DeviceSetup",
+        "deviceId": messages[2]["deviceId"],
+        "asOf": messages[2]["asOf"],
+        "type": "ventilator",
+    }
+    _mock_supported_device_discovery(monkeypatch, messages=messages)
 
     result = await hass.config_entries.flow.async_init(
         DOMAIN,
@@ -188,6 +277,36 @@ async def test_no_supported_devices_is_reported(
     )
 
     assert result["type"] == "form"
+    assert result["errors"] == {"base": "no_supported_devices"}
+
+
+async def test_empty_hierarchy_is_reported_without_optional_discovery(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+) -> None:
+    """An account with no hierarchy devices has a complete empty classification."""
+    monkeypatch.setattr(AprilaireCloudApiClient, "async_authenticate", AsyncMock())
+    monkeypatch.setattr(
+        AprilaireCloudApiClient,
+        "async_get_user",
+        AsyncMock(return_value=build_user()),
+    )
+    monkeypatch.setattr(
+        AprilaireCloudApiClient,
+        "async_get_hierarchy",
+        AsyncMock(return_value={"locations": []}),
+    )
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_USER},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_USERNAME: USERNAME, CONF_PASSWORD: PASSWORD},
+    )
+
     assert result["errors"] == {"base": "no_supported_devices"}
 
 
@@ -259,6 +378,89 @@ async def test_user_flow_accepts_thermostat_only_account(
     )
 
     assert result["type"] == "create_entry"
+
+
+async def test_incomplete_discovery_does_not_false_negative_setup(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+) -> None:
+    """Settings and WebSocket failures leave classification pending, not rejected."""
+    monkeypatch.setattr(AprilaireCloudApiClient, "async_authenticate", AsyncMock())
+    monkeypatch.setattr(
+        AprilaireCloudApiClient,
+        "async_get_user",
+        AsyncMock(return_value=build_user()),
+    )
+    monkeypatch.setattr(
+        AprilaireCloudApiClient,
+        "async_get_hierarchy",
+        AsyncMock(return_value=build_hierarchy()),
+    )
+    monkeypatch.setattr(
+        AprilaireCloudApiClient,
+        "async_get_device_settings",
+        AsyncMock(side_effect=RuntimeError("settings unavailable")),
+    )
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.config_flow.async_collect_location_messages",
+        AsyncMock(side_effect=RuntimeError("socket unavailable")),
+    )
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_USER},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_USERNAME: USERNAME, CONF_PASSWORD: PASSWORD},
+    )
+
+    assert result["type"] == "create_entry"
+
+
+async def test_reconfigure_form_and_wrong_account_error(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+) -> None:
+    """Reconfigure renders first and refuses credentials for another account."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=USER_ID,
+        data={CONF_USERNAME: USERNAME, CONF_PASSWORD: PASSWORD},
+        title=USERNAME,
+    )
+    entry.add_to_hass(hass)
+    monkeypatch.setattr(AprilaireCloudApiClient, "async_authenticate", AsyncMock())
+    monkeypatch.setattr(
+        AprilaireCloudApiClient,
+        "async_get_user",
+        AsyncMock(return_value={"userId": "different-user", "email": USERNAME}),
+    )
+    monkeypatch.setattr(
+        AprilaireCloudApiClient,
+        "async_get_hierarchy",
+        AsyncMock(return_value=build_hierarchy()),
+    )
+    _mock_supported_device_discovery(monkeypatch)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={
+            "source": config_entries.SOURCE_RECONFIGURE,
+            "entry_id": entry.entry_id,
+        },
+        data=entry.data,
+    )
+    assert result["type"] == "form"
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_USERNAME: USERNAME, CONF_PASSWORD: "replacement-password"},
+    )
+
+    assert result["type"] == "form"
+    assert result["errors"] == {"base": "wrong_account"}
 
 
 async def test_options_flow_updates_refresh_settings(

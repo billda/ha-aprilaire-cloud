@@ -1,0 +1,30 @@
+{
+  "_type": "DehumidifierStatus",
+  "deviceId": "device-001",
+  "asOf": "2026-03-24T00:00:03.000Z",
+  "equipmentStatus": "inactive",
+  "humSensors": [
+    {
+      "uid": 1,
+      "reading": 49,
+      "isControlling": true,
+      "status": "reporting"
+    }
+  ],
+  "tempSensors": [
+    {
+      "uid": 1,
+      "reading": 21.46,
+      "isControlling": true,
+      "status": "reporting"
+    }
+  ],
+  "filterService": {
+    "needsService": false,
+    "remaining": 100
+  },
+  "isCompOn": false,
+  "isDehumFanOn": false,
+  "isHvacFanOn": false,
+  "wifiRSSI": -45
+}

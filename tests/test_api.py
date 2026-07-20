@@ -8,14 +8,18 @@ from unittest.mock import AsyncMock
 import pytest
 from aiohttp import ClientError
 
-from custom_components.aprilaire_cloud.api import (
+from custom_components.aprilaire_cloud.const import MAX_RATE_LIMIT_RETRY_SECONDS
+from custom_components.aprilaire_cloud.vendor import (
     AprilaireCloudApiClient,
     AprilaireCloudApiError,
     AprilaireCloudAuthenticationError,
     AprilaireCloudCommunicationError,
     AprilaireCloudRateLimitError,
 )
-from custom_components.aprilaire_cloud.const import MAX_RATE_LIMIT_RETRY_SECONDS
+from custom_components.aprilaire_cloud.vendor.client import (
+    _sanitize_retry_after,
+    _sanitized_vendor_code,
+)
 
 
 class FakeResponse:
@@ -85,7 +89,7 @@ class FakeSession:
 
 def _build_client(session) -> AprilaireCloudApiClient:
     """Create an API client under test."""
-    return AprilaireCloudApiClient("user@example.com", "password", session)
+    return AprilaireCloudApiClient("user@example.com", "not-a-real-password", session)
 
 
 async def test_handle_response_401_refreshes_and_retries(monkeypatch) -> None:
@@ -109,6 +113,7 @@ async def test_handle_response_401_refreshes_and_retries(monkeypatch) -> None:
         "GET",
         "https://example.test/resource",
         payload=None,
+        route_template="/redacted",
         allow_retry=False,
         user_initiated=False,
     )
@@ -203,10 +208,112 @@ async def test_request_json_short_circuits_when_still_rate_limited() -> None:
 
 
 async def test_request_json_wraps_transport_errors() -> None:
-    """Transport failures should be mapped to a communication error."""
+    """Transport failures should be mapped without copying exception text."""
     session = FakeSession(error=ClientError("boom"))
     client = _build_client(session)
     client.async_get_id_token = AsyncMock(return_value="token")  # type: ignore[method-assign]
 
-    with pytest.raises(AprilaireCloudCommunicationError, match="boom"):
+    with pytest.raises(AprilaireCloudCommunicationError) as err:
         await client._async_request_json("GET", "https://example.test/resource")
+
+    assert "boom" not in str(err.value)
+    assert "example.test" not in str(err.value)
+
+
+async def test_http_error_uses_route_template_and_sanitized_vendor_code(caplog) -> None:
+    """HTTP failures must not retain the URL or arbitrary response body."""
+    client = _build_client(object())
+    private_device = "device-private-value"
+    private_body = "private server explanation"
+
+    with pytest.raises(AprilaireCloudApiError) as err:
+        await client._async_handle_response(
+            FakeResponse(
+                status=503,
+                text=(
+                    '{"errorCode":"SERVICE_UNAVAILABLE",'
+                    f'"message":"{private_body}"}}'
+                ),
+            ),
+            method="GET",
+            url=f"https://example.test/devices/{private_device}/status",
+            route_template="/devices/{device_id}/status",
+            payload=None,
+            allow_retry=True,
+            user_initiated=False,
+        )
+
+    assert err.value.context is not None
+    assert err.value.context.status == 503
+    assert err.value.context.method == "GET"
+    assert err.value.context.route == "/devices/{device_id}/status"
+    assert err.value.context.vendor_code == "SERVICE_UNAVAILABLE"
+    combined = f"{err.value} {caplog.text}"
+    assert private_device not in combined
+    assert private_body not in combined
+    assert "example.test" not in combined
+
+
+def test_rate_limit_and_vendor_code_sanitizers_reject_untrusted_text() -> None:
+    """Only bounded machine fields survive response parsing."""
+    assert _sanitize_retry_after(None) == 60
+    assert _sanitize_retry_after("invalid") == 60
+    assert _sanitize_retry_after("0") == 1
+    assert _sanitized_vendor_code("not-json") is None
+    assert _sanitized_vendor_code("[]") is None
+    assert _sanitized_vendor_code('{"message":"private prose"}') is None
+    assert _sanitized_vendor_code('{"code":"SAFE_CODE"}') == "SAFE_CODE"
+    assert _sanitized_vendor_code('{"code":"unsafe code with spaces"}') is None
+
+
+async def test_public_client_methods_delegate_to_sanitized_routes() -> None:
+    """REST helpers centralize transport behavior and never expose concrete IDs as routes."""
+    client = _build_client(object())
+    request = AsyncMock(return_value={"ok": True})
+    client._async_request_json = request  # type: ignore[method-assign]
+
+    assert client.username == "user@example.com"
+    assert client.session is not None
+    await client.async_get_user()
+    await client.async_get_hierarchy()
+    await client.async_get_device_status("device-001")
+    await client.async_get_status("device-001", "humidifier")
+    await client.async_get_device_settings("device-001")
+
+    assert [call.kwargs["route_template"] for call in request.await_args_list] == [
+        "/user",
+        "/hierarchy",
+        "/devices/{device_id}/status",
+        "/devices/{device_id}/status/{status}",
+        "/devices/{device_id}/settings",
+    ]
+
+
+async def test_expired_local_backoff_clears_and_empty_response_succeeds() -> None:
+    """An expired throttle does not block a normal authenticated request."""
+    session = FakeSession(response=FakeResponse(status=200, text=""))
+    client = _build_client(session)
+    client._rate_limited_until = datetime.now(tz=UTC) - timedelta(seconds=1)
+    client.async_get_id_token = AsyncMock(return_value="token")  # type: ignore[method-assign]
+
+    assert await client._async_request_json(
+        "GET",
+        "https://example.test/resource",
+        route_template="/resource",
+    ) == {}
+    assert client.rate_limited_until is None
+
+
+async def test_json_array_success_body_is_rejected() -> None:
+    """The REST boundary accepts only JSON objects."""
+    client = _build_client(object())
+
+    with pytest.raises(AprilaireCloudApiError, match="invalid JSON"):
+        await client._async_handle_response(
+            FakeResponse(status=200, text="[]"),
+            method="GET",
+            url="https://example.test/resource",
+            payload=None,
+            allow_retry=True,
+            user_initiated=False,
+        )

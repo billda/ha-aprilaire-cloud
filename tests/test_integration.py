@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+from homeassistant import config_entries
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -34,6 +37,38 @@ from .common import (
     build_two_location_hierarchy,
     build_user,
 )
+
+
+async def test_identity_mismatch_shuts_down_started_websockets(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+) -> None:
+    """Identity validation failure cannot leak background transports."""
+    client = FakeClient()
+    FakeWebSocket.instances.clear()
+    monkeypatch.setattr(
+        integration, "AprilaireCloudApiClient", lambda username, password, session: client
+    )
+    monkeypatch.setattr(
+        integration, "async_get_loaded_integration", lambda hass, domain: SimpleNamespace()
+    )
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket", FakeWebSocket
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title=USERNAME,
+        unique_id="different-user-001",
+        data={"username": USERNAME, "password": PASSWORD},
+    )
+    entry.add_to_hass(hass)
+    entry.mock_state(hass, config_entries.ConfigEntryState.SETUP_IN_PROGRESS)
+
+    with pytest.raises(ConfigEntryAuthFailed):
+        await integration.async_setup_entry(hass, entry)
+
+    assert FakeWebSocket.instances[LOCATION_ID].stopped is True
 
 
 async def test_setup_creates_entities_and_new_devices_surface_automatically(
@@ -233,9 +268,9 @@ async def test_setup_creates_climate_entities_for_thermostat_accounts(
     }
 
     assert {
-        "THERMO0001_thermostat_pz1",
-        "THERMO0001_thermostat_sz2",
-        "THERMO0001_thermostat_sz3",
+        "device-thermostat-001_thermostat_pz1",
+        "device-thermostat-001_thermostat_sz2",
+        "device-thermostat-001_thermostat_sz3",
     }.issubset(unique_ids)
 
 
@@ -277,9 +312,9 @@ async def test_mixed_dehumidifier_and_thermostat_accounts_create_both_families(
                         "devices": [{"deviceId": DEVICE_ID, "access": "manage", "zone": 1}],
                     },
                     {
-                        "name": "Main Floor",
+                        "name": "Zone One",
                         "devices": [
-                            {"deviceId": "THERMO0001", "access": "manage", "zone": 1}
+                            {"deviceId": "device-thermostat-001", "access": "manage", "zone": 1}
                         ],
                     },
                 ],
@@ -314,7 +349,7 @@ async def test_mixed_dehumidifier_and_thermostat_accounts_create_both_families(
     }
 
     assert f"{DEVICE_ID}_dehumidifier" in unique_ids
-    assert "THERMO0001_thermostat_pz1" in unique_ids
+    assert "device-thermostat-001_thermostat_pz1" in unique_ids
 
 
 async def test_removed_locations_cleanup_and_recreate_websocket_entities(

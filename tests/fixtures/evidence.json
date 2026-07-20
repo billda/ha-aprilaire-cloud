@@ -1,0 +1,152 @@
+{
+  "schema_version": 1,
+  "sanitization": {
+    "replaced": [
+      "account email",
+      "password",
+      "user identifier",
+      "device identifiers",
+      "location identifiers",
+      "location names",
+      "room names",
+      "sensor display names",
+      "firmware and hardware revisions"
+    ],
+    "all_values_are_synthetic": true
+  },
+  "fixtures": {
+    "e100w_hierarchy.json": {
+      "source": "maintainer device capture",
+      "evidence": "captured",
+      "app_version": "2.23.58",
+      "device_model": "E100W",
+      "firmware": "replaced",
+      "transport": "REST hierarchy",
+      "payload_kind": "full"
+    },
+    "e100w_settings.json": {
+      "source": "maintainer device capture",
+      "evidence": "live_confirmed",
+      "app_version": "2.23.58",
+      "device_model": "E100W",
+      "firmware": "replaced",
+      "transport": "REST device settings",
+      "payload_kind": "full"
+    },
+    "e100w_setup.json": {
+      "source": "maintainer device capture",
+      "evidence": "captured",
+      "app_version": "2.23.58",
+      "device_model": "E100W",
+      "firmware": "replaced",
+      "transport": "REST device setup",
+      "payload_kind": "full"
+    },
+    "e100w_status.json": {
+      "source": "maintainer device capture",
+      "evidence": "captured",
+      "app_version": "2.23.58",
+      "device_model": "E100W",
+      "firmware": "replaced",
+      "transport": "REST dehumidifier status",
+      "payload_kind": "full"
+    },
+    "e100w_initial_websocket.json": {
+      "source": "maintainer device capture",
+      "evidence": "captured",
+      "app_version": "2.23.58",
+      "device_model": "E100W",
+      "firmware": "replaced",
+      "transport": "WebSocket initial burst",
+      "payload_kind": "full"
+    },
+    "thermostat_8920w_settings.json": {
+      "source": "community report and pull request 5",
+      "evidence": "live_confirmed",
+      "app_version": "unknown",
+      "device_model": "8920W",
+      "firmware": "unknown",
+      "transport": "DeviceSettings",
+      "payload_kind": "captured shape"
+    },
+    "thermostat_8920w_zone_status.json": {
+      "source": "community report and pull request 5",
+      "evidence": "live_confirmed",
+      "app_version": "unknown",
+      "device_model": "8920W",
+      "firmware": "unknown",
+      "transport": "ThermostatStatus",
+      "payload_kind": "incremental"
+    },
+    "device_event_offline.json": {
+      "source": "community report and pull request 6",
+      "evidence": "live_confirmed",
+      "app_version": "unknown",
+      "device_model": "8920W",
+      "firmware": "unknown",
+      "transport": "WebSocket DeviceEvent",
+      "payload_kind": "incremental"
+    },
+    "device_event_rescinded.json": {
+      "source": "community report and pull request 6",
+      "evidence": "live_confirmed",
+      "app_version": "unknown",
+      "device_model": "8920W",
+      "firmware": "unknown",
+      "transport": "WebSocket DeviceEvent",
+      "payload_kind": "incremental"
+    },
+    "thermostat_attached_humidifier.json": {
+      "source": "community report and pull request 7",
+      "evidence": "live_confirmed",
+      "app_version": "unknown",
+      "device_model": "8920W",
+      "firmware": "unknown",
+      "transport": "DeviceSettings and HumidifierStatus",
+      "payload_kind": "mixed full and incremental"
+    },
+    "read_only_hierarchy.json": {
+      "source": "integration contract",
+      "evidence": "inferred",
+      "app_version": "unknown",
+      "device_model": "unknown",
+      "firmware": "unknown",
+      "transport": "REST hierarchy",
+      "payload_kind": "full"
+    },
+    "external_dehumidifier_setup.json": {
+      "source": "community report in issue 3",
+      "evidence": "live_confirmed",
+      "app_version": "unknown",
+      "device_model": "E100W",
+      "firmware": "unknown",
+      "transport": "DeviceSetup",
+      "payload_kind": "captured shape"
+    },
+    "empty_location_hierarchy.json": {
+      "source": "protocol edge-case contract",
+      "evidence": "inferred",
+      "app_version": "unknown",
+      "device_model": "none",
+      "firmware": "none",
+      "transport": "REST hierarchy",
+      "payload_kind": "full"
+    },
+    "empty_websocket_batch.json": {
+      "source": "protocol edge-case contract",
+      "evidence": "inferred",
+      "app_version": "unknown",
+      "device_model": "unknown",
+      "firmware": "unknown",
+      "transport": "WebSocket",
+      "payload_kind": "valid empty data batch"
+    }
+  },
+  "decompiled_only": [
+    "AprilAire post-login registration endpoint existence"
+  ],
+  "unknown": [
+    "post-login registration request and response body contract",
+    "safe target or dew-point write semantics for externally controlled dehumidifiers"
+  ]
+}

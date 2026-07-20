@@ -8,10 +8,10 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.loader import async_get_loaded_integration
 
-from .api import AprilaireCloudApiClient
 from .const import DOMAIN, PLATFORMS
 from .coordinator import AprilaireCloudDataUpdateCoordinator
 from .data import AprilaireCloudConfigEntry, AprilaireCloudRuntimeData
+from .vendor import AprilaireCloudApiClient
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
@@ -40,6 +40,7 @@ async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry) -> bool:
     )
     await coordinator.async_config_entry_first_refresh()
     if entry.unique_id and coordinator.data.user_id and entry.unique_id != coordinator.data.user_id:
+        await coordinator.async_shutdown()
         raise ConfigEntryAuthFailed("Configured account does not match the saved config entry")
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

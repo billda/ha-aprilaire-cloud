@@ -3,18 +3,33 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from typing import Any
 
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .api import AprilaireCloudApiError, AprilaireCloudRateLimitError
 from .const import ATTRIBUTION, DOMAIN, MANUFACTURER
 from .coordinator import AprilaireCloudDataUpdateCoordinator
 from .data import AprilaireCloudConfigEntry
 from .models import DeviceRecord
-from .profiles import DeviceProfile, get_profile, normalize_device
+from .profiles import (
+    AprilaireCommandError,
+    DeviceProfile,
+    get_profile,
+    normalize_device,
+)
+from .vendor import AprilaireCloudApiError, AprilaireCloudRateLimitError
+
+
+@dataclass(frozen=True, slots=True)
+class DynamicEntityDescriptor:
+    """A stable identity and deferred constructor for one entity."""
+
+    unique_id: str
+    factory: Callable[..., Any]
+    args: tuple[Any, ...] = ()
 
 
 def raise_ha_write_error(err: Exception) -> None:
@@ -26,7 +41,7 @@ def raise_ha_write_error(err: Exception) -> None:
             translation_placeholders={"seconds": str(round(err.retry_after or 0))},
         ) from err
 
-    if isinstance(err, AprilaireCloudApiError):
+    if isinstance(err, (AprilaireCloudApiError, AprilaireCommandError)):
         raise HomeAssistantError(
             translation_domain=DOMAIN,
             translation_key="write_failed",
@@ -38,29 +53,32 @@ def raise_ha_write_error(err: Exception) -> None:
 def setup_dynamic_platform_entities(
     entry: AprilaireCloudConfigEntry,
     async_add_entities: Callable[[Iterable[Any]], None],
-    entity_factory: Callable[[str, DeviceRecord], Iterable[Any]],
+    descriptor_factory: Callable[
+        [str, DeviceRecord],
+        Iterable[DynamicEntityDescriptor],
+    ],
 ) -> None:
-    """Set up dynamic entities for a platform with add/remove support."""
+    """Synchronize descriptors and construct only genuinely new entities."""
     coordinator = entry.runtime_data.coordinator
     active_entities: dict[str, Any] = {}
 
     def _sync_entities() -> None:
-        desired_entities: dict[str, Any] = {}
+        desired: dict[str, DynamicEntityDescriptor] = {}
         for device_id, device in coordinator.data.devices.items():
             if not device.supported:
                 continue
-            for entity in entity_factory(device_id, device):
-                desired_entities[entity.unique_id] = entity
+            for descriptor in descriptor_factory(device_id, device):
+                desired[descriptor.unique_id] = descriptor
 
-        removed_unique_ids = set(active_entities) - set(desired_entities)
+        removed_unique_ids = set(active_entities) - set(desired)
         for unique_id in removed_unique_ids:
             entity = active_entities.pop(unique_id)
             if entity.hass is not None:
                 coordinator.hass.async_create_task(entity.async_remove(force_remove=False))
 
         new_entities = [
-            entity
-            for unique_id, entity in desired_entities.items()
+            descriptor.factory(*descriptor.args)
+            for unique_id, descriptor in desired.items()
             if unique_id not in active_entities
         ]
         if new_entities:
@@ -102,8 +120,7 @@ class AprilaireCloudEntity(CoordinatorEntity[AprilaireCloudDataUpdateCoordinator
     @property
     def available(self) -> bool:
         """Return whether the entity has current device data."""
-        device = self.device
-        return super().available and device is not None and device.supported
+        return self.coordinator.device_is_available(self._device_id)
 
     @property
     def profile(self) -> DeviceProfile | None:
