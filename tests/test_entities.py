@@ -904,7 +904,7 @@ async def test_sensor_and_binary_adapter_edge_paths(
     assert websocket.is_on is None
     assert websocket.available is False
     assert websocket.extra_state_attributes == {}
-    assert websocket.device_info["name"] == "missing-location Cloud Connection"
+    assert websocket.device_info is None
 
 
 async def test_thermostat_dynamic_sensor_metric_paths(

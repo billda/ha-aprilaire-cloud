@@ -11,10 +11,13 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntity,
     BinarySensorEntityDescription,
 )
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import EntityCategory
+from homeassistant.helpers.entity_registry import RegistryEntryDisabler
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import ATTRIBUTION, DOMAIN, MANUFACTURER
+from .const import ATTRIBUTION, DOMAIN
 from .coordinator import AprilaireCloudDataUpdateCoordinator
 from .data import AprilaireCloudConfigEntry
 from .entity import (
@@ -24,6 +27,8 @@ from .entity import (
 )
 from .models import SocketState
 from .profiles import NormalizedDehumidifierState, NormalizedThermostatState, get_profile
+
+_WEBSOCKET_CONNECTION_SUFFIX = "_websocket_connection"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -159,9 +164,72 @@ def _setup_websocket_status_entities(
     entry.async_on_unload(coordinator.async_add_listener(_sync))
 
 
+def _remove_legacy_websocket_devices(
+    coordinator: AprilaireCloudDataUpdateCoordinator,
+    entry: AprilaireCloudConfigEntry,
+) -> None:
+    """Remove obsolete synthetic devices without deleting their diagnostic entities."""
+    device_registry = dr.async_get(coordinator.hass)
+    entity_registry = er.async_get(coordinator.hass)
+    physical_identifiers = {
+        (DOMAIN, device_id) for device_id in coordinator.data.devices
+    }
+    location_identifiers = {
+        (DOMAIN, f"location_{location_id}")
+        for location_id in coordinator.data.locations
+    }
+    legacy_device_ids = {
+        device.id
+        for device in dr.async_entries_for_config_entry(
+            device_registry, entry.entry_id
+        )
+        if device.identifiers.isdisjoint(physical_identifiers)
+        and not device.identifiers.isdisjoint(location_identifiers)
+    }
+
+    for registry_entry in er.async_entries_for_config_entry(
+        entity_registry, entry.entry_id
+    ):
+        if (
+            registry_entry.platform != DOMAIN
+            or registry_entry.device_id is None
+            or not registry_entry.unique_id.endswith(_WEBSOCKET_CONNECTION_SUFFIX)
+        ):
+            continue
+        location_id = registry_entry.unique_id.removesuffix(
+            _WEBSOCKET_CONNECTION_SUFFIX
+        )
+        device = device_registry.async_get(registry_entry.device_id)
+        if (
+            device is not None
+            and (DOMAIN, f"location_{location_id}") in device.identifiers
+            and device.identifiers.isdisjoint(physical_identifiers)
+        ):
+            legacy_device_ids.add(device.id)
+
+    for device_id in legacy_device_ids:
+        for registry_entry in er.async_entries_for_device(
+            entity_registry, device_id, include_disabled_entities=True
+        ):
+            if registry_entry.disabled_by is RegistryEntryDisabler.DEVICE:
+                entity_registry.async_update_entity(
+                    registry_entry.entity_id,
+                    device_id=None,
+                    disabled_by=RegistryEntryDisabler.USER,
+                )
+            else:
+                entity_registry.async_update_entity(
+                    registry_entry.entity_id,
+                    device_id=None,
+                )
+        if device_registry.async_get(device_id) is not None:
+            device_registry.async_remove_device(device_id)
+
+
 async def async_setup_entry(hass, entry: AprilaireCloudConfigEntry, async_add_entities) -> None:
     """Set up AprilAire binary sensors."""
     coordinator = entry.runtime_data.coordinator
+    _remove_legacy_websocket_devices(coordinator, entry)
 
     setup_dynamic_platform_entities(
         entry,
@@ -253,7 +321,7 @@ class AprilaireWebSocketStatusEntity(
         """Initialize the entity."""
         super().__init__(coordinator)
         self._location_id = location_id
-        self._attr_unique_id = f"{location_id}_websocket_connection"
+        self._attr_unique_id = f"{location_id}{_WEBSOCKET_CONNECTION_SUFFIX}"
         self._attr_entity_registry_enabled_default = coordinator.extra_diagnostics_enabled
 
     @property
@@ -283,15 +351,4 @@ class AprilaireWebSocketStatusEntity(
         return {
             "reconnect_attempt": state.reconnect_attempt,
             "last_error": state.last_error,
-        }
-
-    @property
-    def device_info(self):
-        """Return device info linking to the first device in this location."""
-        location = self.coordinator.data.locations.get(self._location_id)
-        name = location.name if location else self._location_id
-        return {
-            "identifiers": {(DOMAIN, f"location_{self._location_id}")},
-            "manufacturer": MANUFACTURER,
-            "name": f"{name} Cloud Connection",
         }

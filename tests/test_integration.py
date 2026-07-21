@@ -186,12 +186,12 @@ async def test_removed_devices_can_be_readded_without_reloading(
     )
 
 
-async def test_remove_device_guard_blocks_live_location_devices(
+async def test_remove_device_guard_only_blocks_live_physical_devices(
     hass,
     enable_custom_integrations,
     monkeypatch,
 ) -> None:
-    """Synthetic location devices should be protected while the location is still active."""
+    """Only physical devices still reported by the account should be protected."""
     client = FakeClient()
     FakeWebSocket.instances.clear()
 
@@ -217,7 +217,7 @@ async def test_remove_device_guard_blocks_live_location_devices(
         await integration.async_remove_config_entry_device(
             hass,
             entry,
-            SimpleNamespace(identifiers={(DOMAIN, f"location_{LOCATION_ID}")}),
+            SimpleNamespace(identifiers={(DOMAIN, DEVICE_ID)}),
         )
         is False
     )
@@ -225,9 +225,67 @@ async def test_remove_device_guard_blocks_live_location_devices(
         await integration.async_remove_config_entry_device(
             hass,
             entry,
-            SimpleNamespace(identifiers={(DOMAIN, "location_stale-location")}),
+            SimpleNamespace(identifiers={(DOMAIN, f"location_{LOCATION_ID}")}),
         )
         is True
+    )
+
+
+async def test_setup_removes_legacy_location_connection_device(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+) -> None:
+    """Upgrades should preserve the diagnostic entity while removing its old device."""
+    client = FakeClient()
+    FakeWebSocket.instances.clear()
+
+    monkeypatch.setattr(
+        integration, "AprilaireCloudApiClient", lambda username, password, session: client
+    )
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket", FakeWebSocket
+    )
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title=USERNAME,
+        unique_id=build_user()["userId"],
+        data={"username": USERNAME, "password": PASSWORD},
+        options={CONF_ENABLE_EXTRA_DIAGNOSTICS: True},
+    )
+    entry.add_to_hass(hass)
+
+    device_registry = dr.async_get(hass)
+    entity_registry = er.async_get(hass)
+    legacy_device = device_registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, f"location_{LOCATION_ID}")},
+        manufacturer="AprilAire",
+        name="Home Cloud Connection",
+    )
+    legacy_entity = entity_registry.async_get_or_create(
+        "binary_sensor",
+        DOMAIN,
+        f"{LOCATION_ID}_websocket_connection",
+        config_entry=entry,
+        device_id=legacy_device.id,
+        suggested_object_id="home_cloud_connection",
+    )
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    migrated_entity = entity_registry.async_get(legacy_entity.entity_id)
+    assert migrated_entity is not None
+    assert migrated_entity.unique_id == legacy_entity.unique_id
+    assert migrated_entity.device_id is None
+    assert hass.states.get(legacy_entity.entity_id) is not None
+    assert device_registry.async_get(legacy_device.id) is None
+    assert any(
+        identifier == (DOMAIN, DEVICE_ID)
+        for device in dr.async_entries_for_config_entry(device_registry, entry.entry_id)
+        for identifier in device.identifiers
     )
 
 
@@ -357,7 +415,7 @@ async def test_removed_locations_cleanup_and_recreate_websocket_entities(
     enable_custom_integrations,
     monkeypatch,
 ) -> None:
-    """Location websocket entities and devices should cleanly remove and re-add."""
+    """Location websocket entities should cycle without creating synthetic devices."""
     client = FakeClient()
     client._hierarchy = build_two_location_hierarchy()
     FakeWebSocket.instances.clear()
@@ -392,8 +450,9 @@ async def test_removed_locations_cleanup_and_recreate_websocket_entities(
     )
 
     assert hass.states.get(second_ws_entity.entity_id) is not None
-    assert any(
-        identifier == (DOMAIN, f"location_{SECOND_LOCATION_ID}")
+    assert second_ws_entity.device_id is None
+    assert not any(
+        identifier[0] == DOMAIN and identifier[1].startswith("location_")
         for device in dr.async_entries_for_config_entry(device_registry, entry.entry_id)
         for identifier in device.identifiers
     )
@@ -426,8 +485,9 @@ async def test_removed_locations_cleanup_and_recreate_websocket_entities(
         if entity.unique_id == second_ws_unique_id
     )
     assert hass.states.get(second_ws_entity.entity_id) is not None
-    assert any(
-        identifier == (DOMAIN, f"location_{SECOND_LOCATION_ID}")
+    assert second_ws_entity.device_id is None
+    assert not any(
+        identifier[0] == DOMAIN and identifier[1].startswith("location_")
         for device in dr.async_entries_for_config_entry(device_registry, entry.entry_id)
         for identifier in device.identifiers
     )

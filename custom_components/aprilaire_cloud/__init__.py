@@ -61,11 +61,7 @@ async def async_remove_config_entry_device(
     """Allow removal of stale devices only."""
     coordinator = entry.runtime_data.coordinator
     current_device_ids = set(coordinator.data.devices)
-    current_location_ids = {
-        f"location_{location_id}" for location_id in coordinator.data.locations
-    }
-    live_identifiers = current_device_ids | current_location_ids
     return all(
-        identifier[0] != DOMAIN or identifier[1] not in live_identifiers
+        identifier[0] != DOMAIN or identifier[1] not in current_device_ids
         for identifier in device_entry.identifiers
     )
