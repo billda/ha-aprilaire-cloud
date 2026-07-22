@@ -68,6 +68,49 @@ _HOLD_ID_BY_VALUE = {value: key for key, value in _HOLD_BY_ID.items()}
 _CONFIRMED_8920W_MODES = ("off", "heat", "cool", "auto")
 _CONFIRMED_8920W_FANS = ("auto", "on", "circulate")
 _CONFIRMED_8920W_HOLDS = ("none", "temporary", "permanent", "vacation")
+_CONFIRMED_8920W_MODELS = frozenset({"8920W", "8920W_GS"})
+_CONFIRMED_8920W_NATIVE_TEMPERATURE_UNIT = "C"
+_ACTIVE_HEATING_STATUSES = frozenset({"active", "heating", "on", "stage1"})
+_ACTIVE_COOLING_STATUSES = frozenset({"active", "cooling", "on", "stage1"})
+_INACTIVE_OPERATING_STATUSES = frozenset({"idle", "inactive", "off"})
+_OPERATING_STATE_BY_EQUIPMENT_STATUS = {
+    "off": "off",
+    "heating": "heating",
+    "heat": "heating",
+    "aux-heat": "heating",
+    "emergency-heat": "heating",
+    "cooling": "cooling",
+    "cool": "cooling",
+    "fan": "fan",
+    "fan-only": "fan",
+    "fan-on": "fan",
+    "idle": "idle",
+    "inactive": "idle",
+    "standby": "idle",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _EnumSettingCodec:
+    """Describe one observed string/numeric thermostat enum contract."""
+
+    string_key: str
+    numeric_key: str
+    numeric_values: dict[str, int]
+    label: str
+    string_values: dict[str, str] = field(default_factory=dict)
+
+
+_MODE_CODEC = _EnumSettingCodec("mode", "ModeId", _MODE_ID_BY_VALUE, "thermostat mode")
+_FAN_CODEC = _EnumSettingCodec("fan", "FanId", _FAN_ID_BY_VALUE, "fan mode")
+_FAN_GS_CODEC = _EnumSettingCodec(
+    "fan",
+    "FanId",
+    _FAN_ID_BY_VALUE,
+    "fan mode",
+    {"circulate": "circ"},
+)
+_HOLD_CODEC = _EnumSettingCodec("holdType", "HoldType", _HOLD_ID_BY_VALUE, "hold mode")
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +131,7 @@ class NormalizedThermostatZoneState:
     heating_status: str | None = None
     cooling_status: str | None = None
     fan_on: bool | None = None
+    operating_state: str | None = None
     hvac_service_remaining: int | None = None
     outdoor_temperature: float | None = None
     outdoor_humidity: float | None = None
@@ -132,12 +176,16 @@ def _zone_dynamic_sensor_keys(
 ) -> list[str]:
     """Return dynamic telemetry keys reported for one thermostat zone."""
     prefix = f"thermostat_{zone.lower()}"
-    status = record.status_payloads.get(thermostat_status_key_for_zone(zone), {})
-    if not isinstance(status, dict):
-        return []
+    _, settings, status = _zone_mapping(record, zone)
     keys: list[str] = []
+    if "tempSensors" in status or "currentTemperature" in status:
+        keys.append(f"{prefix}_indoor_temperature")
     if "humSensors" in status or "currentHumidity" in status:
         keys.append(f"{prefix}_indoor_humidity")
+    if any(key in settings for key in ("heatSetpoint", "HeatSetpoint", "heat")):
+        keys.append(f"{prefix}_heat_setpoint")
+    if any(key in settings for key in ("coolSetpoint", "CoolSetpoint", "cool")):
+        keys.append(f"{prefix}_cool_setpoint")
     if "outdoorTemperature" in status:
         keys.append(f"{prefix}_outdoor_temperature")
     if "outdoorHumidity" in status:
@@ -284,6 +332,12 @@ def _normalize_enum(value: Any, numeric: dict[int, str]) -> str | None:
     return normalize_string(value)
 
 
+def _normalize_fan(value: Any) -> str | None:
+    """Normalize the live-confirmed 8920W circulation shorthand."""
+    normalized = _normalize_enum(value, _FAN_BY_ID)
+    return "circulate" if normalized == "circ" else normalized
+
+
 def _zone_mapping(record: DeviceRecord, zone: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
     """Return key, settings, and status for an explicit zone."""
     settings_key = thermostat_status_key_for_zone(zone)
@@ -306,6 +360,58 @@ def _numeric_from(primary: dict[str, Any], fallback: dict[str, Any], *keys: str)
 def _normalized_status(value: Any) -> str | None:
     """Normalize a status string while preserving unknown values."""
     return normalize_string(value)
+
+
+def _thermostat_model(record: DeviceRecord) -> str | None:
+    """Return an exact protocol model identifier when present."""
+    model = record.device_status.get("model")
+    return model if isinstance(model, str) else None
+
+
+def _native_temperature_unit(
+    record: DeviceRecord,
+    settings: dict[str, Any],
+    status: dict[str, Any],
+) -> str | None:
+    """Return a native payload unit, never a display-preference fallback."""
+    if _thermostat_model(record) in _CONFIRMED_8920W_MODELS:
+        return _CONFIRMED_8920W_NATIVE_TEMPERATURE_UNIT
+    return explicit_temperature_unit(settings, status)
+
+
+def _derive_operating_state(
+    *,
+    raw_mode: str | None,
+    equipment_status: str | None,
+    heating_status: str | None,
+    cooling_status: str | None,
+    fan_on: bool | None,
+) -> str | None:
+    """Derive one conservative state from observed aggregate and split fields."""
+    state: str | None
+    if raw_mode == "off":
+        state = "off"
+    elif heating_status in _ACTIVE_HEATING_STATUSES:
+        state = "heating"
+    elif cooling_status in _ACTIVE_COOLING_STATUSES:
+        state = "cooling"
+    elif fan_on is True:
+        state = "fan"
+    else:
+        statuses = tuple(
+            status for status in (heating_status, cooling_status) if status is not None
+        )
+        if (
+            statuses
+            and all(status in _INACTIVE_OPERATING_STATUSES for status in statuses)
+            and fan_on is False
+        ):
+            state = "idle"
+        elif equipment_status is not None:
+            state = _OPERATING_STATE_BY_EQUIPMENT_STATUS.get(equipment_status)
+        else:
+            state = None
+    return state
 
 
 def _explicit_equipment_installation(
@@ -378,13 +484,14 @@ class ThermostatProfile:
             zone: self._normalize_zone(record, zone)
             for zone in thermostat_zone_keys_for_record(record)
         }
+        native_units = {
+            zone.temperature_unit for zone in zones.values() if zone.temperature_unit is not None
+        }
         return NormalizedThermostatState(
             zones=zones,
             iaq=self._normalize_iaq(record),
-            attached_humidifier=self._normalize_attached_humidifier(record),
-            temperature_unit=explicit_temperature_unit(
-                record.device_setup, record.effective_device_settings
-            ),
+            attached_humidifier=self._normalize_attached_humidifier(record, zones),
+            temperature_unit=(native_units.pop() if len(native_units) == 1 else None),
         )
 
     def _normalize_zone(
@@ -409,26 +516,29 @@ class ThermostatProfile:
             ("hvacService", "remaining"),
             ("service", "remaining"),
         )
+        raw_mode = _normalize_enum(
+            first_value(
+                first_present(settings, "mode", "ModeId"),
+                first_present(status, "mode", "ModeId"),
+            ),
+            _MODE_BY_ID,
+        )
+        raw_fan = _normalize_fan(
+            first_value(
+                first_present(settings, "fan", "FanId"),
+                first_present(status, "fan", "FanId"),
+            )
+        )
+        equipment_status = _normalized_status(first_present(status, "equipmentStatus"))
+        heating_status = _normalized_status(first_present(status, "heatingStatus"))
+        cooling_status = _normalized_status(first_present(status, "coolingStatus"))
+        fan_on = coerce_bool(first_present(status, "isFanOn"))
         return NormalizedThermostatZoneState(
             zone_key=zone,
             settings_key=settings_key,
-            temperature_unit=explicit_temperature_unit(
-                settings, status, record.device_setup, record.effective_device_settings
-            ),
-            raw_mode=_normalize_enum(
-                first_value(
-                    first_present(settings, "mode", "ModeId"),
-                    first_present(status, "mode", "ModeId"),
-                ),
-                _MODE_BY_ID,
-            ),
-            raw_fan=_normalize_enum(
-                first_value(
-                    first_present(settings, "fan", "FanId"),
-                    first_present(status, "fan", "FanId"),
-                ),
-                _FAN_BY_ID,
-            ),
+            temperature_unit=_native_temperature_unit(record, settings, status),
+            raw_mode=raw_mode,
+            raw_fan=raw_fan,
             raw_hold_type=_normalize_enum(
                 first_value(
                     first_present(settings, "holdType", "HoldType"),
@@ -444,12 +554,17 @@ class ThermostatProfile:
             cool_setpoint=_numeric_from(
                 settings, status, "coolSetpoint", "CoolSetpoint", "cool"
             ),
-            equipment_status=_normalized_status(
-                first_present(status, "equipmentStatus")
+            equipment_status=equipment_status,
+            heating_status=heating_status,
+            cooling_status=cooling_status,
+            fan_on=fan_on,
+            operating_state=_derive_operating_state(
+                raw_mode=raw_mode,
+                equipment_status=equipment_status,
+                heating_status=heating_status,
+                cooling_status=cooling_status,
+                fan_on=fan_on,
             ),
-            heating_status=_normalized_status(first_present(status, "heatingStatus")),
-            cooling_status=_normalized_status(first_present(status, "coolingStatus")),
-            fan_on=coerce_bool(first_present(status, "isFanOn")),
             hvac_service_remaining=coerce_int(
                 first_value(
                     first_present(status, "hvacServiceRemaining"),
@@ -524,7 +639,7 @@ class ThermostatProfile:
         access_reason = (
             None if record.hierarchy.access == "manage" else "account_access_read_only"
         )
-        model_confirmed = record.device_status.get("model") == "8920W"
+        model_confirmed = _thermostat_model(record) in _CONFIRMED_8920W_MODELS
         available = False
         reason = "command_contract_unavailable"
         allowed: tuple[str, ...] = ()
@@ -573,6 +688,8 @@ class ThermostatProfile:
                 and isinstance(settings, dict)
                 and "humiditySetpoint" in settings
             )
+            # Issue 8 live-confirmed that the cloud rejects values above 50.
+            maximum = 50
             unit = "%RH"
         return CommandCapability(
             type=command_type,
@@ -639,30 +756,25 @@ class ThermostatProfile:
                 settings,
                 value=command.mode,
                 allowed_values=capability.allowed_values,
-                string_key="mode",
-                numeric_key="ModeId",
-                numeric_values=_MODE_ID_BY_VALUE,
-                label="thermostat mode",
+                codec=_MODE_CODEC,
             )
         if isinstance(command, SetThermostatFan):
             return self._encode_enum_setting(
                 settings,
                 value=command.mode,
                 allowed_values=capability.allowed_values,
-                string_key="fan",
-                numeric_key="FanId",
-                numeric_values=_FAN_ID_BY_VALUE,
-                label="fan mode",
+                codec=(
+                    _FAN_GS_CODEC
+                    if _thermostat_model(record) == "8920W_GS"
+                    else _FAN_CODEC
+                ),
             )
         if isinstance(command, SetThermostatHold):
             return self._encode_enum_setting(
                 settings,
                 value=command.hold,
                 allowed_values=capability.allowed_values,
-                string_key="holdType",
-                numeric_key="HoldType",
-                numeric_values=_HOLD_ID_BY_VALUE,
-                label="hold mode",
+                codec=_HOLD_CODEC,
             )
         raise CommandNotSupportedError("temperature patch contract is unconfirmed")
 
@@ -672,19 +784,16 @@ class ThermostatProfile:
         *,
         value: str,
         allowed_values: tuple[str, ...],
-        string_key: str,
-        numeric_key: str,
-        numeric_values: dict[str, int],
-        label: str,
+        codec: _EnumSettingCodec,
     ) -> dict[str, Any]:
         """Encode one confirmed enum using the device's observed key style."""
         if value not in allowed_values:
-            raise CommandValidationError(f"unsupported {label}")
-        if string_key in settings:
-            return {string_key: value}
-        if numeric_key in settings:
-            return {numeric_key: numeric_values[value]}
-        raise CommandNotSupportedError(f"zone {label} contract is unavailable")
+            raise CommandValidationError(f"unsupported {codec.label}")
+        if codec.string_key in settings:
+            return {codec.string_key: codec.string_values.get(value, value)}
+        if codec.numeric_key in settings:
+            return {codec.numeric_key: codec.numeric_values[value]}
+        raise CommandNotSupportedError(f"zone {codec.label} contract is unavailable")
 
     def command_confirmed(
         self,
@@ -693,13 +802,16 @@ class ThermostatProfile:
     ) -> bool:
         """Compare normalized confirmed state with numeric tolerance."""
         normalized = self.normalize(replace(record, pending_device_settings={}))
+        confirmed = False
         if isinstance(command, SetAttachedHumidifierPower):
             state = normalized.attached_humidifier
-            return state is not None and state.mode == ("on" if command.enabled else "off")
-        if isinstance(command, SetAttachedHumidifierTarget):
+            confirmed = state is not None and state.mode == (
+                "on" if command.enabled else "off"
+            )
+        elif isinstance(command, SetAttachedHumidifierTarget):
             state = normalized.attached_humidifier
-            return state is not None and state.target_humidity == command.humidity
-        if isinstance(
+            confirmed = state is not None and state.target_humidity == command.humidity
+        elif isinstance(
             command,
             (
                 SetThermostatMode,
@@ -709,16 +821,14 @@ class ThermostatProfile:
             ),
         ):
             zone = normalized.zones.get(command.zone)
-            if zone is None:
-                return False
-            if isinstance(command, SetThermostatMode):
-                return zone.raw_mode == command.mode
-            if isinstance(command, SetThermostatFan):
-                return zone.raw_fan == command.mode
-            if isinstance(command, SetThermostatHold):
-                return zone.raw_hold_type == command.hold
-            return False
-        return False
+            if zone is not None:
+                if isinstance(command, SetThermostatMode):
+                    confirmed = zone.raw_mode == command.mode
+                elif isinstance(command, SetThermostatFan):
+                    confirmed = zone.raw_fan == command.mode
+                elif isinstance(command, SetThermostatHold):
+                    confirmed = zone.raw_hold_type == command.hold
+        return confirmed
 
     def _installed_iaq_status_requests(
         self,
@@ -766,6 +876,7 @@ class ThermostatProfile:
     def _normalize_attached_humidifier(
         self,
         record: DeviceRecord,
+        zones: dict[str, NormalizedThermostatZoneState],
     ) -> NormalizedAttachedHumidifierState | None:
         """Normalize the global attached humidifier without assigning a zone."""
         status_key, _, payload_keys = THERMOSTAT_IAQ_EQUIPMENT["humidifier"]
@@ -780,6 +891,8 @@ class ThermostatProfile:
         current_humidity = select_sensor_reading(status.get("humSensors"))
         if current_humidity is None:
             current_humidity = coerce_float(first_present(status, "currentHumidity"))
+        if current_humidity is None and len(zones) == 1:
+            current_humidity = next(iter(zones.values())).current_humidity
         return NormalizedAttachedHumidifierState(
             installed=True,
             mode=(

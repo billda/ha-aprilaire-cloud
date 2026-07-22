@@ -57,6 +57,9 @@ MAX_PARALLEL_REST_REQUESTS = 4
 POST_WRITE_CONFIRM_TIMEOUT = 5
 POST_WRITE_RECONCILIATION_ATTEMPTS = 2
 POST_WRITE_RECONCILIATION_DELAY_SECONDS = 1
+# A 2xx PATCH is accepted even when the vendor's settings view lags. These
+# bounded follow-up reads happen outside the Home Assistant service call.
+POST_WRITE_DEFERRED_RECONCILIATION_DELAYS_SECONDS = (2, 8)
 SHORT_WRITE_RETRY_THRESHOLD_SECONDS = 2
 
 CONF_ACCOUNT_USER_ID = "account_user_id"

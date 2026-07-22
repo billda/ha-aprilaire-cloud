@@ -19,7 +19,7 @@
       "status": "reporting"
     }
   ],
-  "heatingStatus": "heating",
-  "coolingStatus": "idle",
+  "heatingStatus": "inactive",
+  "coolingStatus": "stage1",
   "isFanOn": true
 }

@@ -194,10 +194,10 @@ class AprilaireCloudApiClient:
         self,
         device_id: str,
         payload: dict[str, Any],
-    ) -> None:
-        """Write device settings."""
+    ) -> dict[str, Any]:
+        """Write device settings and retain any authoritative response document."""
         try:
-            await self._async_request_json(
+            return await self._async_request_json(
                 "PATCH",
                 f"{DEVICE_API}/{device_id}/settings",
                 payload=payload,
@@ -210,14 +210,13 @@ class AprilaireCloudApiClient:
                     "Short rate limit on write (%.1fs), auto-retrying", err.retry_after
                 )
                 await asyncio.sleep(err.retry_after)
-                await self._async_request_json(
+                return await self._async_request_json(
                     "PATCH",
                     f"{DEVICE_API}/{device_id}/settings",
                     payload=payload,
                     route_template="/devices/{device_id}/settings",
                     user_initiated=True,
                 )
-                return
             raise
 
     async def _async_request_json(

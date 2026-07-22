@@ -28,7 +28,6 @@ from custom_components.aprilaire_cloud.vendor import (
     AprilaireCloudAuthenticationTransientError,
     AprilaireCloudCommunicationError,
     AprilaireCloudInvalidCredentialsError,
-    AprilaireCloudWriteError,
     AuthOperation,
 )
 
@@ -91,6 +90,30 @@ async def test_thermostat_cold_start_hydrates_after_settings_classification(
     assert {"thermostat/PZ1", "thermostat/SZ2", "thermostat/SZ3"}.issubset(endpoints)
 
 
+async def test_cancelled_rest_wait_does_not_create_unawaited_request(
+    hass,
+    enable_custom_integrations,
+    config_entry,
+) -> None:
+    """Cancellation before semaphore entry must not instantiate a request coroutine."""
+    client = FakeClient()
+    coordinator = AprilaireCloudDataUpdateCoordinator(
+        hass, config_entry=config_entry, client=client
+    )
+    semaphore = asyncio.Semaphore(0)
+    request_factory = AsyncMock(return_value={})
+
+    task = asyncio.create_task(
+        coordinator._capture_rest_result(semaphore, request_factory)
+    )
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    request_factory.assert_not_called()
+
+
 async def test_optional_iaq_404_preserves_data_and_is_conservatively_cached(
     hass,
     enable_custom_integrations,
@@ -128,7 +151,7 @@ async def test_optional_iaq_404_preserves_data_and_is_conservatively_cached(
     record = coordinator.data.devices[THERMOSTAT_DEVICE_ID]
     assert record.supported is True
     assert record.device_settings
-    assert record.device_status["model"] == "8920W"
+    assert record.device_status["model"] == "8920W_GS"
     assert "thermostatPZ1" in record.status_payloads
     humidifier_calls = [
         call
@@ -176,12 +199,12 @@ async def test_one_critical_device_failure_preserves_another_device_success(
     assert coordinator.data.devices[SECOND_DEVICE_ID].device_settings == {}
 
 
-async def test_shutdown_cancels_and_awaits_refresh_event_task(
+async def test_shutdown_cancels_and_awaits_owned_tasks(
     hass,
     enable_custom_integrations,
     config_entry,
 ) -> None:
-    """Coordinator shutdown owns the complete refresh-event task lifecycle."""
+    """Coordinator shutdown owns refresh-event and write-reconciliation tasks."""
     client = FakeClient()
     coordinator = AprilaireCloudDataUpdateCoordinator(
         hass, config_entry=config_entry, client=client
@@ -195,11 +218,15 @@ async def test_shutdown_cancels_and_awaits_refresh_event_task(
 
     coordinator.async_request_refresh = _blocked_refresh  # type: ignore[method-assign]
     coordinator._schedule_refresh()
+    reconciliation_task = hass.async_create_task(blocked.wait())
+    coordinator._write_reconciliation_tasks.add(reconciliation_task)
     await asyncio.wait_for(started.wait(), timeout=1)
 
     await coordinator.async_shutdown()
 
     assert coordinator._refresh_event_task is None
+    assert reconciliation_task.cancelled()
+    assert coordinator._write_reconciliation_tasks == set()
 
 
 @pytest.fixture
@@ -836,13 +863,13 @@ async def test_timeout_rest_refresh_matching_value_succeeds(
     )
 
 
-async def test_timeout_rest_refresh_mismatch_reverts_latest_pending_write(
+async def test_accepted_write_reconciles_in_background_without_false_service_error(
     hass,
     enable_custom_integrations,
     monkeypatch,
     config_entry,
 ) -> None:
-    """A timeout with mismatched REST settings should revert the optimistic value."""
+    """A successful PATCH is accepted while delayed observation reconciles later."""
     client = FakeClient()
     monkeypatch.setattr(
         "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket", FakeWebSocket
@@ -854,14 +881,19 @@ async def test_timeout_rest_refresh_mismatch_reverts_latest_pending_write(
         "custom_components.aprilaire_cloud.coordinator.POST_WRITE_RECONCILIATION_DELAY_SECONDS",
         0,
     )
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator."
+        "POST_WRITE_DEFERRED_RECONCILIATION_DELAYS_SECONDS",
+        (0,),
+    )
 
     coordinator = AprilaireCloudDataUpdateCoordinator(
         hass, config_entry=config_entry, client=client
     )
     await bootstrap_coordinator(coordinator)
 
-    with pytest.raises(AprilaireCloudWriteError):
-        await _async_set_target_humidity(coordinator, 55)
+    await _async_set_target_humidity(coordinator, 55)
+    await asyncio.gather(*coordinator._write_reconciliation_tasks)
 
     assert coordinator.data.devices[DEVICE_ID].pending_device_settings == {}
     assert (
@@ -870,6 +902,87 @@ async def test_timeout_rest_refresh_mismatch_reverts_latest_pending_write(
         ]
         == 52
     )
+
+
+async def test_deferred_reconciliation_observes_late_success(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """A late remote observation clears optimistic state without an HA error."""
+    client = FakeClient()
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket",
+        FakeWebSocket,
+    )
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.POST_WRITE_CONFIRM_TIMEOUT",
+        0.01,
+    )
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.POST_WRITE_RECONCILIATION_DELAY_SECONDS",
+        0,
+    )
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator."
+        "POST_WRITE_DEFERRED_RECONCILIATION_DELAYS_SECONDS",
+        (0,),
+    )
+    coordinator = AprilaireCloudDataUpdateCoordinator(
+        hass, config_entry=config_entry, client=client
+    )
+    await bootstrap_coordinator(coordinator)
+    stale = build_device_settings(humidity=52)
+    stale["asOf"] = "2026-03-24T00:10:00.000Z"
+    confirmed = build_device_settings(humidity=55)
+    confirmed["asOf"] = "2026-03-24T00:11:00.000Z"
+    client.async_get_device_settings = AsyncMock(
+        side_effect=[stale, stale, confirmed],
+    )
+
+    await _async_set_target_humidity(coordinator, 55)
+    await asyncio.gather(*coordinator._write_reconciliation_tasks)
+
+    assert client.async_get_device_settings.await_count == 3
+    assert coordinator.data.devices[DEVICE_ID].pending_device_settings == {}
+    assert (
+        coordinator.data.devices[DEVICE_ID].effective_device_settings["dehumidifier"][
+            "humiditySetpoint"
+        ]
+        == 55
+    )
+
+
+async def test_authoritative_rest_settings_signal_inflight_confirmation(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """A concurrent authoritative refresh should wake the confirmation waiter."""
+    client = FakeClient()
+    client.patch_release = asyncio.Event()
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket",
+        FakeWebSocket,
+    )
+    coordinator = AprilaireCloudDataUpdateCoordinator(
+        hass, config_entry=config_entry, client=client
+    )
+    await bootstrap_coordinator(coordinator)
+
+    task = asyncio.create_task(_async_set_target_humidity(coordinator, 55))
+    await asyncio.wait_for(client.patch_started.wait(), timeout=1)
+    client.patch_release.set()
+    await asyncio.sleep(0)
+    confirmed = build_device_settings(humidity=55)
+    confirmed["asOf"] = "2026-03-24T00:10:00.000Z"
+    coordinator._apply_full_device_settings(DEVICE_ID, confirmed)
+    coordinator._publish_snapshot()
+
+    await asyncio.wait_for(task, timeout=1)
+    assert coordinator.data.devices[DEVICE_ID].pending_device_settings == {}
 
 
 async def test_delayed_rest_observation_confirms_on_second_bounded_check(

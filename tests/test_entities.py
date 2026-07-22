@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, call
 import pytest
 from homeassistant.components.climate import ClimateEntityFeature, HVACAction, HVACMode
 from homeassistant.components.climate.const import (
+    ATTR_CURRENT_TEMPERATURE,
     ATTR_HVAC_MODE,
     ATTR_TARGET_TEMP_HIGH,
     ATTR_TARGET_TEMP_LOW,
@@ -15,6 +16,7 @@ from homeassistant.components.climate.const import (
 from homeassistant.components.humidifier import HumidifierAction
 from homeassistant.const import ATTR_TEMPERATURE
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.util.unit_system import US_CUSTOMARY_SYSTEM
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.aprilaire_cloud.binary_sensor import (
@@ -398,15 +400,19 @@ async def test_thermostat_climate_properties_map_to_home_assistant_values(
 
     pz1 = AprilaireThermostatClimateEntity(coordinator, device_id, "thermostat_pz1")
     sz2 = AprilaireThermostatClimateEntity(coordinator, device_id, "thermostat_sz2")
+    hass.config.units = US_CUSTOMARY_SYSTEM
+    pz1.hass = hass
 
     assert pz1.unique_id == f"{device_id}_thermostat_pz1"
-    assert pz1.current_temperature == 70
+    assert pz1.temperature_unit == "°C"
+    assert pz1.current_temperature == 21
+    assert pz1.state_attributes[ATTR_CURRENT_TEMPERATURE] == 70
     assert pz1.current_humidity == 45
     assert pz1.hvac_mode is HVACMode.HEAT
     assert pz1.hvac_action is HVACAction.HEATING
-    assert pz1.target_temperature == 68
-    assert pz1.target_temperature_low == 68
-    assert pz1.target_temperature_high == 75
+    assert pz1.target_temperature == 20
+    assert pz1.target_temperature_low == 20
+    assert pz1.target_temperature_high == 24
     assert pz1.fan_mode == "auto"
     assert pz1.preset_mode == "permanent"
     assert ClimateEntityFeature.TARGET_TEMPERATURE not in pz1.supported_features
@@ -431,6 +437,13 @@ async def test_thermostat_action_uses_separate_status_fields_in_priority_order(
         coordinator,
         device_id,
         "thermostat_pz1",
+    )
+    equipment = AprilaireThermostatZoneSensor(
+        coordinator,
+        device_id,
+        "PZ1",
+        "equipment_status",
+        "thermostat_pz1_equipment_status",
     )
 
     await coordinator.async_process_messages(
@@ -459,12 +472,13 @@ async def test_thermostat_action_uses_separate_status_fields_in_priority_order(
                 "zone": "PZ1",
                 "asOf": "2026-03-24T00:11:00.000Z",
                 "heatingStatus": "idle",
-                "coolingStatus": "cooling",
+                "coolingStatus": "stage1",
                 "isFanOn": True,
             }
         ],
     )
     assert entity.hvac_action is HVACAction.COOLING
+    assert equipment.native_value == "cooling"
 
     await coordinator.async_process_messages(
         LOCATION_ID,
@@ -633,7 +647,7 @@ async def test_thermostat_iaq_sensors_appear_only_when_status_data_exists(
     )
 
     assert zone_sensor.unique_id == f"{device_id}_thermostat_pz1_outdoor_temperature"
-    assert zone_sensor.native_value == 35
+    assert zone_sensor.native_value == 2
     assert iaq_sensor.unique_id == f"{device_id}_iaq_humidifier_status"
     assert iaq_sensor.native_value == "humidifying"
 
@@ -672,6 +686,7 @@ async def test_attached_humidifier_is_global_and_uses_reported_service_values(
     assert "pz1" not in humidifier.unique_id
     assert humidifier.current_humidity == 38
     assert humidifier.target_humidity == 40
+    assert humidifier.max_humidity == 50
     assert humidifier.is_on is True
     assert humidifier.action is HumidifierAction.HUMIDIFYING
     assert remaining.native_value == 17
@@ -941,8 +956,11 @@ async def test_thermostat_dynamic_sensor_metric_paths(
     )
 
     expected = {
+        "indoor_temperature": 21,
         "indoor_humidity": 45,
-        "outdoor_temperature": 35,
+        "heat_setpoint": 20,
+        "cool_setpoint": 24,
+        "outdoor_temperature": 2,
         "outdoor_humidity": 62,
         "equipment_status": "heating",
         "hvac_service_remaining": 88,
@@ -956,8 +974,13 @@ async def test_thermostat_dynamic_sensor_metric_paths(
             f"thermostat_pz1_{metric}",
         )
         assert sensor.native_value == value
-        if metric == "outdoor_temperature":
-            assert sensor.native_unit_of_measurement == "°F"
+        if metric in {
+            "indoor_temperature",
+            "heat_setpoint",
+            "cool_setpoint",
+            "outdoor_temperature",
+        }:
+            assert sensor.native_unit_of_measurement == "°C"
 
     missing = AprilaireThermostatZoneSensor(
         coordinator,

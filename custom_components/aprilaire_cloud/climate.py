@@ -227,7 +227,9 @@ class AprilaireThermostatClimateEntity(AprilaireCloudEntity, ClimateEntity):
     def current_temperature(self) -> float | None:
         """Return the current indoor temperature."""
         zone = self._zone
-        return None if zone is None else zone.current_temperature
+        if zone is None or zone.temperature_unit is None:
+            return None
+        return zone.current_temperature
 
     @property
     def current_humidity(self) -> float | None:
@@ -247,33 +249,15 @@ class AprilaireThermostatClimateEntity(AprilaireCloudEntity, ClimateEntity):
     def hvac_action(self) -> HVACAction | None:
         """Return the current Home Assistant HVAC action."""
         zone = self._zone
-        if zone is None:
+        if zone is None or zone.operating_state is None:
             return None
-        if zone.raw_mode == "off":
-            return HVACAction.OFF
-        if zone.heating_status in {"active", "heating", "on"}:
-            return HVACAction.HEATING
-        if zone.cooling_status in {"active", "cooling", "on"}:
-            return HVACAction.COOLING
-        if zone.fan_on is True:
-            return HVACAction.FAN
-        inactive = {"idle", "inactive", "off"}
-        statuses = [
-            status
-            for status in (zone.heating_status, zone.cooling_status)
-            if status is not None
-        ]
-        if statuses and all(status in inactive for status in statuses) and zone.fan_on is False:
-            return HVACAction.IDLE
-        if zone.equipment_status is None:
-            return None
-        return HA_ACTION_BY_STATUS.get(zone.equipment_status)
+        return HA_ACTION_BY_STATUS.get(zone.operating_state)
 
     @property
     def target_temperature(self) -> float | None:
         """Return the single setpoint for heat or cool modes."""
         zone = self._zone
-        if zone is None:
+        if zone is None or zone.temperature_unit is None:
             return None
         if self.hvac_mode == HVACMode.HEAT:
             return zone.heat_setpoint
@@ -285,13 +269,17 @@ class AprilaireThermostatClimateEntity(AprilaireCloudEntity, ClimateEntity):
     def target_temperature_low(self) -> float | None:
         """Return the heat setpoint."""
         zone = self._zone
-        return None if zone is None else zone.heat_setpoint
+        if zone is None or zone.temperature_unit is None:
+            return None
+        return zone.heat_setpoint
 
     @property
     def target_temperature_high(self) -> float | None:
         """Return the cool setpoint."""
         zone = self._zone
-        return None if zone is None else zone.cool_setpoint
+        if zone is None or zone.temperature_unit is None:
+            return None
+        return zone.cool_setpoint
 
     @property
     def fan_mode(self) -> str | None:
@@ -390,6 +378,7 @@ class AprilaireThermostatClimateEntity(AprilaireCloudEntity, ClimateEntity):
                 "raw_heating_status": zone.heating_status,
                 "raw_cooling_status": zone.cooling_status,
                 "raw_fan_on": zone.fan_on,
+                "operating_state": zone.operating_state,
             }
         )
         return attrs

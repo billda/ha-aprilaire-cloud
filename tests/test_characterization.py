@@ -59,9 +59,10 @@ def test_thermostat_fixture_uses_observed_8920w_nesting() -> None:
 
     assert isinstance(status["tempSensors"], list)
     assert isinstance(status["humSensors"], list)
-    assert status["heatingStatus"] == "heating"
-    assert status["coolingStatus"] == "idle"
+    assert status["heatingStatus"] == "inactive"
+    assert status["coolingStatus"] == "stage1"
     assert status["isFanOn"] is True
+    assert "equipmentStatus" not in status
     assert "currentTemperature" not in status
     assert "currentHumidity" not in status
 

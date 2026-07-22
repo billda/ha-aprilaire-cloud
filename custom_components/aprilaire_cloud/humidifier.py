@@ -21,6 +21,7 @@ from .entity import (
 )
 from .profiles import (
     AprilaireCommandError,
+    CommandType,
     NormalizedAttachedHumidifierState,
     NormalizedDehumidifierState,
     NormalizedThermostatState,
@@ -184,6 +185,17 @@ class AprilaireAttachedHumidifierEntity(AprilaireCloudEntity, HumidifierEntity):
     ) -> None:
         """Initialize the global attached humidifier entity."""
         super().__init__(coordinator, device_id, "attached_humidifier")
+        device = coordinator.data.devices.get(device_id)
+        profile = get_profile(device.profile_key) if device is not None else None
+        capability = (
+            profile.capabilities(device).commands.get(
+                CommandType.ATTACHED_HUMIDIFIER_TARGET
+            )
+            if profile is not None and device is not None
+            else None
+        )
+        if capability is not None and capability.maximum is not None:
+            self._attr_max_humidity = capability.maximum
 
     @property
     def _normalized_humidifier(self) -> NormalizedAttachedHumidifierState | None:
@@ -193,7 +205,7 @@ class AprilaireAttachedHumidifierEntity(AprilaireCloudEntity, HumidifierEntity):
 
     @property
     def current_humidity(self) -> float | None:
-        """Return current humidity only when the vendor reports it."""
+        """Return explicit humidity or the sole thermostat zone's reading."""
         state = self._normalized_humidifier
         return None if state is None else state.current_humidity
 

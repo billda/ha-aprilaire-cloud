@@ -132,11 +132,35 @@ PROFILE_DYNAMIC_SENSOR_FACTORIES: dict[str, DynamicSensorFactory] = {
 
 
 THERMOSTAT_ZONE_SENSOR_NAMES = {
+    "indoor_temperature": "Indoor temperature",
     "indoor_humidity": "Indoor humidity",
+    "heat_setpoint": "Heat setpoint",
+    "cool_setpoint": "Cool setpoint",
     "outdoor_temperature": "Outdoor temperature",
     "outdoor_humidity": "Outdoor humidity",
     "equipment_status": "Equipment status",
     "hvac_service_remaining": "HVAC service remaining",
+}
+THERMOSTAT_TEMPERATURE_METRICS = frozenset(
+    {
+        "indoor_temperature",
+        "heat_setpoint",
+        "cool_setpoint",
+        "outdoor_temperature",
+    }
+)
+THERMOSTAT_ZONE_SENSOR_VALUES: dict[
+    str,
+    Callable[[NormalizedThermostatZoneState], str | float | int | None],
+] = {
+    "indoor_temperature": lambda zone: zone.current_temperature,
+    "indoor_humidity": lambda zone: zone.current_humidity,
+    "heat_setpoint": lambda zone: zone.heat_setpoint,
+    "cool_setpoint": lambda zone: zone.cool_setpoint,
+    "outdoor_temperature": lambda zone: zone.outdoor_temperature,
+    "outdoor_humidity": lambda zone: zone.outdoor_humidity,
+    "equipment_status": lambda zone: zone.operating_state,
+    "hvac_service_remaining": lambda zone: zone.hvac_service_remaining,
 }
 
 THERMOSTAT_IAQ_SENSOR_NAMES = {
@@ -305,14 +329,13 @@ def _thermostat_state(normalized: object | None) -> NormalizedThermostatState | 
 
 def _thermostat_temperature_unit(
     zone: NormalizedThermostatZoneState | None,
-    fallback: str,
-) -> str:
-    """Return an explicit protocol unit or the HA display fallback."""
+) -> str | None:
+    """Return only a confirmed native protocol unit."""
     if zone is not None and zone.temperature_unit == "C":
         return UnitOfTemperature.CELSIUS
     if zone is not None and zone.temperature_unit == "F":
         return UnitOfTemperature.FAHRENHEIT
-    return fallback
+    return None
 
 
 class AprilaireThermostatZoneSensor(AprilaireCloudEntity, SensorEntity):
@@ -336,7 +359,7 @@ class AprilaireThermostatZoneSensor(AprilaireCloudEntity, SensorEntity):
             self._attr_native_unit_of_measurement = PERCENTAGE
             self._attr_device_class = SensorDeviceClass.HUMIDITY
             self._attr_state_class = SensorStateClass.MEASUREMENT
-        elif metric == "outdoor_temperature":
+        elif metric in THERMOSTAT_TEMPERATURE_METRICS:
             self._attr_device_class = SensorDeviceClass.TEMPERATURE
             self._attr_state_class = SensorStateClass.MEASUREMENT
         elif metric == "hvac_service_remaining":
@@ -359,30 +382,20 @@ class AprilaireThermostatZoneSensor(AprilaireCloudEntity, SensorEntity):
     @property
     def native_unit_of_measurement(self) -> str | None:
         """Return the unit for thermostat temperature sensors."""
-        if self._metric == "outdoor_temperature":
-            return _thermostat_temperature_unit(
-                self._zone,
-                self.coordinator.hass.config.units.temperature_unit,
-            )
+        if self._metric in THERMOSTAT_TEMPERATURE_METRICS:
+            return _thermostat_temperature_unit(self._zone)
         return getattr(self, "_attr_native_unit_of_measurement", None)
 
     @property
-    def native_value(self):
+    def native_value(self) -> str | float | int | None:
         """Return the current sensor reading."""
         zone = self._zone
-        if zone is None:
+        value_fn = THERMOSTAT_ZONE_SENSOR_VALUES.get(self._metric)
+        if zone is None or value_fn is None:
             return None
-        if self._metric == "indoor_humidity":
-            return zone.current_humidity
-        if self._metric == "outdoor_temperature":
-            return zone.outdoor_temperature
-        if self._metric == "outdoor_humidity":
-            return zone.outdoor_humidity
-        if self._metric == "equipment_status":
-            return zone.equipment_status
-        if self._metric == "hvac_service_remaining":
-            return zone.hvac_service_remaining
-        return None
+        if self._metric in THERMOSTAT_TEMPERATURE_METRICS and zone.temperature_unit is None:
+            return None
+        return value_fn(zone)
 
 
 class AprilaireThermostatIAQSensor(AprilaireCloudEntity, SensorEntity):

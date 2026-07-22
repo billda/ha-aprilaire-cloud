@@ -57,7 +57,9 @@ If you are testing with a model other than the AprilAire E100W, please report:
 
 Do not test a control that Home Assistant does not advertise. Thermostat
 temperature setpoint writes remain disabled pending evidence for PATCH units,
-limits, and deadband.
+limits, and deadband. On confirmed `8920W`/`8920W_GS` contracts, readings and
+read-only setpoints are native Celsius even when the thermostat is configured
+to display Fahrenheit; Home Assistant should perform that display conversion.
 
 ## Bug Reports
 

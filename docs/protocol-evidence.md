@@ -4,7 +4,7 @@ This catalog records what the integration knows about the undocumented
 `aprilaire.io` protocol and why it enables or disables each behavior. It
 supersedes broad protocol claims in the March 2026 local research notes.
 
-Last reviewed: 2026-07-20.
+Last reviewed: 2026-07-22.
 
 ## Evidence levels
 
@@ -30,6 +30,8 @@ device, location, room, sensor, firmware, and hardware values were replaced.
 | [PR 5](https://github.com/billda/ha-aprilaire-cloud/pull/5), inspected as evidence only | Unknown | 8920W / unknown firmware | `tempSensors`, `humSensors`, separate heating/cooling/fan state, zone settings, observed mode/fan/hold values |
 | [PR 6](https://github.com/billda/ha-aprilaire-cloud/pull/6), inspected as evidence only | Unknown | 8920W / unknown firmware | `DeviceEvent` offline and rescinded messages |
 | [PR 7](https://github.com/billda/ha-aprilaire-cloud/pull/7), inspected as evidence only | Unknown | 8920W with attached humidifier / unknown firmware | Global attached-humidifier settings/status, power/target writes, and water-panel service state |
+| [Issue 8](https://github.com/billda/ha-aprilaire-cloud/issues/8) and the reporter's public [`0.4.0b` branch](https://github.com/Paradox52525/ha-aprilaire-cloud/tree/0.4.0b), inspected as evidence only | Home Assistant 2026.7.2; Healthy Air app unknown | 8920W hardware / firmware 3.04.5; `8920W_GS` protocol identifier in the branch | Native-Celsius thermostat values despite a Fahrenheit display preference, `coolingStatus: stage1`, current/setpoint extraction, and the `circ` circulation token |
+| [Issue 8](https://github.com/billda/ha-aprilaire-cloud/issues/8) | Home Assistant 2026.7.2; Healthy Air app unknown | Two single-zone 8920W thermostats with attached humidifiers / firmware 3.04.5 | Attached-humidifier power/target writes, a cloud-enforced 50% maximum, sole-zone humidity context, and delayed write observation that can outlast the synchronous confirmation window |
 | Android APK inspection | Healthy Air Android 2.23.58 | Not device-specific | Cognito configuration, REST/WebSocket route names, and the existence of an account `/login` route |
 
 The listed iOS 2.27.16 release was not decompiled or captured for this work and
@@ -91,26 +93,29 @@ observed settings key for that device. Missing or unknown access is read-only.
 | External/remote dehumidifier telemetry | `live_confirmed` community report for external control | Read sensors whose fields are present |
 | External/remote dehumidifier on/off | `live_confirmed` community report for external control | Exposed as an on/off switch only when `mode` is explicitly reported |
 | External/remote humidity/dew-point target | `unknown` / inapplicable | Disabled |
-| 8920W temperature/humidity and HVAC action | `live_confirmed` community report | Read from observed sensor arrays and separate heat/cool/fan fields |
-| 8920W mode, fan, and hold | `live_confirmed` community report | Enabled only for model 8920W and observed key style/value set |
+| 8920W temperature/humidity and HVAC action | `live_confirmed` issue 8 and reporter branch | Exact `8920W`/`8920W_GS` contracts use native-Celsius values; read from observed sensor arrays and separate heat/cool/fan fields, including `stage1` |
+| 8920W mode, fan, and hold | `live_confirmed` community report and reporter branch | Enabled only for exact `8920W`/`8920W_GS` identifiers and the observed key style/value set; `circ` is normalized to Home Assistant's `circulate` |
 | 8920W heat/cool setpoints | Read keys `live_confirmed`; PATCH unit/deadband `unknown` | Values are read; writes are disabled |
-| Attached central humidifier power/target | `live_confirmed` community report | One thermostat-global entity, enabled only when installation/settings are explicit |
+| Attached central humidifier power/target | `live_confirmed` community report and issue 8 | One thermostat-global entity, enabled only when installation/settings are explicit; target maximum is 50%, while the minimum remains unknown |
 | Attached humidifier water panel | `live_confirmed` community report | Remaining/service state exposed only when reported |
 | Other thermostat-attached IAQ equipment | Captured/community schema | Read-only status/service entities when installation is explicit |
 | Emergency heat and schedule editing | Outside scope | Disabled |
 
-No value-threshold temperature inference is used. A protocol-provided unit is
-used when present; otherwise Home Assistant's configured unit is only a display
-fallback. It is not evidence of the PATCH unit and does not enable a setpoint
-write.
+No value-threshold temperature inference is used. Exact `8920W` and
+`8920W_GS` protocol identifiers use the community-confirmed native Celsius
+read contract even when the device display preference is Fahrenheit. Home
+Assistant performs presentation conversion. For other models, a
+protocol-provided unit is required before numeric temperature state is exposed.
+Neither behavior proves the PATCH unit or enables a setpoint write.
 
 ## Open evidence gaps
 
-- 8920W sensor/settings units, PATCH units, allowed temperature range, and
-  heat/cool deadband need a sanitized before/after capture from the same
-  device.
-- Firmware versions and current mobile-app versions for the community 8920W
-  reports are unknown.
+- 8920W PATCH units, allowed temperature range, and heat/cool deadband need a
+  sanitized before/after capture from the same device.
+- The attached-humidifier minimum setpoint and multi-zone humidity source are
+  unknown. No minimum is invented, and a multi-zone thermostat is not bound to
+  the first zone.
+- The current mobile-app version used for the 8920W issue 8 report is unknown.
 - The current account `/login` request contract and purpose are unknown.
 - External/remote/dew-point control behavior beyond the reported sensor and
   explicit mode fields is unknown.

@@ -161,9 +161,12 @@ async def test_patch_device_settings_retries_on_short_rate_limit(monkeypatch) ->
     )
     monkeypatch.setattr(client, "_async_request_json", request_json)
 
-    await client.async_patch_device_settings("device-1", {"dehumidifier": {"mode": "on"}})
+    result = await client.async_patch_device_settings(
+        "device-1", {"dehumidifier": {"mode": "on"}}
+    )
 
     assert request_json.await_count == 2
+    assert result == {}
 
 
 async def test_patch_device_settings_raises_on_long_rate_limit(monkeypatch) -> None:

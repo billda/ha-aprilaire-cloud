@@ -58,26 +58,38 @@ allowlist. It does not imply that every Healthy Air device is compatible.
 
 ### Beta Thermostat Support
 
-Thermostat support is beta. Community testing on an 8920W confirms:
+Thermostat support is beta. Community testing on 8920W hardware (reported by
+the API as `8920W` or `8920W_GS`) confirms:
 
 - climate entities for zones `PZ1`, `SZ2`, and `SZ3` when those zones are reported
-- indoor temperature/humidity from the reported sensor arrays;
-- HVAC action from separate heating, cooling, and fan state;
+- indoor temperature/humidity from the reported sensor arrays, including
+  native-Celsius readings when the thermostat display preference is
+  Fahrenheit;
+- HVAC action from separate heating, cooling, and fan state, including staged
+  cooling values such as `stage1`;
 - off, heat, cool, and auto mode writes;
 - `auto`, `on`, and `circulate` fan writes;
 - `none`, `temporary`, `permanent`, and `vacation` hold writes;
+- current fan mode and read-only heat/cool setpoints;
+- separate indoor-temperature, indoor-humidity, heat-setpoint, and
+  cool-setpoint sensors;
 - read-only outdoor, equipment, service, and explicitly installed IAQ state
   when reported.
 
 Heat and cool setpoints are displayed, but setpoint writes are deliberately
 disabled: the PATCH unit and heat/cool deadband have not been proven. The
-integration does not infer temperature units from numeric values.
+integration does not infer temperature units from numeric thresholds. For the
+confirmed 8920W identifiers it marks the payload as native Celsius and lets
+Home Assistant perform display conversion; temperature values from an unknown
+model/unit contract are withheld rather than mislabeled.
 
 An explicitly installed thermostat-attached humidifier receives one
 thermostat-global humidifier entity rather than being assigned to an arbitrary
 zone. Community-confirmed power/target keys are writable with `manage` access;
-current humidity, action, and water-panel state remain unknown when not
-reported.
+the target is capped at the cloud-confirmed 50% maximum. Current humidity uses
+the humidifier's own reading when reported, or the sole thermostat zone's
+reading when there is exactly one zone. Action and water-panel state remain
+unknown when not reported.
 
 Live validation has been performed against a real AprilAire cloud account and a real AprilAire E100W. If your device authenticates successfully but does not show up in Home Assistant, the most likely reason is that it exposes an unsupported capability profile rather than a bad login.
 
@@ -215,6 +227,11 @@ The normal flow is:
 ### Writes
 
 Commands such as turning the device on or changing target humidity are sent with REST `PATCH` requests to the AprilAire settings endpoint. The integration then waits for the corresponding WebSocket update and falls back to a targeted REST reconciliation read if a confirming push does not arrive quickly.
+
+The cloud can accept a write before the new value becomes observable. After a
+successful PATCH, the integration performs bounded immediate checks and then
+continues a short, owned background reconciliation instead of reporting a
+false service-call failure. Explicit PATCH errors still fail immediately.
 
 ### Authentication
 

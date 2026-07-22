@@ -70,13 +70,14 @@
       "payload_kind": "captured shape"
     },
     "thermostat_8920w_zone_status.json": {
-      "source": "community report and pull request 5",
+      "source": "community report, pull request 5, issue 8, and reporter fork 0.4.0b branch",
       "evidence": "live_confirmed",
       "app_version": "unknown",
-      "device_model": "8920W",
-      "firmware": "unknown",
+      "device_model": "8920W / 8920W_GS protocol identifier",
+      "firmware": "3.04.5 reported in issue 8",
       "transport": "ThermostatStatus",
-      "payload_kind": "incremental"
+      "payload_kind": "incremental",
+      "establishes": "Celsius-native readings and staged cooling without aggregate equipmentStatus"
     },
     "device_event_offline.json": {
       "source": "community report and pull request 6",

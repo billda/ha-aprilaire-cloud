@@ -9,5 +9,5 @@
   "issue_tracker": "https://github.com/billda/ha-aprilaire-cloud/issues",
   "loggers": ["custom_components.aprilaire_cloud", "pycognito"],
   "requirements": ["pycognito==2024.5.1"],
-  "version": "0.4.0b2"
+  "version": "0.4.0b3"
 }

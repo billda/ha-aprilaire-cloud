@@ -77,6 +77,15 @@
       "thermostat_indoor_humidity": {
         "name": "{zone} indoor humidity"
       },
+      "thermostat_indoor_temperature": {
+        "name": "{zone} indoor temperature"
+      },
+      "thermostat_heat_setpoint": {
+        "name": "{zone} heat setpoint"
+      },
+      "thermostat_cool_setpoint": {
+        "name": "{zone} cool setpoint"
+      },
       "thermostat_outdoor_temperature": {
         "name": "{zone} outdoor temperature"
       },

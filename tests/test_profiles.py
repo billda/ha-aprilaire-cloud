@@ -42,6 +42,7 @@ from .common import (
     build_initial_messages,
     build_thermostat_hierarchy,
     build_thermostat_initial_messages,
+    build_thermostat_setup,
 )
 
 FIXTURES = Path(__file__).with_name("fixtures")
@@ -245,7 +246,7 @@ def test_thermostat_codecs_use_only_observed_zone_keys() -> None:
     assert profile.encode_command(
         record,
         SetThermostatFan(zone="PZ1", mode="circulate"),
-    ).payload == {"thermostatPZ1": {"fan": "circulate"}}
+    ).payload == {"thermostatPZ1": {"fan": "circ"}}
     assert profile.encode_command(
         record,
         SetThermostatFan(zone="SZ2", mode="on"),
@@ -289,13 +290,13 @@ def test_unproven_thermostat_temperature_contract_stays_read_only() -> None:
         )
 
 
-def test_8920w_fixture_paths_are_read_without_unit_guessing() -> None:
-    """Community-confirmed telemetry is explicit while its unknown unit stays unknown."""
+def test_8920w_fixture_normalizes_native_units_staged_cooling_and_read_sensors() -> None:
+    """Issue 8 telemetry remains Celsius and drives one canonical operating state."""
     record = _record(
         build_thermostat_hierarchy(),
         THERMOSTAT_DEVICE_ID,
         [
-            build_device_status(THERMOSTAT_DEVICE_ID, model="8920W"),
+            build_device_status(THERMOSTAT_DEVICE_ID, model="8920W_GS"),
             _fixture("thermostat_8920w_settings.json"),
             _fixture("thermostat_8920w_zone_status.json"),
         ],
@@ -309,9 +310,65 @@ def test_8920w_fixture_paths_are_read_without_unit_guessing() -> None:
     assert zone.current_humidity == 45
     assert zone.heat_setpoint == 20
     assert zone.cool_setpoint == 24
-    assert zone.heating_status == "heating"
-    assert zone.cooling_status == "idle"
+    assert zone.heating_status == "inactive"
+    assert zone.cooling_status == "stage1"
     assert zone.fan_on is True
+    assert zone.equipment_status is None
+    assert zone.operating_state == "cooling"
+    assert zone.temperature_unit == "C"
+    assert {
+        "thermostat_pz1_indoor_temperature",
+        "thermostat_pz1_heat_setpoint",
+        "thermostat_pz1_cool_setpoint",
+        "thermostat_pz1_equipment_status",
+    }.issubset(profile.capabilities(record).entities.dynamic_sensor_keys)
+
+
+def test_8920w_gs_uses_observed_circulation_token_for_string_fan_contract() -> None:
+    """The confirmed GS string contract maps HA circulate to vendor circ."""
+    settings = _fixture("thermostat_8920w_settings.json")
+    settings["thermostatPZ1"]["fan"] = "circ"
+    record = _record(
+        build_thermostat_hierarchy(),
+        THERMOSTAT_DEVICE_ID,
+        [
+            build_device_status(THERMOSTAT_DEVICE_ID, model="8920W_GS"),
+            settings,
+            _fixture("thermostat_8920w_zone_status.json"),
+        ],
+    )
+    profile = get_profile(record.profile_key)
+    assert profile is not None
+
+    capability = profile.capabilities(record).commands[CommandType.THERMOSTAT_FAN]
+    assert capability.writable is True
+    assert profile.encode_command(
+        record,
+        SetThermostatFan(zone="PZ1", mode="circulate"),
+    ).payload == {"thermostatPZ1": {"fan": "circ"}}
+    assert profile.command_confirmed(
+        record,
+        SetThermostatFan(zone="PZ1", mode="circulate"),
+    )
+
+
+def test_unknown_thermostat_model_does_not_treat_display_preference_as_native_unit() -> None:
+    """An unconfirmed model keeps numeric telemetry untyped instead of mislabeling it."""
+    record = _record(
+        build_thermostat_hierarchy(),
+        THERMOSTAT_DEVICE_ID,
+        [
+            build_device_status(THERMOSTAT_DEVICE_ID, model="unconfirmed-model"),
+            build_thermostat_setup(),
+            _fixture("thermostat_8920w_settings.json"),
+            _fixture("thermostat_8920w_zone_status.json"),
+        ],
+    )
+    profile = get_profile(record.profile_key)
+    assert profile is not None
+    zone = cast(NormalizedThermostatState, profile.normalize(record)).zones["PZ1"]
+
+    assert zone.current_temperature == 21
     assert zone.temperature_unit is None
 
 
@@ -343,8 +400,11 @@ def test_attached_humidifier_fixture_has_global_exact_codecs() -> None:
         capabilities.entities.binary_sensor_keys
     )
     assert normalized.attached_humidifier is not None
+    assert normalized.attached_humidifier.current_humidity == 45
     assert normalized.attached_humidifier.water_panel_remaining == 80
     assert normalized.attached_humidifier.water_panel_needs_service is False
+    target_capability = capabilities.commands[CommandType.ATTACHED_HUMIDIFIER_TARGET]
+    assert target_capability.maximum == 50
     assert profile.encode_command(
         record,
         SetAttachedHumidifierPower(enabled=False),
@@ -353,6 +413,15 @@ def test_attached_humidifier_fixture_has_global_exact_codecs() -> None:
         record,
         SetAttachedHumidifierTarget(humidity=42),
     ).payload == {"humidifier": {"humiditySetpoint": 42}}
+    assert profile.encode_command(
+        record,
+        SetAttachedHumidifierTarget(humidity=50),
+    ).payload == {"humidifier": {"humiditySetpoint": 50}}
+    with pytest.raises(CommandValidationError):
+        profile.encode_command(
+            record,
+            SetAttachedHumidifierTarget(humidity=51),
+        )
     assert profile.command_confirmed(
         record,
         SetAttachedHumidifierPower(enabled=True),
@@ -381,6 +450,17 @@ def test_attached_humidifier_fixture_has_global_exact_codecs() -> None:
         record,
         SetThermostatMode(zone="SZ3", mode="heat"),
     )
+
+
+def test_attached_humidifier_does_not_choose_between_multiple_zones() -> None:
+    """A global humidifier remains unbound when more than one zone can report humidity."""
+    record = _thermostat()
+    profile = get_profile(record.profile_key)
+    assert profile is not None
+    normalized = cast(NormalizedThermostatState, profile.normalize(record))
+
+    assert normalized.attached_humidifier is not None
+    assert normalized.attached_humidifier.current_humidity is None
 
 
 def test_optional_attached_value_loss_does_not_remove_entities() -> None:

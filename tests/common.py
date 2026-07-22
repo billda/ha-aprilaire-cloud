@@ -211,6 +211,8 @@ def build_thermostat_setup(
         "deviceId": device_id,
         "asOf": "2026-03-24T00:00:02.000Z",
         "type": "thermostat",
+        # The 8920W reports native API temperatures in Celsius even when its
+        # display preference is Fahrenheit.
         "thermostat": {"temperatureUnit": "F"},
         "humidifier": {"installed": humidifier_installed},
         "dehumidifier": {"installed": dehumidifier_installed},
@@ -227,22 +229,22 @@ def build_thermostat_settings(device_id: str = THERMOSTAT_DEVICE_ID) -> dict:
         "asOf": "2026-03-24T00:00:01.000Z",
         "thermostatPZ1": {
             "mode": "heat",
-            "heatSetpoint": 68,
-            "coolSetpoint": 75,
+            "heatSetpoint": 20,
+            "coolSetpoint": 24,
             "fan": "auto",
             "holdType": "permanent",
         },
         "thermostatSZ2": {
             "ModeId": 4,
-            "HeatSetpoint": 66,
-            "CoolSetpoint": 74,
+            "HeatSetpoint": 19,
+            "CoolSetpoint": 23,
             "FanId": 3,
             "HoldType": 1,
         },
         "thermostatSZ3": {
             "mode": "cool",
-            "heatSetpoint": 65,
-            "coolSetpoint": 76,
+            "heatSetpoint": 18,
+            "coolSetpoint": 25,
             "fan": "on",
             "holdType": "none",
         },
@@ -264,9 +266,9 @@ def build_thermostat_status(
         "deviceId": device_id,
         "asOf": "2026-03-24T00:00:03.000Z",
         "zone": zone,
-        "currentTemperature": 70 + offset,
+        "currentTemperature": 21 + offset,
         "currentHumidity": 45 + offset,
-        "outdoorTemperature": 35,
+        "outdoorTemperature": 2,
         "outdoorHumidity": 62,
         "equipmentStatus": equipment_status,
         "hvacServiceRemaining": 88,
@@ -298,7 +300,7 @@ def build_thermostat_initial_messages(device_id: str = THERMOSTAT_DEVICE_ID) -> 
     return [
         build_thermostat_setup(device_id),
         build_thermostat_settings(device_id),
-        build_device_status(device_id, model="8920W"),
+        build_device_status(device_id, model="8920W_GS"),
         build_thermostat_status(device_id, zone="PZ1"),
         build_thermostat_status(device_id, zone="SZ2", equipment_status="idle"),
         build_thermostat_status(device_id, zone="SZ3", equipment_status="cooling"),
@@ -348,6 +350,7 @@ class FakeClient:
         self.patch_release: asyncio.Event | None = None
         self.patch_side_effect: Exception | None = None
         self.patch_side_effects: list[Exception | None] = []
+        self.patch_response: dict = {}
         self.rest_failures: dict[tuple[str, str], Exception] = {}
         self.requested_status_ids: list[str] = []
         self.requested_status_endpoints: list[tuple[str, str]] = []
@@ -374,7 +377,7 @@ class FakeClient:
         if ("device_status", device_id) in self.rest_failures:
             raise self.rest_failures[("device_status", device_id)]
         if any(key.startswith("thermostat") for key in self.device_settings):
-            return build_device_status(device_id, model="8920W")
+            return build_device_status(device_id, model="8920W_GS")
         return build_initial_messages(device_id)[3]
 
     async def async_get_status(self, device_id: str, endpoint: str) -> dict:
@@ -403,7 +406,7 @@ class FakeClient:
             raise self.rest_failures[("device_settings", device_id)]
         return deep_copy(self.device_settings)
 
-    async def async_patch_device_settings(self, device_id: str, payload: dict) -> None:
+    async def async_patch_device_settings(self, device_id: str, payload: dict) -> dict:
         """Pretend a write succeeded."""
         self.patched_payloads.append(deep_copy(payload))
         self.patch_started.set()
@@ -415,7 +418,7 @@ class FakeClient:
                 raise side_effect
         if self.patch_side_effect is not None:
             raise self.patch_side_effect
-        return None
+        return deep_copy(self.patch_response)
 
     def set_remote_settings(self, payload: dict) -> None:
         """Update the fake remote settings payload."""

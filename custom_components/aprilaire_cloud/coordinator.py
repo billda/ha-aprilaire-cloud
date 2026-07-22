@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from functools import partial
 from time import monotonic
 from typing import Any
 
@@ -31,6 +32,7 @@ from .const import (
     LOGGER,
     MAX_PARALLEL_REST_REQUESTS,
     POST_WRITE_CONFIRM_TIMEOUT,
+    POST_WRITE_DEFERRED_RECONCILIATION_DELAYS_SECONDS,
     POST_WRITE_RECONCILIATION_ATTEMPTS,
     POST_WRITE_RECONCILIATION_DELAY_SECONDS,
     UNKNOWN_DEVICE_MESSAGE_MAX_PER_DEVICE,
@@ -145,6 +147,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         self._websockets: dict[str, AprilaireLocationWebSocket] = {}
         self._refresh_event_task: asyncio.Task[None] | None = None
         self._write_states: dict[str, DeviceWriteState] = {}
+        self._write_reconciliation_tasks: set[asyncio.Task[None]] = set()
         self._unknown_device_messages: dict[str, list[tuple[float, dict[str, Any]]]] = {}
         self._last_rest_refresh_at: datetime | None = None
         self._last_websocket_message_at: dict[str, datetime] = {}
@@ -259,6 +262,14 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
             with suppress(asyncio.CancelledError):
                 await self._refresh_event_task
             self._refresh_event_task = None
+        for task in self._write_reconciliation_tasks:
+            task.cancel()
+        if self._write_reconciliation_tasks:
+            await asyncio.gather(
+                *self._write_reconciliation_tasks,
+                return_exceptions=True,
+            )
+            self._write_reconciliation_tasks.clear()
         ir.async_delete_issue(
             self.hass,
             DOMAIN,
@@ -324,7 +335,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         if updated == record:
             return False, False
         self._devices[device_id] = updated
-        self._confirm_inflight_settings(message_type, device_id, updated)
+        self._confirm_inflight_settings(device_id, updated)
         support_changed = (
             updated.supported != record.supported
             or updated.unsupported_reason != record.unsupported_reason
@@ -333,13 +344,10 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
 
     def _confirm_inflight_settings(
         self,
-        message_type: Any,
         device_id: str,
         record: DeviceRecord,
     ) -> None:
-        """Signal a pending write when confirmed by DeviceSettings."""
-        if message_type != "DeviceSettings":
-            return
+        """Signal a pending write after any authoritative state observation."""
         write_state = self._write_states.get(device_id)
         profile = get_profile(record.profile_key)
         if (
@@ -406,7 +414,6 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         write_state.pending_paths = tuple(sorted(pending_paths))
         self._publish_snapshot()
 
-        should_raise = False
         try:
             async with write_state.lock:
                 if not self._pending_payload_is_current(device_id, payload):
@@ -446,10 +453,13 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
                                 POST_WRITE_RECONCILIATION_DELAY_SECONDS
                             )
 
-                    should_raise = True
+                    LOGGER.debug(
+                        "Device write accepted but not yet observed; deferring checks"
+                    )
+                    self._schedule_write_reconciliation(device_id, encoded)
+                    return
         except (AprilaireCloudApiError, AprilaireCloudCommunicationError):
-            should_raise = should_raise or self._pending_payload_is_current(device_id, payload)
-            if should_raise:
+            if self._pending_payload_is_current(device_id, payload):
                 self._clear_pending_device_settings(device_id, payload)
                 self._sync_write_state(device_id, confirmed_settings=None)
                 self._publish_snapshot()
@@ -462,11 +472,68 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
             write_state.inflight_event = None
             self._sync_write_state(device_id, confirmed_settings=None)
 
-        if should_raise:
+    def _schedule_write_reconciliation(
+        self,
+        device_id: str,
+        encoded: EncodedCommand,
+    ) -> None:
+        """Continue checking a 2xx-accepted write outside the HA service call."""
+        task = self.hass.async_create_task(
+            self._async_reconcile_accepted_write(device_id, encoded)
+        )
+        self._write_reconciliation_tasks.add(task)
+        task.add_done_callback(self._write_reconciliation_tasks.discard)
+
+    async def _async_reconcile_accepted_write(
+        self,
+        device_id: str,
+        encoded: EncodedCommand,
+    ) -> None:
+        """Bound deferred reads and eventually clear an unconfirmed override."""
+        payload = encoded.payload
+        payload_paths = format_leaf_paths(payload)
+        for delay in POST_WRITE_DEFERRED_RECONCILIATION_DELAYS_SECONDS:
+            await asyncio.sleep(delay)
+            if not self._pending_payload_is_current(device_id, payload):
+                return
+            write_state = self._write_states.get(device_id)
+            if write_state is None:
+                return
+            try:
+                async with write_state.lock:
+                    if not self._pending_payload_is_current(device_id, payload):
+                        return
+                    await self._async_refresh_device_settings(device_id)
+                    self._publish_snapshot()
+            except (
+                AprilaireCloudAuthenticationError,
+                AprilaireCloudApiError,
+                AprilaireCloudCommunicationError,
+            ):
+                LOGGER.debug(
+                    "Deferred device write reconciliation failed for paths: %s",
+                    payload_paths,
+                )
+                continue
+
+            record = self._devices.get(device_id)
+            profile = get_profile(record.profile_key) if record else None
+            if (
+                record is not None
+                and profile is not None
+                and profile.command_confirmed(record, encoded.command)
+            ):
+                LOGGER.debug("Device write confirmed during deferred reconciliation")
+                return
+
+        if self._pending_payload_is_current(device_id, payload):
             self._clear_pending_device_settings(device_id, payload)
             self._sync_write_state(device_id, confirmed_settings=None)
             self._publish_snapshot()
-            raise AprilaireCloudWriteError("AprilAire did not confirm updated settings")
+            LOGGER.warning(
+                "Accepted device write remained unconfirmed for paths: %s",
+                payload_paths,
+            )
 
     def _build_snapshot(self) -> AprilaireSnapshot:
         """Build an immutable snapshot for entities."""
@@ -674,12 +741,12 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
     async def _capture_rest_result(
         self,
         semaphore: asyncio.Semaphore,
-        request: Awaitable[dict[str, Any]],
+        request_factory: Callable[[], Awaitable[dict[str, Any]]],
     ) -> dict[str, Any] | Exception:
-        """Run one bounded REST request and retain only typed failures."""
+        """Create and run one bounded REST request, retaining typed failures."""
         try:
             async with semaphore:
-                return await request
+                return await request_factory()
         except (
             AprilaireCloudApiError,
             AprilaireCloudAuthenticationError,
@@ -696,10 +763,12 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         """Hydrate one device in critical then profile-specific stages."""
         status_result, settings_result = await asyncio.gather(
             self._capture_rest_result(
-                semaphore, self.client.async_get_device_status(device_id)
+                semaphore,
+                partial(self.client.async_get_device_status, device_id),
             ),
             self._capture_rest_result(
-                semaphore, self.client.async_get_device_settings(device_id)
+                semaphore,
+                partial(self.client.async_get_device_settings, device_id),
             ),
         )
         if device_id not in self._devices:
@@ -720,7 +789,11 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
             *(
                 self._capture_rest_result(
                     semaphore,
-                    self.client.async_get_status(device_id, request.endpoint),
+                    partial(
+                        self.client.async_get_status,
+                        device_id,
+                        request.endpoint,
+                    ),
                 )
                 for request in requests
             )
@@ -995,6 +1068,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         write_state.pending_paths = format_leaf_paths(record.pending_device_settings)
         if confirmed_settings is not None:
             write_state.last_confirmed_settings = deepcopy(confirmed_settings)
+        self._confirm_inflight_settings(device_id, record)
         if (
             not write_state.pending_paths
             and not write_state.inflight_paths
