@@ -58,8 +58,9 @@ allowlist. It does not imply that every Healthy Air device is compatible.
 
 ### Beta Thermostat Support
 
-Thermostat support is beta. Community testing on 8920W hardware (reported by
-the API as `8920W` or `8920W_GS`) confirms:
+Thermostat support is beta. Community testing on 8920W hardware, together with
+compatibility captures using exact `8920W` and `8920W_GS` protocol identifiers,
+confirms:
 
 - climate entities for zones `PZ1`, `SZ2`, and `SZ3` when those zones are reported
 - indoor temperature/humidity from the reported sensor arrays, including
@@ -70,18 +71,28 @@ the API as `8920W` or `8920W_GS`) confirms:
 - off, heat, cool, and auto mode writes;
 - `auto`, `on`, and `circulate` fan writes;
 - `none`, `temporary`, `permanent`, and `vacation` hold writes;
-- current fan mode and read-only heat/cool setpoints;
+- current fan mode and heat/cool setpoints;
 - separate indoor-temperature, indoor-humidity, heat-setpoint, and
   cool-setpoint sensors;
 - read-only outdoor, equipment, service, and explicitly installed IAQ state
   when reported.
 
-Heat and cool setpoints are displayed, but setpoint writes are deliberately
-disabled: the PATCH unit and heat/cool deadband have not been proven. The
-integration does not infer temperature units from numeric thresholds. For the
-confirmed 8920W identifiers it marks the payload as native Celsius and lets
-Home Assistant perform display conversion; temperature values from an unknown
-model/unit contract are withheld rather than mislabeled.
+Setpoint writes are enabled only for an exact `8920W` or `8920W_GS` API model
+with `manage` access, exactly one reported zone, an explicit Fahrenheit
+thermostat display preference, native-Celsius zone values, the captured
+`heat`/`cool` settings keys, and Home Assistant configured to display
+Fahrenheit. The integration snaps requests to the thermostat's
+whole-Fahrenheit grid, sends an atomic heat/cool pair in native Celsius at
+two-decimal precision, enforces the reported per-side limits (heat 40–90°F;
+cool 50–93°F), and rejects a pair with less than 3°F separation without moving
+the companion target. A setpoint change made while a schedule is active may
+cause the thermostat to enter a temporary hold until the next schedule period.
+
+Celsius-display setpoint writes, Home Assistant installations configured for
+Celsius, legacy setpoint-key aliases, all multi-zone contracts, and unknown
+models remain read-only. The integration does not infer temperature units from
+numeric thresholds. Home Assistant performs presentation conversion for the
+native-Celsius values.
 
 An explicitly installed thermostat-attached humidifier receives one
 thermostat-global humidifier entity rather than being assigned to an arbitrary
@@ -125,6 +136,14 @@ Recommended for most users.
 8. Enter the same email address and password you use in the AprilAire Healthy Air app.
 
 You can also use the My Home Assistant button above to open the repository directly in HACS.
+
+#### Opt In To Beta Releases
+
+HACS prereleases are opt-in. Enable the disabled-by-default prerelease switch
+for the AprilAire Cloud repository, then use `Redownload` and select the beta
+version under `Need a different version?`. Restart Home Assistant after the
+download. You can turn the prerelease switch off again to return to stable-only
+update notifications.
 
 ### Manual
 
@@ -207,8 +226,15 @@ For a confirmed 8920W contract and `manage` account access:
 - set HVAC mode to off, heat, cool, or heat/cool auto
 - set fan mode
 - set hold/preset mode
+- set heat and cool targets when exactly one zone explicitly reports the
+  Fahrenheit-display/native-Celsius `heat`/`cool` contract and Home Assistant
+  is configured for Fahrenheit
 
-Temperature setpoint, schedule, and emergency-heat writes are disabled. An
+Setpoint changes use whole-Fahrenheit steps, carry forward the latest locally
+requested or authoritative companion target, and fail locally if the resulting
+pair violates the captured limits or 3°F deadband. The integration does not
+imitate the app's automatic companion movement. Schedule editing and
+emergency-heat writes remain disabled. An
 explicitly installed attached humidifier can expose power and humidity-target
 controls plus reported water-panel service state. Other attached IAQ equipment
 is read-only.
@@ -231,7 +257,12 @@ Commands such as turning the device on or changing target humidity are sent with
 The cloud can accept a write before the new value becomes observable. After a
 successful PATCH, the integration performs bounded immediate checks and then
 continues a short, owned background reconciliation instead of reporting a
-false service-call failure. Explicit PATCH errors still fail immediately.
+false service-call failure. Explicit PATCH errors still fail immediately. A
+complete, causally newer settings observation can also be decisive: matching
+state confirms the command. For the evidence-gated setpoint contract only, the
+beta infers a sanitized rejection from a clean mismatch that changes no
+unrelated setting, and removes the optimistic value even when PATCH returned
+HTTP 200. Other mismatches remain inconclusive and use bounded reconciliation.
 
 ### Authentication
 

@@ -61,13 +61,14 @@
       "payload_kind": "full"
     },
     "thermostat_8920w_settings.json": {
-      "source": "community report and pull request 5",
+      "source": "community report, pull request 5, and issue 8 setpoint report",
       "evidence": "live_confirmed",
       "app_version": "unknown",
-      "device_model": "8920W",
-      "firmware": "unknown",
+      "device_model": "8920W hardware; raw API model not captured in issue 8",
+      "firmware": "3.04.5 reported in issue 8",
       "transport": "DeviceSettings",
-      "payload_kind": "captured shape"
+      "payload_kind": "captured shape",
+      "establishes": "exact heat/cool keys with native-Celsius values; issue 8 supplies atomic two-decimal Fahrenheit-display write examples labeled as fork_code plus live-tested limits and deadband"
     },
     "thermostat_8920w_zone_status.json": {
       "source": "community report, pull request 5, issue 8, and reporter fork 0.4.0b branch",
@@ -148,6 +149,10 @@
   ],
   "unknown": [
     "post-login registration request and response body contract",
-    "safe target or dew-point write semantics for externally controlled dehumidifiers"
+    "safe target or dew-point write semantics for externally controlled dehumidifiers",
+    "raw API model and authoritative asOf sequence for the issue 8 setpoint capture",
+    "Celsius-display thermostat setpoint PATCH contract",
+    "whether both heat and cool values are mandatory in every thermostat mode",
+    "correctly labeled companion-setpoint movement at the 3 F boundary"
   ]
 }

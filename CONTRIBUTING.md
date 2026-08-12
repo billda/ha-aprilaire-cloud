@@ -56,10 +56,18 @@ If you are testing with a model other than the AprilAire E100W, please report:
 - whether an offline/recovery cycle changed only that device's availability
 
 Do not test a control that Home Assistant does not advertise. Thermostat
-temperature setpoint writes remain disabled pending evidence for PATCH units,
-limits, and deadband. On confirmed `8920W`/`8920W_GS` contracts, readings and
-read-only setpoints are native Celsius even when the thermostat is configured
-to display Fahrenheit; Home Assistant should perform that display conversion.
+setpoint writes are available only for exact `8920W`/`8920W_GS` contracts with
+`manage` access, exactly one reported zone, an explicit Fahrenheit thermostat
+display preference, native-Celsius values, exact `heat`/`cool` keys, and Home
+Assistant configured for Fahrenheit. Home Assistant performs display
+conversion. Celsius-display devices, Celsius-configured Home Assistant
+installations, legacy setpoint aliases, unknown models, multi-zone contracts,
+incomplete zone contracts, and read-only accounts must remain read-only.
+
+For the enabled beta contract, test only safe values within the reported
+40–90°F heat and 50–93°F cool ranges. Keep at least 3°F between targets and
+restore the original targets and schedule/hold state after testing. Setpoint
+changes during a schedule may put the thermostat into a temporary hold.
 
 ## Bug Reports
 
