@@ -11,3 +11,9 @@ dist/
 build/
 *.egg-info/
 *.pyc
+
+# Local secrets and runtime state
+.env.*
+!.env.example
+*.pem
+*.key
