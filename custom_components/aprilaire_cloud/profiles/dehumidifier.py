@@ -364,6 +364,10 @@ class DehumidifierProfile:
             return state.high_humidity_alert_limit == command.humidity
         return False
 
+    def mismatch_is_rejection(self, command: DeviceCommand) -> bool:
+        """Keep mismatches inconclusive without dehumidifier negative-ack evidence."""
+        return False
+
     @staticmethod
     def _validate_range(value: float, capability: CommandCapability) -> None:
         """Validate an observed numeric constraint."""

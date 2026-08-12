@@ -57,6 +57,7 @@ from .profiles import (
 )
 from .state import (
     DeviceWriteState,
+    WriteOutcome,
     apply_confirmed_device_settings,
     apply_device_message,
     apply_full_device_settings,
@@ -67,7 +68,10 @@ from .state import (
     clear_pending_device_settings,
     evaluate_device_support,
     format_leaf_paths,
+    parse_vendor_timestamp,
     pending_payload_is_current,
+    settings_changed_outside_payload,
+    settings_cover_payload,
 )
 from .vendor import (
     AprilaireCloudApiClient,
@@ -335,28 +339,65 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         if updated == record:
             return False, False
         self._devices[device_id] = updated
-        self._confirm_inflight_settings(device_id, updated)
+        if message_type == "DeviceSettings":
+            self._observe_inflight_settings(
+                device_id,
+                updated,
+                message,
+                source=StateSource.WEBSOCKET,
+            )
         support_changed = (
             updated.supported != record.supported
             or updated.unsupported_reason != record.unsupported_reason
         )
         return True, support_changed
 
-    def _confirm_inflight_settings(
+    def _observe_inflight_settings(
         self,
         device_id: str,
         record: DeviceRecord,
+        observation: dict[str, Any],
+        *,
+        source: StateSource,
     ) -> None:
-        """Signal a pending write after any authoritative state observation."""
+        """Classify a complete, causally newer authoritative settings observation."""
         write_state = self._write_states.get(device_id)
         profile = get_profile(record.profile_key)
         if (
-            write_state is not None
-            and write_state.inflight_event is not None
-            and write_state.inflight_command is not None
-            and profile is not None
-            and profile.command_confirmed(record, write_state.inflight_command)
+            write_state is None
+            or write_state.inflight_event is None
+            or write_state.inflight_command is None
+            or write_state.inflight_outcome is not WriteOutcome.UNKNOWN
+            or profile is None
+            or not settings_cover_payload(observation, write_state.inflight_expected)
         ):
+            return
+
+        observed_at = parse_vendor_timestamp(observation.get("asOf"))
+        current_version = record.versions.get("device_settings")
+        baseline_version = write_state.inflight_baseline_version
+        if (
+            observed_at is None
+            or current_version is None
+            or current_version.as_of != observed_at
+            or current_version.source is not source
+            or baseline_version is None
+            or baseline_version.as_of is None
+            or observed_at <= baseline_version.as_of
+        ):
+            return
+
+        if profile.command_confirmed(record, write_state.inflight_command):
+            write_state.inflight_outcome = WriteOutcome.CONFIRMED
+        elif profile.mismatch_is_rejection(
+            write_state.inflight_command
+        ) and not settings_changed_outside_payload(
+            write_state.inflight_baseline_settings,
+            record.device_settings,
+            write_state.inflight_expected,
+        ):
+            write_state.inflight_outcome = WriteOutcome.REJECTED
+        if write_state.inflight_outcome is not WriteOutcome.UNKNOWN:
             write_state.inflight_event.set()
 
     async def async_socket_state_changed(self, state: SocketState) -> None:
@@ -394,49 +435,96 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         profile = get_profile(record.profile_key)
         if profile is None:
             raise AprilaireCloudWriteError("AprilAire device profile is unavailable")
-        encoded = profile.encode_command(record, command)
-        await self._async_write_device_settings(device_id, encoded)
+        await self._async_write_device_settings(device_id, command)
 
     async def _async_write_device_settings(
         self,
         device_id: str,
-        encoded: EncodedCommand,
+        command: DeviceCommand,
     ) -> None:
-        """Write one validated command and reconcile normalized intent."""
-        payload = encoded.payload
+        """Serialize, encode, and reconcile one validated domain command."""
         write_state = self._write_states.setdefault(device_id, DeviceWriteState())
-        payload_paths = format_leaf_paths(payload)
-        LOGGER.debug("Device write started for paths: %s", payload_paths)
-        self._apply_pending_device_settings(device_id, payload)
-        self._sync_write_state(device_id, confirmed_settings=None)
-        pending_paths = set(write_state.pending_paths)
-        pending_paths.update(payload_paths)
-        write_state.pending_paths = tuple(sorted(pending_paths))
-        self._publish_snapshot()
+        write_state.active_writers += 1
+        owner = object()
+        payload: dict[str, Any] | None = None
+        payload_paths: tuple[str, ...] = ()
+        encoded: EncodedCommand | None = None
+        owns_inflight = False
 
         try:
             async with write_state.lock:
-                if not self._pending_payload_is_current(device_id, payload):
-                    return
+                record = self._devices.get(device_id)
+                if record is None:
+                    raise AprilaireCloudWriteError("AprilAire device is unavailable")
+                profile = get_profile(record.profile_key)
+                if profile is None:
+                    raise AprilaireCloudWriteError(
+                        "AprilAire device profile is unavailable"
+                    )
+                encoded = profile.encode_command(record, command)
+                payload = encoded.payload
+                payload_paths = format_leaf_paths(payload)
+                LOGGER.debug("Device write started for paths: %s", payload_paths)
+                self._apply_pending_device_settings(device_id, payload)
+                self._sync_write_state(device_id, confirmed_settings=None)
+                pending_paths = set(write_state.pending_paths)
+                pending_paths.update(payload_paths)
+                write_state.pending_paths = tuple(sorted(pending_paths))
+                self._publish_snapshot()
 
                 inflight_event = asyncio.Event()
                 write_state.inflight_paths = payload_paths
                 write_state.inflight_expected = deepcopy(payload)
                 write_state.inflight_command = encoded.command
+                write_state.inflight_owner = owner
+                write_state.inflight_baseline_version = (
+                    record.versions.get("device_settings")
+                )
+                write_state.inflight_baseline_settings = deepcopy(
+                    record.device_settings
+                )
+                write_state.inflight_outcome = WriteOutcome.UNKNOWN
                 write_state.inflight_event = inflight_event
+                owns_inflight = True
 
                 await self.client.async_patch_device_settings(device_id, payload)
                 try:
                     await asyncio.wait_for(
                         inflight_event.wait(), timeout=POST_WRITE_CONFIRM_TIMEOUT
                     )
-                    LOGGER.debug("Device write confirmed via WebSocket")
-                    return
+                    if write_state.inflight_outcome is WriteOutcome.CONFIRMED:
+                        self._clear_pending_device_settings(device_id, payload)
+                        self._sync_write_state(device_id, confirmed_settings=None)
+                        self._publish_snapshot()
+                        LOGGER.debug("Device write confirmed via WebSocket")
+                        return
+                    if write_state.inflight_outcome is WriteOutcome.REJECTED:
+                        LOGGER.warning(
+                            "AprilAire did not apply a settings write for paths: %s",
+                            payload_paths,
+                        )
+                        raise AprilaireCloudWriteError(
+                            "AprilAire did not apply the requested settings"
+                        )
                 except TimeoutError:
                     LOGGER.debug("Device write confirmation timed out; checking REST")
                     for attempt in range(POST_WRITE_RECONCILIATION_ATTEMPTS):
                         await self._async_refresh_device_settings(device_id)
                         self._publish_snapshot()
+                        if write_state.inflight_outcome is WriteOutcome.REJECTED:
+                            LOGGER.warning(
+                                "AprilAire did not apply a settings write for paths: %s",
+                                payload_paths,
+                            )
+                            raise AprilaireCloudWriteError(
+                                "AprilAire did not apply the requested settings"
+                            ) from None
+                        if write_state.inflight_outcome is WriteOutcome.CONFIRMED:
+                            self._clear_pending_device_settings(device_id, payload)
+                            self._sync_write_state(device_id, confirmed_settings=None)
+                            self._publish_snapshot()
+                            LOGGER.debug("Device write confirmed via REST")
+                            return
                         record = self._devices.get(device_id)
                         profile = get_profile(record.profile_key) if record else None
                         if (
@@ -444,6 +532,9 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
                             and profile is not None
                             and profile.command_confirmed(record, encoded.command)
                         ):
+                            self._clear_pending_device_settings(device_id, payload)
+                            self._sync_write_state(device_id, confirmed_settings=None)
+                            self._publish_snapshot()
                             LOGGER.debug("Device write confirmed via REST")
                             return
                         if not self._pending_payload_is_current(device_id, payload):
@@ -458,18 +549,29 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
                     )
                     self._schedule_write_reconciliation(device_id, encoded)
                     return
-        except (AprilaireCloudApiError, AprilaireCloudCommunicationError):
-            if self._pending_payload_is_current(device_id, payload):
+        except asyncio.CancelledError:
+            if payload is not None and self._pending_payload_is_current(device_id, payload):
                 self._clear_pending_device_settings(device_id, payload)
                 self._sync_write_state(device_id, confirmed_settings=None)
                 self._publish_snapshot()
-                raise
-            return
+            raise
+        except (AprilaireCloudApiError, AprilaireCloudCommunicationError):
+            if payload is not None:
+                self._clear_pending_device_settings(device_id, payload)
+                self._sync_write_state(device_id, confirmed_settings=None)
+                self._publish_snapshot()
+            raise
         finally:
-            write_state.inflight_paths = ()
-            write_state.inflight_expected = {}
-            write_state.inflight_command = None
-            write_state.inflight_event = None
+            if owns_inflight and write_state.inflight_owner is owner:
+                write_state.inflight_paths = ()
+                write_state.inflight_expected = {}
+                write_state.inflight_command = None
+                write_state.inflight_baseline_version = None
+                write_state.inflight_baseline_settings = {}
+                write_state.inflight_owner = None
+                write_state.inflight_outcome = WriteOutcome.UNKNOWN
+                write_state.inflight_event = None
+            write_state.active_writers -= 1
             self._sync_write_state(device_id, confirmed_settings=None)
 
     def _schedule_write_reconciliation(
@@ -523,6 +625,9 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
                 and profile is not None
                 and profile.command_confirmed(record, encoded.command)
             ):
+                self._clear_pending_device_settings(device_id, payload)
+                self._sync_write_state(device_id, confirmed_settings=None)
+                self._publish_snapshot()
                 LOGGER.debug("Device write confirmed during deferred reconciliation")
                 return
 
@@ -568,6 +673,12 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
             apply_confirmed_device_settings(record, settings)
         )
         self._sync_write_state(device_id, confirmed_settings=settings)
+        self._observe_inflight_settings(
+            device_id,
+            self._devices[device_id],
+            settings,
+            source=StateSource.WEBSOCKET,
+        )
 
     def _apply_full_device_settings(self, device_id: str, settings: dict[str, Any]) -> None:
         """Replace confirmed remote settings from a REST settings payload."""
@@ -578,6 +689,12 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
             apply_full_device_settings(record, settings)
         )
         self._sync_write_state(device_id, confirmed_settings=settings)
+        self._observe_inflight_settings(
+            device_id,
+            self._devices[device_id],
+            settings,
+            source=StateSource.REST,
+        )
 
     def _clear_pending_device_settings(self, device_id: str, payload: dict[str, Any]) -> None:
         """Remove matching optimistic override paths from the pending layer."""
@@ -827,10 +944,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         if isinstance(settings_result, Exception):
             errors.append(settings_result)
         else:
-            self._devices[device_id] = evaluate_device_support(
-                apply_full_device_settings(self._devices[device_id], settings_result)
-            )
-            self._sync_write_state(device_id, confirmed_settings=settings_result)
+            self._apply_full_device_settings(device_id, settings_result)
             progressed = True
         return progressed, errors
 
@@ -1068,11 +1182,11 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         write_state.pending_paths = format_leaf_paths(record.pending_device_settings)
         if confirmed_settings is not None:
             write_state.last_confirmed_settings = deepcopy(confirmed_settings)
-        self._confirm_inflight_settings(device_id, record)
         if (
             not write_state.pending_paths
             and not write_state.inflight_paths
             and write_state.inflight_event is None
+            and write_state.active_writers == 0
         ):
             self._write_states.pop(device_id, None)
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from math import floor, isclose
 from typing import Any
 
 from ..models import DeviceRecord
@@ -70,6 +71,14 @@ _CONFIRMED_8920W_FANS = ("auto", "on", "circulate")
 _CONFIRMED_8920W_HOLDS = ("none", "temporary", "permanent", "vacation")
 _CONFIRMED_8920W_MODELS = frozenset({"8920W", "8920W_GS"})
 _CONFIRMED_8920W_NATIVE_TEMPERATURE_UNIT = "C"
+_CONFIRMED_8920W_DISPLAY_TEMPERATURE_UNIT = "F"
+_CONFIRMED_8920W_HEAT_RANGE_F = (40, 90)
+_CONFIRMED_8920W_COOL_RANGE_F = (50, 93)
+_CONFIRMED_8920W_DEADBAND_F = 3
+_CONFIRMED_8920W_STEP_C = 5 / 9
+_TEMPERATURE_WIRE_DECIMALS = 2
+_TEMPERATURE_CONFIRM_ABS_TOLERANCE_C = 0.011
+_TEMPERATURE_WIRE_RANGE_TOLERANCE_F = 0.02
 _ACTIVE_HEATING_STATUSES = frozenset({"active", "heating", "on", "stage1"})
 _ACTIVE_COOLING_STATUSES = frozenset({"active", "cooling", "on", "stage1"})
 _INACTIVE_OPERATING_STATUSES = frozenset({"idle", "inactive", "off"})
@@ -102,8 +111,7 @@ class _EnumSettingCodec:
 
 
 _MODE_CODEC = _EnumSettingCodec("mode", "ModeId", _MODE_ID_BY_VALUE, "thermostat mode")
-_FAN_CODEC = _EnumSettingCodec("fan", "FanId", _FAN_ID_BY_VALUE, "fan mode")
-_FAN_GS_CODEC = _EnumSettingCodec(
+_FAN_CODEC = _EnumSettingCodec(
     "fan",
     "FanId",
     _FAN_ID_BY_VALUE,
@@ -350,6 +358,47 @@ def _zone_mapping(record: DeviceRecord, zone: str) -> tuple[str, dict[str, Any],
     )
 
 
+def _authoritative_zone_settings(record: DeviceRecord, zone: str) -> dict[str, Any]:
+    """Return confirmed settings for a zone without optimistic overlays."""
+    settings = record.device_settings.get(thermostat_status_key_for_zone(zone))
+    return settings if isinstance(settings, dict) else {}
+
+
+def _effective_zone_settings(record: DeviceRecord, zone: str) -> dict[str, Any]:
+    """Return the latest confirmed or locally pending settings for a zone."""
+    settings = record.effective_device_settings.get(
+        thermostat_status_key_for_zone(zone)
+    )
+    return settings if isinstance(settings, dict) else {}
+
+
+def _has_confirmed_setpoint_contract(
+    record: DeviceRecord,
+    zones: tuple[str, ...],
+) -> bool:
+    """Return whether the exposed zone has the captured Fahrenheit contract."""
+    if (
+        len(zones) != 1
+        or _thermostat_model(record) not in _CONFIRMED_8920W_MODELS
+        or _display_temperature_unit(record)
+        != _CONFIRMED_8920W_DISPLAY_TEMPERATURE_UNIT
+    ):
+        return False
+    for zone in zones:
+        settings = _authoritative_zone_settings(record, zone)
+        _, _, status = _zone_mapping(record, zone)
+        if (
+            _native_temperature_unit(record, settings, status)
+            != _CONFIRMED_8920W_NATIVE_TEMPERATURE_UNIT
+            or "heat" not in settings
+            or "cool" not in settings
+            or coerce_float(settings["heat"]) is None
+            or coerce_float(settings["cool"]) is None
+        ):
+            return False
+    return True
+
+
 def _numeric_from(primary: dict[str, Any], fallback: dict[str, Any], *keys: str) -> float | None:
     """Return a numeric first-present value from two payloads."""
     return coerce_float(
@@ -377,6 +426,31 @@ def _native_temperature_unit(
     if _thermostat_model(record) in _CONFIRMED_8920W_MODELS:
         return _CONFIRMED_8920W_NATIVE_TEMPERATURE_UNIT
     return explicit_temperature_unit(settings, status)
+
+
+def _display_temperature_unit(record: DeviceRecord) -> str | None:
+    """Return only the thermostat's explicit display preference."""
+    return explicit_temperature_unit(record.device_setup)
+
+
+def _fahrenheit_to_celsius(value: float) -> float:
+    """Convert a Fahrenheit contract value to native Celsius."""
+    return (value - 32) * 5 / 9
+
+
+def _celsius_to_fahrenheit(value: float) -> float:
+    """Convert a native Celsius value to the display contract."""
+    return value * 9 / 5 + 32
+
+
+def _fahrenheit_grid(value: float) -> int:
+    """Return the nearest whole-Fahrenheit thermostat grid value."""
+    return floor(_celsius_to_fahrenheit(value) + 0.5)
+
+
+def _wire_celsius_from_fahrenheit(value: int) -> float:
+    """Encode a whole-Fahrenheit setpoint using the observed wire precision."""
+    return round(_fahrenheit_to_celsius(value), _TEMPERATURE_WIRE_DECIMALS)
 
 
 def _derive_operating_state(
@@ -645,6 +719,7 @@ class ThermostatProfile:
         allowed: tuple[str, ...] = ()
         minimum: float | None = None
         maximum: float | None = None
+        step: float | None = None
         unit: str | None = None
         evidence = EvidenceLevel.LIVE_CONFIRMED
         if command_type is CommandType.THERMOSTAT_MODE:
@@ -669,11 +744,14 @@ class ThermostatProfile:
             )
             allowed = _CONFIRMED_8920W_HOLDS if available else ()
         elif command_type is CommandType.THERMOSTAT_SETPOINTS:
-            # Community captures establish readable heat/cool keys, but not the
-            # PATCH unit and deadband contract. Keep the write disabled until
-            # both are captured and manually validated.
+            available = _has_confirmed_setpoint_contract(record, zones)
             reason = "temperature_patch_contract_unconfirmed"
-            evidence = EvidenceLevel.UNKNOWN
+            evidence = EvidenceLevel.CAPTURED
+            if available:
+                minimum = _fahrenheit_to_celsius(_CONFIRMED_8920W_HEAT_RANGE_F[0])
+                maximum = _fahrenheit_to_celsius(_CONFIRMED_8920W_COOL_RANGE_F[1])
+                step = _CONFIRMED_8920W_STEP_C
+                unit = _CONFIRMED_8920W_NATIVE_TEMPERATURE_UNIT
         elif command_type is CommandType.ATTACHED_HUMIDIFIER_POWER:
             settings = record.effective_device_settings.get("humidifier")
             available = (
@@ -698,6 +776,7 @@ class ThermostatProfile:
             unavailable_reason=access_reason or (None if available else reason),
             minimum=minimum,
             maximum=maximum,
+            step=step,
             unit=unit,
             allowed_values=allowed,
         )
@@ -716,6 +795,7 @@ class ThermostatProfile:
                 capability.unavailable_reason if capability else "unsupported command"
             )
         payload: dict[str, Any]
+        encoded_command = command
         if isinstance(command, SetAttachedHumidifierPower):
             payload = {"humidifier": {"mode": "on" if command.enabled else "off"}}
         elif isinstance(command, SetAttachedHumidifierTarget):
@@ -734,9 +814,15 @@ class ThermostatProfile:
             payload = {
                 thermostat_status_key_for_zone(command.zone): zone_payload
             }
+            if isinstance(command, SetThermostatSetpoints):
+                encoded_command = SetThermostatSetpoints(
+                    zone=command.zone,
+                    heat=zone_payload["heat"],
+                    cool=zone_payload["cool"],
+                )
         else:
             raise CommandNotSupportedError("command belongs to another profile")
-        return EncodedCommand(payload=payload, command=command)
+        return EncodedCommand(payload=payload, command=encoded_command)
 
     def _encode_zone_command(
         self,
@@ -763,11 +849,7 @@ class ThermostatProfile:
                 settings,
                 value=command.mode,
                 allowed_values=capability.allowed_values,
-                codec=(
-                    _FAN_GS_CODEC
-                    if _thermostat_model(record) == "8920W_GS"
-                    else _FAN_CODEC
-                ),
+                codec=_FAN_CODEC,
             )
         if isinstance(command, SetThermostatHold):
             return self._encode_enum_setting(
@@ -776,7 +858,89 @@ class ThermostatProfile:
                 allowed_values=capability.allowed_values,
                 codec=_HOLD_CODEC,
             )
-        raise CommandNotSupportedError("temperature patch contract is unconfirmed")
+        if isinstance(command, SetThermostatSetpoints):
+            return self._encode_setpoint_pair(record, command)
+        raise CommandNotSupportedError("unsupported thermostat command")
+
+    @staticmethod
+    def _encode_setpoint_pair(
+        record: DeviceRecord,
+        command: SetThermostatSetpoints,
+    ) -> dict[str, Any]:
+        """Encode one safe atomic heat/cool pair for the captured 8920W contract."""
+        settings = _effective_zone_settings(record, command.zone)
+        current_heat = coerce_float(settings.get("heat"))
+        current_cool = coerce_float(settings.get("cool"))
+        if current_heat is None or current_cool is None:
+            raise CommandNotSupportedError("authoritative heat/cool setpoints are unavailable")
+        if command.heat is None and command.cool is None:
+            raise CommandValidationError("at least one thermostat setpoint is required")
+
+        heat = (
+            round(current_heat, _TEMPERATURE_WIRE_DECIMALS)
+            if command.heat is None
+            else ThermostatProfile._requested_setpoint(
+                command.heat,
+                limits=_CONFIRMED_8920W_HEAT_RANGE_F,
+                label="heat",
+            )
+        )
+        cool = (
+            round(current_cool, _TEMPERATURE_WIRE_DECIMALS)
+            if command.cool is None
+            else ThermostatProfile._requested_setpoint(
+                command.cool,
+                limits=_CONFIRMED_8920W_COOL_RANGE_F,
+                label="cool",
+            )
+        )
+        ThermostatProfile._validate_setpoint_range(
+            heat,
+            limits=_CONFIRMED_8920W_HEAT_RANGE_F,
+            label="heat",
+        )
+        ThermostatProfile._validate_setpoint_range(
+            cool,
+            limits=_CONFIRMED_8920W_COOL_RANGE_F,
+            label="cool",
+        )
+        if _fahrenheit_grid(cool) - _fahrenheit_grid(heat) < _CONFIRMED_8920W_DEADBAND_F:
+            raise CommandValidationError(
+                "heat and cool setpoints must be separated by at least 3°F"
+            )
+        return {"heat": heat, "cool": cool}
+
+    @staticmethod
+    def _requested_setpoint(
+        value: float,
+        *,
+        limits: tuple[int, int],
+        label: str,
+    ) -> float:
+        """Resolve one native-C request to the whole-Fahrenheit setpoint grid."""
+        number = coerce_float(value)
+        if number is None:
+            raise CommandValidationError(f"{label} setpoint must be finite")
+        ThermostatProfile._validate_setpoint_range(number, limits=limits, label=label)
+        return _wire_celsius_from_fahrenheit(_fahrenheit_grid(number))
+
+    @staticmethod
+    def _validate_setpoint_range(
+        value: float,
+        *,
+        limits: tuple[int, int],
+        label: str,
+    ) -> None:
+        """Validate one native-C value against a captured Fahrenheit range."""
+        fahrenheit = _celsius_to_fahrenheit(value)
+        if fahrenheit < limits[0] - _TEMPERATURE_WIRE_RANGE_TOLERANCE_F:
+            raise CommandValidationError(
+                f"{label} setpoint is below the supported {limits[0]}°F minimum"
+            )
+        if fahrenheit > limits[1] + _TEMPERATURE_WIRE_RANGE_TOLERANCE_F:
+            raise CommandValidationError(
+                f"{label} setpoint is above the supported {limits[1]}°F maximum"
+            )
 
     @staticmethod
     def _encode_enum_setting(
@@ -824,11 +988,34 @@ class ThermostatProfile:
             if zone is not None:
                 if isinstance(command, SetThermostatMode):
                     confirmed = zone.raw_mode == command.mode
+                elif isinstance(command, SetThermostatSetpoints):
+                    confirmed = (
+                        command.heat is not None
+                        and command.cool is not None
+                        and zone.heat_setpoint is not None
+                        and zone.cool_setpoint is not None
+                        and isclose(
+                            zone.heat_setpoint,
+                            command.heat,
+                            rel_tol=0,
+                            abs_tol=_TEMPERATURE_CONFIRM_ABS_TOLERANCE_C,
+                        )
+                        and isclose(
+                            zone.cool_setpoint,
+                            command.cool,
+                            rel_tol=0,
+                            abs_tol=_TEMPERATURE_CONFIRM_ABS_TOLERANCE_C,
+                        )
+                    )
                 elif isinstance(command, SetThermostatFan):
                     confirmed = zone.raw_fan == command.mode
                 elif isinstance(command, SetThermostatHold):
                     confirmed = zone.raw_hold_type == command.hold
         return confirmed
+
+    def mismatch_is_rejection(self, command: DeviceCommand) -> bool:
+        """Use the captured settings echo only for the beta setpoint contract."""
+        return isinstance(command, SetThermostatSetpoints)
 
     def _installed_iaq_status_requests(
         self,

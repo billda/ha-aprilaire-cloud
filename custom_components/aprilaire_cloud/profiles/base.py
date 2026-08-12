@@ -137,6 +137,7 @@ class CommandCapability:
     unavailable_reason: str | None = None
     minimum: float | None = None
     maximum: float | None = None
+    step: float | None = None
     unit: str | None = None
     allowed_values: tuple[str, ...] = ()
 
@@ -244,4 +245,8 @@ class DeviceProfile(Protocol):
         command: DeviceCommand,
     ) -> bool:
         """Return whether confirmed normalized state matches a command."""
+        ...
+
+    def mismatch_is_rejection(self, command: DeviceCommand) -> bool:
+        """Return whether a newer complete mismatch decisively rejects a command."""
         ...

@@ -16,7 +16,7 @@ from homeassistant.components.climate.const import (
 from homeassistant.components.humidifier import HumidifierAction
 from homeassistant.const import ATTR_TEMPERATURE
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.util.unit_system import US_CUSTOMARY_SYSTEM
+from homeassistant.util.unit_system import METRIC_SYSTEM, US_CUSTOMARY_SYSTEM
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.aprilaire_cloud.binary_sensor import (
@@ -425,6 +425,77 @@ async def test_thermostat_climate_properties_map_to_home_assistant_values(
     assert sz2.preset_mode == "temporary"
 
 
+async def test_climate_advertises_exact_fahrenheit_setpoint_contract(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+) -> None:
+    """The exact writable contract exposes native-C bounds and whole-F step."""
+    coordinator = await _bootstrap_thermostat_coordinator(hass, monkeypatch)
+    device_id = coordinator.data.supported_device_ids[0]
+    device = coordinator.data.devices[device_id]
+    settings = build_thermostat_settings()
+    settings["thermostatPZ1"] = {
+        "mode": "heat",
+        "heat": 20,
+        "cool": 24,
+        "fan": "auto",
+        "holdType": "permanent",
+    }
+    settings.pop("thermostatSZ2")
+    settings.pop("thermostatSZ3")
+    coordinator._devices[device_id] = replace(device, device_settings=settings)
+    coordinator.async_set_updated_data(coordinator._build_snapshot())
+    hass.config.units = US_CUSTOMARY_SYSTEM
+    entity = AprilaireThermostatClimateEntity(
+        coordinator,
+        device_id,
+        "thermostat_pz1",
+    )
+    entity.hass = hass
+
+    assert entity.unique_id == f"{device_id}_thermostat_pz1"
+    assert ClimateEntityFeature.TARGET_TEMPERATURE in entity.supported_features
+    assert ClimateEntityFeature.TARGET_TEMPERATURE_RANGE in entity.supported_features
+    assert entity.min_temp == pytest.approx((40 - 32) * 5 / 9)
+    assert entity.max_temp == pytest.approx((93 - 32) * 5 / 9)
+    assert entity.target_temperature_step == 1
+
+
+async def test_setpoints_stay_read_only_when_home_assistant_uses_celsius(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+) -> None:
+    """The beta whole-F grid is not advertised through HA's unconverted C step."""
+    coordinator = await _bootstrap_thermostat_coordinator(hass, monkeypatch)
+    device_id = coordinator.data.supported_device_ids[0]
+    device = coordinator.data.devices[device_id]
+    settings = build_thermostat_settings()
+    settings["thermostatPZ1"] = {
+        "mode": "heat",
+        "heat": 20,
+        "cool": 24,
+        "fan": "auto",
+        "holdType": "permanent",
+    }
+    settings.pop("thermostatSZ2")
+    settings.pop("thermostatSZ3")
+    coordinator._devices[device_id] = replace(device, device_settings=settings)
+    coordinator.async_set_updated_data(coordinator._build_snapshot())
+    hass.config.units = METRIC_SYSTEM
+    entity = AprilaireThermostatClimateEntity(
+        coordinator,
+        device_id,
+        "thermostat_pz1",
+    )
+    entity.hass = hass
+
+    assert ClimateEntityFeature.TARGET_TEMPERATURE not in entity.supported_features
+    assert ClimateEntityFeature.TARGET_TEMPERATURE_RANGE not in entity.supported_features
+    assert entity.target_temperature_step is None
+
+
 async def test_thermostat_action_uses_separate_status_fields_in_priority_order(
     hass,
     enable_custom_integrations,
@@ -569,16 +640,27 @@ async def test_thermostat_climate_writes_exact_patch_payloads(
     entity = AprilaireThermostatClimateEntity(coordinator, device_id, "thermostat_pz1")
     coordinator.async_execute_command = AsyncMock()  # type: ignore[method-assign]
 
+    heat_native = (69 - 32) * 5 / 9
+    cool_native = (73 - 32) * 5 / 9
+    low_native = (66 - 32) * 5 / 9
+    high_native = (74 - 32) * 5 / 9
+
     await entity.async_set_hvac_mode(HVACMode.COOL)
-    await entity.async_set_temperature(**{ATTR_TEMPERATURE: 69})
+    await entity.async_set_temperature(**{ATTR_TEMPERATURE: heat_native})
     await entity.async_set_temperature(
-        **{ATTR_HVAC_MODE: HVACMode.COOL, ATTR_TEMPERATURE: 73}
+        **{ATTR_HVAC_MODE: HVACMode.COOL, ATTR_TEMPERATURE: cool_native}
     )
     await entity.async_set_temperature(
         **{
             ATTR_HVAC_MODE: HVACMode.HEAT_COOL,
-            ATTR_TARGET_TEMP_LOW: 66,
-            ATTR_TARGET_TEMP_HIGH: 74,
+            ATTR_TARGET_TEMP_LOW: low_native,
+            ATTR_TARGET_TEMP_HIGH: high_native,
+        }
+    )
+    await entity.async_set_temperature(
+        **{
+            ATTR_TARGET_TEMP_LOW: low_native,
+            ATTR_TARGET_TEMP_HIGH: high_native,
         }
     )
     await entity.async_set_fan_mode("circulate")
@@ -586,9 +668,16 @@ async def test_thermostat_climate_writes_exact_patch_payloads(
 
     assert coordinator.async_execute_command.await_args_list == [
         call(device_id, SetThermostatMode(zone="PZ1", mode="cool")),
-        call(device_id, SetThermostatSetpoints(zone="PZ1", heat=69.0)),
-        call(device_id, SetThermostatSetpoints(zone="PZ1", cool=73.0)),
-        call(device_id, SetThermostatSetpoints(zone="PZ1", heat=66.0, cool=74.0)),
+        call(device_id, SetThermostatSetpoints(zone="PZ1", heat=heat_native)),
+        call(device_id, SetThermostatSetpoints(zone="PZ1", cool=cool_native)),
+        call(
+            device_id,
+            SetThermostatSetpoints(zone="PZ1", heat=low_native, cool=high_native),
+        ),
+        call(
+            device_id,
+            SetThermostatSetpoints(zone="PZ1", heat=low_native, cool=high_native),
+        ),
         call(device_id, SetThermostatFan(zone="PZ1", mode="circulate")),
         call(device_id, SetThermostatHold(zone="PZ1", hold="vacation")),
     ]

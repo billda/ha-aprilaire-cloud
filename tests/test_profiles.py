@@ -81,6 +81,26 @@ def _thermostat() -> DeviceRecord:
     )
 
 
+def _thermostat_setpoint_contract(
+    *,
+    model: str = "8920W",
+    display_unit: str = "F",
+) -> DeviceRecord:
+    """Return the exact captured single-zone setpoint contract."""
+    setup = build_thermostat_setup()
+    setup["thermostat"]["temperatureUnit"] = display_unit
+    return _record(
+        build_thermostat_hierarchy(),
+        THERMOSTAT_DEVICE_ID,
+        [
+            build_device_status(THERMOSTAT_DEVICE_ID, model=model),
+            setup,
+            _fixture("thermostat_8920w_settings.json"),
+            _fixture("thermostat_8920w_zone_status.json"),
+        ],
+    )
+
+
 def test_read_only_access_never_encodes_a_patch() -> None:
     """A shared/read hierarchy cannot acquire write access from payload shape."""
     record = _dehumidifier()
@@ -253,6 +273,10 @@ def test_thermostat_codecs_use_only_observed_zone_keys() -> None:
     ).payload == {"thermostatSZ2": {"FanId": 2}}
     assert profile.encode_command(
         record,
+        SetThermostatFan(zone="SZ2", mode="circulate"),
+    ).payload == {"thermostatSZ2": {"FanId": 3}}
+    assert profile.encode_command(
+        record,
         SetThermostatHold(zone="PZ1", hold="vacation"),
     ).payload == {"thermostatPZ1": {"holdType": "vacation"}}
     assert profile.encode_command(
@@ -271,8 +295,8 @@ def test_thermostat_codecs_use_only_observed_zone_keys() -> None:
         )
 
 
-def test_unproven_thermostat_temperature_contract_stays_read_only() -> None:
-    """Setpoint PATCHes remain disabled without explicit unit and constraints."""
+def test_unproven_thermostat_temperature_key_contract_stays_read_only() -> None:
+    """Setpoint PATCHes remain disabled without the exact captured heat/cool keys."""
     record = _thermostat()
     profile = get_profile(record.profile_key)
     assert profile is not None
@@ -281,13 +305,166 @@ def test_unproven_thermostat_temperature_contract_stays_read_only() -> None:
     ]
 
     assert capability.writable is False
-    assert capability.evidence is EvidenceLevel.UNKNOWN
+    assert capability.evidence is EvidenceLevel.CAPTURED
     assert capability.unavailable_reason == "temperature_patch_contract_unconfirmed"
     with pytest.raises(CommandNotSupportedError):
         profile.encode_command(
             record,
             SetThermostatSetpoints(zone="PZ1", heat=68),
         )
+
+
+def test_8920w_fahrenheit_setpoint_contract_encodes_safe_atomic_pairs() -> None:
+    """Native-C commands snap to whole F and preserve the authoritative companion."""
+    record = _thermostat_setpoint_contract()
+    profile = get_profile(record.profile_key)
+    assert profile is not None
+    capability = profile.capabilities(record).commands[
+        CommandType.THERMOSTAT_SETPOINTS
+    ]
+
+    assert capability.writable is True
+    assert capability.evidence is EvidenceLevel.CAPTURED
+    assert capability.minimum == pytest.approx(4.444444)
+    assert capability.maximum == pytest.approx(33.888889)
+    assert capability.step == pytest.approx(0.555556)
+    assert capability.unit == "C"
+
+    heat_only = profile.encode_command(
+        record,
+        SetThermostatSetpoints(zone="PZ1", heat=(69 - 32) * 5 / 9),
+    )
+    assert heat_only.payload == {"thermostatPZ1": {"heat": 20.56, "cool": 24}}
+    assert heat_only.command == SetThermostatSetpoints(
+        zone="PZ1",
+        heat=20.56,
+        cool=24,
+    )
+
+    cool_only = profile.encode_command(
+        record,
+        SetThermostatSetpoints(zone="PZ1", cool=(72 - 32) * 5 / 9),
+    )
+    assert cool_only.payload == {"thermostatPZ1": {"heat": 20, "cool": 22.22}}
+    assert profile.encode_command(
+        record,
+        SetThermostatSetpoints(
+            zone="PZ1",
+            heat=(69 - 32) * 5 / 9,
+            cool=(72 - 32) * 5 / 9,
+        ),
+    ).payload == {"thermostatPZ1": {"heat": 20.56, "cool": 22.22}}
+
+
+def test_8920w_setpoint_contract_validates_side_limits_and_deadband() -> None:
+    """Captured F limits and the 3 F deadband reject locally without moving targets."""
+    record = _thermostat_setpoint_contract()
+    profile = get_profile(record.profile_key)
+    assert profile is not None
+
+    assert profile.encode_command(
+        record,
+        SetThermostatSetpoints(
+            zone="PZ1",
+            heat=(40 - 32) * 5 / 9,
+            cool=(93 - 32) * 5 / 9,
+        ),
+    ).payload == {"thermostatPZ1": {"heat": 4.44, "cool": 33.89}}
+
+    invalid_commands = (
+        SetThermostatSetpoints(zone="PZ1", heat=(39 - 32) * 5 / 9),
+        SetThermostatSetpoints(zone="PZ1", heat=(91 - 32) * 5 / 9),
+        SetThermostatSetpoints(zone="PZ1", cool=(49 - 32) * 5 / 9),
+        SetThermostatSetpoints(zone="PZ1", cool=(94 - 32) * 5 / 9),
+        SetThermostatSetpoints(
+            zone="PZ1",
+            heat=(69 - 32) * 5 / 9,
+            cool=(71 - 32) * 5 / 9,
+        ),
+        SetThermostatSetpoints(zone="PZ1", heat=(74 - 32) * 5 / 9),
+    )
+    for command in invalid_commands:
+        with pytest.raises(CommandValidationError):
+            profile.encode_command(record, command)
+
+
+@pytest.mark.parametrize(
+    ("model", "display_unit"),
+    (
+        ("unconfirmed-model", "F"),
+        ("8920W", "C"),
+    ),
+)
+def test_setpoints_stay_disabled_outside_exact_fahrenheit_contract(
+    model: str,
+    display_unit: str,
+) -> None:
+    """Unknown models and Celsius-display devices do not acquire write support."""
+    record = _thermostat_setpoint_contract(model=model, display_unit=display_unit)
+    profile = get_profile(record.profile_key)
+    assert profile is not None
+
+    capability = profile.capabilities(record).commands[
+        CommandType.THERMOSTAT_SETPOINTS
+    ]
+    assert capability.writable is False
+    assert capability.unavailable_reason == "temperature_patch_contract_unconfirmed"
+
+
+def test_setpoints_stay_disabled_for_uncaptured_multi_zone_writes() -> None:
+    """Single-zone live evidence cannot silently authorize a multi-zone layout."""
+    record = _thermostat_setpoint_contract()
+    settings = dict(record.device_settings)
+    settings["thermostatSZ2"] = {
+        "mode": "auto",
+        "heat": 19,
+        "cool": 23,
+        "fan": "auto",
+        "holdType": "permanent",
+    }
+    record = replace(record, device_settings=settings)
+    profile = get_profile(record.profile_key)
+    assert profile is not None
+
+    capability = profile.capabilities(record).commands[
+        CommandType.THERMOSTAT_SETPOINTS
+    ]
+    assert capability.writable is False
+    with pytest.raises(CommandNotSupportedError):
+        profile.encode_command(
+            record,
+            SetThermostatSetpoints(zone="PZ1", heat=(69 - 32) * 5 / 9),
+        )
+
+
+def test_setpoint_confirmation_requires_the_complete_wire_pair_with_tolerance() -> None:
+    """Both authoritative values must match the encoded pair within wire precision."""
+    record = _thermostat_setpoint_contract()
+    profile = get_profile(record.profile_key)
+    assert profile is not None
+    command = SetThermostatSetpoints(zone="PZ1", heat=20.56, cool=22.22)
+
+    confirmed = apply_device_message(
+        record,
+        {
+            "_type": "DeviceSettings",
+            "deviceId": THERMOSTAT_DEVICE_ID,
+            "asOf": "2026-03-24T00:10:00.000Z",
+            "thermostatPZ1": {"heat": 20.55, "cool": 22.23},
+        },
+    )
+    rejected = apply_device_message(
+        record,
+        {
+            "_type": "DeviceSettings",
+            "deviceId": THERMOSTAT_DEVICE_ID,
+            "asOf": "2026-03-24T00:10:00.000Z",
+            "thermostatPZ1": {"heat": 20.54, "cool": 22.22},
+        },
+    )
+
+    assert profile.command_confirmed(confirmed, command)
+    assert not profile.command_confirmed(rejected, command)
 
 
 def test_8920w_fixture_normalizes_native_units_staged_cooling_and_read_sensors() -> None:
@@ -324,15 +501,18 @@ def test_8920w_fixture_normalizes_native_units_staged_cooling_and_read_sensors()
     }.issubset(profile.capabilities(record).entities.dynamic_sensor_keys)
 
 
-def test_8920w_gs_uses_observed_circulation_token_for_string_fan_contract() -> None:
-    """The confirmed GS string contract maps HA circulate to vendor circ."""
+@pytest.mark.parametrize("model", ("8920W", "8920W_GS"))
+def test_8920w_family_uses_observed_circulation_token_for_string_fan_contract(
+    model: str,
+) -> None:
+    """Both confirmed 8920W identifiers map HA circulate to vendor circ."""
     settings = _fixture("thermostat_8920w_settings.json")
     settings["thermostatPZ1"]["fan"] = "circ"
     record = _record(
         build_thermostat_hierarchy(),
         THERMOSTAT_DEVICE_ID,
         [
-            build_device_status(THERMOSTAT_DEVICE_ID, model="8920W_GS"),
+            build_device_status(THERMOSTAT_DEVICE_ID, model=model),
             settings,
             _fixture("thermostat_8920w_zone_status.json"),
         ],

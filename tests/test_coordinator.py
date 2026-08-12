@@ -21,6 +21,7 @@ from custom_components.aprilaire_cloud.profiles import (
     CommandValidationError,
     SetDehumidifierTarget,
     SetHighHumidityAlert,
+    SetThermostatSetpoints,
 )
 from custom_components.aprilaire_cloud.vendor import (
     ApiErrorContext,
@@ -28,6 +29,7 @@ from custom_components.aprilaire_cloud.vendor import (
     AprilaireCloudAuthenticationTransientError,
     AprilaireCloudCommunicationError,
     AprilaireCloudInvalidCredentialsError,
+    AprilaireCloudWriteError,
     AuthOperation,
 )
 
@@ -42,6 +44,7 @@ from .common import (
     FakeClient,
     FakeWebSocket,
     MultiLocationFakeWebSocket,
+    ThermostatFakeWebSocket,
     UnavailableWebSocket,
     bootstrap_coordinator,
     build_dehumidifier_status,
@@ -253,6 +256,55 @@ async def _async_set_target_humidity(
     )
 
 
+def _device_settings_at(humidity: int, minute: int) -> dict:
+    """Return settings with an explicit vendor ordering timestamp."""
+    settings = build_device_settings(humidity=humidity)
+    settings["asOf"] = f"2026-03-24T00:{minute:02d}:00.000Z"
+    return settings
+
+
+def _thermostat_settings_at(
+    heat: float,
+    cool: float,
+    minute: int,
+    *,
+    fan: str = "auto",
+) -> dict:
+    """Return the exact captured single-zone setpoint shape at one timestamp."""
+    settings = build_thermostat_settings()
+    settings["asOf"] = f"2026-03-24T00:{minute:02d}:00.000Z"
+    settings["thermostatPZ1"] = {
+        "mode": "heat",
+        "heat": heat,
+        "cool": cool,
+        "fan": fan,
+        "holdType": "permanent",
+    }
+    settings.pop("thermostatSZ2")
+    settings.pop("thermostatSZ3")
+    return settings
+
+
+async def _bootstrap_setpoint_coordinator(hass, monkeypatch, config_entry):
+    """Return a coordinator with the evidence-gated single-zone 8920W contract."""
+    client = FakeClient()
+    client._hierarchy = build_thermostat_hierarchy()
+    client.device_settings = build_thermostat_settings()
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket",
+        ThermostatFakeWebSocket,
+    )
+    coordinator = AprilaireCloudDataUpdateCoordinator(
+        hass, config_entry=config_entry, client=client
+    )
+    await bootstrap_coordinator(coordinator)
+    settings = _thermostat_settings_at(20, 24, 5)
+    coordinator._apply_full_device_settings(THERMOSTAT_DEVICE_ID, settings)
+    coordinator._publish_snapshot()
+    client.set_remote_settings(settings)
+    return coordinator, client
+
+
 async def test_command_validation_precedes_optimistic_state(
     hass,
     enable_custom_integrations,
@@ -448,7 +500,7 @@ async def test_single_humidity_write_is_optimistic_and_requires_device_settings_
     await asyncio.sleep(0)
     assert not task.done()
 
-    await coordinator.async_process_messages(LOCATION_ID, [build_device_settings(humidity=55)])
+    await coordinator.async_process_messages(LOCATION_ID, [_device_settings_at(55, 10)])
     await asyncio.wait_for(task, timeout=1)
 
     assert coordinator.data.devices[DEVICE_ID].pending_device_settings == {}
@@ -456,6 +508,248 @@ async def test_single_humidity_write_is_optimistic_and_requires_device_settings_
         coordinator.data.devices[DEVICE_ID].device_settings["dehumidifier"]["humiditySetpoint"]
         == 55
     )
+
+
+async def test_dehumidifier_mismatch_remains_inconclusive_without_negative_ack_evidence(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """An E100W mismatch cannot be promoted into an invented rejection signal."""
+    client = FakeClient()
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket",
+        FakeWebSocket,
+    )
+    coordinator = AprilaireCloudDataUpdateCoordinator(
+        hass, config_entry=config_entry, client=client
+    )
+    await bootstrap_coordinator(coordinator)
+
+    task = asyncio.create_task(_async_set_target_humidity(coordinator, 55))
+    await wait_until(lambda: len(client.patched_payloads) == 1)
+
+    await coordinator.async_process_messages(
+        LOCATION_ID,
+        [_device_settings_at(52, 10)],
+    )
+    await asyncio.sleep(0)
+    assert not task.done()
+
+    await coordinator.async_process_messages(
+        LOCATION_ID,
+        [_device_settings_at(55, 11)],
+    )
+    await asyncio.wait_for(task, timeout=1)
+    assert coordinator.data.devices[DEVICE_ID].pending_device_settings == {}
+    assert coordinator.data.devices[DEVICE_ID].effective_device_settings[
+        "dehumidifier"
+    ]["humiditySetpoint"] == 55
+    assert coordinator._write_reconciliation_tasks == set()
+
+
+async def test_setpoint_mismatch_can_report_inferred_semantic_rejection(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """A clean newer echo of the unchanged atomic pair is an inferred rejection."""
+    coordinator, client = await _bootstrap_setpoint_coordinator(
+        hass, monkeypatch, config_entry
+    )
+    command = SetThermostatSetpoints(
+        zone="PZ1",
+        heat=(69 - 32) * 5 / 9,
+    )
+
+    task = asyncio.create_task(
+        coordinator.async_execute_command(THERMOSTAT_DEVICE_ID, command)
+    )
+    await wait_until(lambda: len(client.patched_payloads) == 1)
+    await coordinator.async_process_messages(
+        LOCATION_ID,
+        [_thermostat_settings_at(20, 24, 10)],
+    )
+
+    with pytest.raises(AprilaireCloudWriteError, match="did not apply"):
+        await asyncio.wait_for(task, timeout=1)
+    assert coordinator.data.devices[THERMOSTAT_DEVICE_ID].pending_device_settings == {}
+    assert coordinator._write_reconciliation_tasks == set()
+
+
+async def test_unrelated_newer_settings_change_does_not_false_reject_setpoint(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """A concurrent non-setpoint change makes a mismatching echo inconclusive."""
+    coordinator, client = await _bootstrap_setpoint_coordinator(
+        hass, monkeypatch, config_entry
+    )
+    command = SetThermostatSetpoints(
+        zone="PZ1",
+        heat=(69 - 32) * 5 / 9,
+    )
+
+    task = asyncio.create_task(
+        coordinator.async_execute_command(THERMOSTAT_DEVICE_ID, command)
+    )
+    await wait_until(lambda: len(client.patched_payloads) == 1)
+    await coordinator.async_process_messages(
+        LOCATION_ID,
+        [
+            {
+                "_type": "DeviceSettings",
+                "deviceId": THERMOSTAT_DEVICE_ID,
+                "asOf": "2026-03-24T00:10:00.000Z",
+                "thermostatPZ1": {"fan": "on"},
+            }
+        ],
+    )
+    await coordinator.async_process_messages(
+        LOCATION_ID,
+        [
+            {
+                "_type": "DeviceSettings",
+                "deviceId": THERMOSTAT_DEVICE_ID,
+                "asOf": "2026-03-24T00:11:00.000Z",
+                "thermostatPZ1": {"heat": 20, "cool": 24},
+            }
+        ],
+    )
+    await asyncio.sleep(0)
+    assert not task.done()
+
+    await coordinator.async_process_messages(
+        LOCATION_ID,
+        [_thermostat_settings_at(20.56, 24, 12, fan="on")],
+    )
+    await asyncio.wait_for(task, timeout=1)
+    assert coordinator.data.devices[THERMOSTAT_DEVICE_ID].pending_device_settings == {}
+
+
+async def test_tolerant_setpoint_confirmation_clears_exact_optimistic_overlay(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """A wire-rounding match confirms and removes the exact pending value."""
+    coordinator, client = await _bootstrap_setpoint_coordinator(
+        hass, monkeypatch, config_entry
+    )
+    task = asyncio.create_task(
+        coordinator.async_execute_command(
+            THERMOSTAT_DEVICE_ID,
+            SetThermostatSetpoints(
+                zone="PZ1",
+                heat=(69 - 32) * 5 / 9,
+            ),
+        )
+    )
+    await wait_until(lambda: len(client.patched_payloads) == 1)
+
+    await coordinator.async_process_messages(
+        LOCATION_ID,
+        [_thermostat_settings_at(20.55, 24, 10)],
+    )
+    await asyncio.wait_for(task, timeout=1)
+
+    record = coordinator.data.devices[THERMOSTAT_DEVICE_ID]
+    assert record.pending_device_settings == {}
+    assert record.effective_device_settings["thermostatPZ1"]["heat"] == 20.55
+
+
+async def test_stale_partial_and_unrelated_settings_do_not_reject_write(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """Only a complete and causally newer settings observation is decisive."""
+    client = FakeClient()
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket",
+        FakeWebSocket,
+    )
+    coordinator = AprilaireCloudDataUpdateCoordinator(
+        hass, config_entry=config_entry, client=client
+    )
+    await bootstrap_coordinator(coordinator)
+
+    task = asyncio.create_task(_async_set_target_humidity(coordinator, 55))
+    await wait_until(lambda: len(client.patched_payloads) == 1)
+
+    await coordinator.async_process_messages(
+        LOCATION_ID,
+        [
+            {
+                "_type": "DeviceSettings",
+                "deviceId": DEVICE_ID,
+                "asOf": "2026-03-24T00:10:00.000Z",
+                "dehumidifier": {"mode": "on"},
+            },
+            _device_settings_at(52, 0),
+        ],
+    )
+    await asyncio.sleep(0)
+    assert not task.done()
+
+    await coordinator.async_process_messages(
+        LOCATION_ID,
+        [_device_settings_at(55, 11)],
+    )
+    await asyncio.wait_for(task, timeout=1)
+    assert coordinator.data.devices[DEVICE_ID].pending_device_settings == {}
+
+
+async def test_timestamped_observation_is_inconclusive_without_timestamped_baseline(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """A timestamped echo cannot prove causality against an unknown baseline time."""
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.POST_WRITE_CONFIRM_TIMEOUT",
+        0.05,
+    )
+    coordinator, client = await _bootstrap_setpoint_coordinator(
+        hass, monkeypatch, config_entry
+    )
+    record = coordinator._devices[THERMOSTAT_DEVICE_ID]
+    versions = dict(record.versions)
+    versions["device_settings"] = replace(
+        versions["device_settings"],
+        as_of=None,
+    )
+    coordinator._devices[THERMOSTAT_DEVICE_ID] = replace(record, versions=versions)
+    coordinator.async_set_updated_data(coordinator._build_snapshot())
+
+    task = asyncio.create_task(
+        coordinator.async_execute_command(
+            THERMOSTAT_DEVICE_ID,
+            SetThermostatSetpoints(
+                zone="PZ1",
+                heat=(69 - 32) * 5 / 9,
+            ),
+        )
+    )
+    await wait_until(lambda: len(client.patched_payloads) == 1)
+
+    await coordinator.async_process_messages(
+        LOCATION_ID,
+        [_thermostat_settings_at(20, 24, 10)],
+    )
+    await asyncio.sleep(0)
+    assert not task.done()
+
+    client.set_remote_settings(_thermostat_settings_at(20.56, 24, 11))
+    await asyncio.wait_for(task, timeout=1)
+    assert coordinator.data.devices[THERMOSTAT_DEVICE_ID].pending_device_settings == {}
 
 
 async def test_successful_write_clears_internal_write_state(
@@ -481,7 +775,7 @@ async def test_successful_write_clears_internal_write_state(
 
     client.patch_release.set()
     await hass.async_block_till_done()
-    await coordinator.async_process_messages(LOCATION_ID, [build_device_settings(humidity=55)])
+    await coordinator.async_process_messages(LOCATION_ID, [_device_settings_at(55, 10)])
     await asyncio.wait_for(task, timeout=1)
     await asyncio.sleep(0)
 
@@ -494,7 +788,7 @@ async def test_rapid_humidity_writes_are_last_write_wins(
     monkeypatch,
     config_entry,
 ) -> None:
-    """A stale confirmation must not overwrite a newer optimistic value."""
+    """Queued commands serialize and the final requested value wins."""
     client = FakeClient()
     monkeypatch.setattr(
         "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket", FakeWebSocket
@@ -515,28 +809,27 @@ async def test_rapid_humidity_writes_are_last_write_wins(
         coordinator.data.devices[DEVICE_ID].effective_device_settings["dehumidifier"][
             "humiditySetpoint"
         ]
-        == 50
+        == 45
     )
 
-    await coordinator.async_process_messages(LOCATION_ID, [build_device_settings(humidity=45)])
+    await coordinator.async_process_messages(LOCATION_ID, [_device_settings_at(45, 10)])
     await asyncio.wait_for(first, timeout=1)
 
     assert (
         coordinator.data.devices[DEVICE_ID].device_settings["dehumidifier"]["humiditySetpoint"]
         == 45
     )
+    await wait_until(lambda: len(client.patched_payloads) == 2)
     assert (
         coordinator.data.devices[DEVICE_ID].effective_device_settings["dehumidifier"][
             "humiditySetpoint"
         ]
         == 50
     )
-
-    await wait_until(lambda: len(client.patched_payloads) == 2)
     assert client.patched_payloads[0]["dehumidifier"]["humiditySetpoint"] == 45
     assert client.patched_payloads[1]["dehumidifier"]["humiditySetpoint"] == 50
 
-    await coordinator.async_process_messages(LOCATION_ID, [build_device_settings(humidity=50)])
+    await coordinator.async_process_messages(LOCATION_ID, [_device_settings_at(50, 11)])
     await asyncio.wait_for(second, timeout=1)
 
     assert coordinator.data.devices[DEVICE_ID].pending_device_settings == {}
@@ -548,13 +841,185 @@ async def test_rapid_humidity_writes_are_last_write_wins(
     )
 
 
+async def test_queued_setpoint_reencodes_against_first_write_confirmation(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """A queued partial pair must preserve the newly authoritative companion."""
+    coordinator, client = await _bootstrap_setpoint_coordinator(
+        hass, monkeypatch, config_entry
+    )
+    first = asyncio.create_task(
+        coordinator.async_execute_command(
+            THERMOSTAT_DEVICE_ID,
+            SetThermostatSetpoints(
+                zone="PZ1",
+                heat=(69 - 32) * 5 / 9,
+            ),
+        )
+    )
+    await wait_until(lambda: len(client.patched_payloads) == 1)
+    second = asyncio.create_task(
+        coordinator.async_execute_command(
+            THERMOSTAT_DEVICE_ID,
+            SetThermostatSetpoints(
+                zone="PZ1",
+                cool=(75 - 32) * 5 / 9,
+            ),
+        )
+    )
+    await asyncio.sleep(0)
+    assert len(client.patched_payloads) == 1
+
+    await coordinator.async_process_messages(
+        LOCATION_ID,
+        [_thermostat_settings_at(20.56, 24, 10)],
+    )
+    await asyncio.wait_for(first, timeout=1)
+    await wait_until(lambda: len(client.patched_payloads) == 2)
+
+    assert client.patched_payloads == [
+        {"thermostatPZ1": {"heat": 20.56, "cool": 24}},
+        {"thermostatPZ1": {"heat": 20.56, "cool": 23.89}},
+    ]
+    await coordinator.async_process_messages(
+        LOCATION_ID,
+        [_thermostat_settings_at(20.56, 23.89, 11)],
+    )
+    await asyncio.wait_for(second, timeout=1)
+    assert THERMOSTAT_DEVICE_ID not in coordinator._write_states
+
+
+async def test_setpoint_after_accepted_unconfirmed_write_preserves_pending_companion(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """A later command carries forward an accepted pending companion intent."""
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.POST_WRITE_CONFIRM_TIMEOUT",
+        0.01,
+    )
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator."
+        "POST_WRITE_RECONCILIATION_DELAY_SECONDS",
+        0,
+    )
+    coordinator, client = await _bootstrap_setpoint_coordinator(
+        hass, monkeypatch, config_entry
+    )
+    coordinator._schedule_write_reconciliation = lambda *_: None  # type: ignore[method-assign]
+
+    await coordinator.async_execute_command(
+        THERMOSTAT_DEVICE_ID,
+        SetThermostatSetpoints(
+            zone="PZ1",
+            heat=(69 - 32) * 5 / 9,
+        ),
+    )
+    record = coordinator.data.devices[THERMOSTAT_DEVICE_ID]
+    assert record.pending_device_settings == {"thermostatPZ1": {"heat": 20.56}}
+
+    second = asyncio.create_task(
+        coordinator.async_execute_command(
+            THERMOSTAT_DEVICE_ID,
+            SetThermostatSetpoints(
+                zone="PZ1",
+                cool=(75 - 32) * 5 / 9,
+            ),
+        )
+    )
+    await wait_until(lambda: len(client.patched_payloads) == 2)
+    assert client.patched_payloads[1] == {
+        "thermostatPZ1": {"heat": 20.56, "cool": 23.89}
+    }
+
+    await coordinator.async_process_messages(
+        LOCATION_ID,
+        [_thermostat_settings_at(20.56, 23.89, 11)],
+    )
+    await asyncio.wait_for(second, timeout=1)
+    assert coordinator.data.devices[THERMOSTAT_DEVICE_ID].pending_device_settings == {}
+
+
+async def test_cancelling_queued_write_does_not_clear_active_writer_state(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """Cancellation before lock ownership cannot disturb the active write."""
+    client = FakeClient()
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket",
+        FakeWebSocket,
+    )
+    coordinator = AprilaireCloudDataUpdateCoordinator(
+        hass, config_entry=config_entry, client=client
+    )
+    await bootstrap_coordinator(coordinator)
+
+    active = asyncio.create_task(_async_set_target_humidity(coordinator, 55))
+    await wait_until(lambda: len(client.patched_payloads) == 1)
+    queued = asyncio.create_task(_async_set_target_humidity(coordinator, 60))
+    await asyncio.sleep(0)
+    queued.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await queued
+
+    write_state = coordinator._write_states[DEVICE_ID]
+    assert write_state.inflight_event is not None
+    assert write_state.inflight_expected == {
+        "dehumidifier": {"humiditySetpoint": 55}
+    }
+    await coordinator.async_process_messages(
+        LOCATION_ID,
+        [_device_settings_at(55, 10)],
+    )
+    await asyncio.wait_for(active, timeout=1)
+    assert DEVICE_ID not in coordinator._write_states
+
+
+async def test_cancelling_active_write_clears_its_optimistic_overlay(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """Cancellation during PATCH unwinds only the owned pending write state."""
+    client = FakeClient()
+    client.patch_release = asyncio.Event()
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.AprilaireLocationWebSocket",
+        FakeWebSocket,
+    )
+    coordinator = AprilaireCloudDataUpdateCoordinator(
+        hass, config_entry=config_entry, client=client
+    )
+    await bootstrap_coordinator(coordinator)
+
+    task = asyncio.create_task(_async_set_target_humidity(coordinator, 55))
+    await asyncio.wait_for(client.patch_started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    record = coordinator.data.devices[DEVICE_ID]
+    assert record.pending_device_settings == {}
+    assert record.effective_device_settings["dehumidifier"]["humiditySetpoint"] == 52
+    assert DEVICE_ID not in coordinator._write_states
+
+
 async def test_failed_older_write_reverts_only_its_own_paths(
     hass,
     enable_custom_integrations,
     monkeypatch,
     config_entry,
 ) -> None:
-    """A failed older write should not clear a newer unrelated optimistic change."""
+    """A failed write must release its serialized successor without stale state."""
     client = FakeClient()
     client.patch_release = asyncio.Event()
     client.patch_side_effects = [AprilaireCloudCommunicationError("write failed"), None]
@@ -583,14 +1048,23 @@ async def test_failed_older_write_reverts_only_its_own_paths(
         coordinator.data.devices[DEVICE_ID].effective_device_settings["dehumidifier"][
             "alertLimits"
         ]["highHum"]
-        == 70
+        == 65
     )
 
     client.patch_release.set()
     with pytest.raises(AprilaireCloudCommunicationError):
         await first
 
+    await wait_until(lambda: len(client.patched_payloads) == 2)
+    assert (
+        coordinator.data.devices[DEVICE_ID].effective_device_settings["dehumidifier"][
+            "alertLimits"
+        ]["highHum"]
+        == 70
+    )
+
     settings = build_device_settings(humidity=52)
+    settings["asOf"] = "2026-03-24T00:10:00.000Z"
     settings["dehumidifier"]["alertLimits"]["highHum"] = 70
     await coordinator.async_process_messages(LOCATION_ID, [settings])
     await asyncio.wait_for(second, timeout=1)
@@ -863,6 +1337,37 @@ async def test_timeout_rest_refresh_matching_value_succeeds(
     )
 
 
+async def test_timeout_rest_refresh_newer_mismatch_rejects_write(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    config_entry,
+) -> None:
+    """A clean newer setpoint REST echo may report an inferred rejection."""
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.coordinator.POST_WRITE_CONFIRM_TIMEOUT",
+        0.01,
+    )
+    coordinator, client = await _bootstrap_setpoint_coordinator(
+        hass, monkeypatch, config_entry
+    )
+    client.set_remote_settings(_thermostat_settings_at(20, 24, 10))
+    settings_requests_before_write = len(client.requested_settings_ids)
+
+    with pytest.raises(AprilaireCloudWriteError, match="did not apply"):
+        await coordinator.async_execute_command(
+            THERMOSTAT_DEVICE_ID,
+            SetThermostatSetpoints(
+                zone="PZ1",
+                heat=(69 - 32) * 5 / 9,
+            ),
+        )
+
+    assert len(client.requested_settings_ids) == settings_requests_before_write + 1
+    assert coordinator.data.devices[THERMOSTAT_DEVICE_ID].pending_device_settings == {}
+    assert coordinator._write_reconciliation_tasks == set()
+
+
 async def test_accepted_write_reconciles_in_background_without_false_service_error(
     hass,
     enable_custom_integrations,
@@ -934,7 +1439,7 @@ async def test_deferred_reconciliation_observes_late_success(
     )
     await bootstrap_coordinator(coordinator)
     stale = build_device_settings(humidity=52)
-    stale["asOf"] = "2026-03-24T00:10:00.000Z"
+    stale["asOf"] = "2026-03-24T00:00:01.000Z"
     confirmed = build_device_settings(humidity=55)
     confirmed["asOf"] = "2026-03-24T00:11:00.000Z"
     client.async_get_device_settings = AsyncMock(
@@ -1010,7 +1515,7 @@ async def test_delayed_rest_observation_confirms_on_second_bounded_check(
     )
     await bootstrap_coordinator(coordinator)
     stale = build_device_settings(humidity=52)
-    stale["asOf"] = "2026-03-24T00:10:00.000Z"
+    stale["asOf"] = "2026-03-24T00:00:01.000Z"
     confirmed = build_device_settings(humidity=55)
     confirmed["asOf"] = "2026-03-24T00:11:00.000Z"
     client.async_get_device_settings = AsyncMock(
@@ -1055,6 +1560,7 @@ async def test_alert_limit_write_uses_nested_settings_confirmation(
     assert not task.done()
 
     settings = build_device_settings(humidity=52)
+    settings["asOf"] = "2026-03-24T00:10:00.000Z"
     settings["dehumidifier"]["alertLimits"]["highHum"] = 70
     await coordinator.async_process_messages(LOCATION_ID, [settings])
     await asyncio.wait_for(task, timeout=1)

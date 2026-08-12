@@ -28,6 +28,7 @@ from .entity import (
 )
 from .profiles import (
     AprilaireCommandError,
+    CommandCapability,
     CommandType,
     DeviceCommand,
     NormalizedThermostatState,
@@ -124,8 +125,6 @@ def _coerce_hvac_mode(value: HVACMode | str | None) -> HVACMode | None:
 class AprilaireThermostatClimateEntity(AprilaireCloudEntity, ClimateEntity):
     """Representation of a supported AprilAire thermostat zone."""
 
-    _attr_target_temperature_step = 1
-
     def __init__(
         self,
         coordinator: AprilaireCloudDataUpdateCoordinator,
@@ -175,8 +174,7 @@ class AprilaireThermostatClimateEntity(AprilaireCloudEntity, ClimateEntity):
             return ClimateEntityFeature(0)
         commands = profile.capabilities(device).commands
         features = ClimateEntityFeature(0)
-        setpoints = commands.get(CommandType.THERMOSTAT_SETPOINTS)
-        if setpoints is not None and setpoints.writable:
+        if self._setpoints_writable_in_ha():
             features |= (
                 ClimateEntityFeature.TARGET_TEMPERATURE
                 | ClimateEntityFeature.TARGET_TEMPERATURE_RANGE
@@ -188,6 +186,53 @@ class AprilaireThermostatClimateEntity(AprilaireCloudEntity, ClimateEntity):
         if hold is not None and hold.writable:
             features |= ClimateEntityFeature.PRESET_MODE
         return features
+
+    def _setpoint_capability(self) -> CommandCapability | None:
+        """Return this device's evidence-gated setpoint constraints."""
+        device = self.device
+        profile = self.profile
+        if device is None or profile is None:
+            return None
+        return profile.capabilities(device).commands.get(CommandType.THERMOSTAT_SETPOINTS)
+
+    def _setpoints_writable_in_ha(self) -> bool:
+        """Return whether this beta contract is safe in HA's configured unit system."""
+        capability = self._setpoint_capability()
+        return (
+            capability is not None
+            and capability.writable
+            and self.coordinator.hass.config.units.temperature_unit
+            == UnitOfTemperature.FAHRENHEIT
+        )
+
+    @property
+    def min_temp(self) -> float:
+        """Return the lower bound of the writable thermostat envelope."""
+        capability = self._setpoint_capability()
+        if (
+            self._setpoints_writable_in_ha()
+            and capability is not None
+            and capability.minimum is not None
+        ):
+            return capability.minimum
+        return super().min_temp
+
+    @property
+    def max_temp(self) -> float:
+        """Return the upper bound of the writable thermostat envelope."""
+        capability = self._setpoint_capability()
+        if (
+            self._setpoints_writable_in_ha()
+            and capability is not None
+            and capability.maximum is not None
+        ):
+            return capability.maximum
+        return super().max_temp
+
+    @property
+    def target_temperature_step(self) -> float | None:
+        """Return the captured grid in HA's configured Fahrenheit unit."""
+        return 1 if self._setpoints_writable_in_ha() else None
 
     def _allowed_values(self, command_type: CommandType) -> tuple[str, ...]:
         """Return profile-confirmed enum values for this device."""
@@ -306,28 +351,28 @@ class AprilaireThermostatClimateEntity(AprilaireCloudEntity, ClimateEntity):
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
         """Set thermostat setpoints."""
-        target_mode = _coerce_hvac_mode(kwargs.get(ATTR_HVAC_MODE)) or self.hvac_mode
         temperature = kwargs.get(ATTR_TEMPERATURE)
         low = kwargs.get(ATTR_TARGET_TEMP_LOW)
         high = kwargs.get(ATTR_TARGET_TEMP_HIGH)
 
         heat: float | None = None
         cool: float | None = None
-        if target_mode == HVACMode.HEAT:
-            value = temperature if temperature is not None else low
-            if value is not None:
-                heat = float(value)
-        elif target_mode == HVACMode.COOL:
-            value = temperature if temperature is not None else high
-            if value is not None:
-                cool = float(value)
-        elif target_mode == HVACMode.HEAT_COOL:
-            heat_value = low if low is not None else temperature
-            cool_value = high if high is not None else temperature
-            if heat_value is not None:
-                heat = float(heat_value)
-            if cool_value is not None:
-                cool = float(cool_value)
+        if low is not None or high is not None:
+            if low is not None:
+                heat = float(low)
+            if high is not None:
+                cool = float(high)
+        else:
+            target_mode = _coerce_hvac_mode(kwargs.get(ATTR_HVAC_MODE)) or self.hvac_mode
+            if target_mode == HVACMode.HEAT:
+                if temperature is not None:
+                    heat = float(temperature)
+            elif target_mode == HVACMode.COOL:
+                if temperature is not None:
+                    cool = float(temperature)
+            elif target_mode == HVACMode.HEAT_COOL and temperature is not None:
+                heat = float(temperature)
+                cool = float(temperature)
 
         if heat is None and cool is None:
             raise HomeAssistantError("No supported thermostat setpoint was provided")

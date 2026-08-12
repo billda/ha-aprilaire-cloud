@@ -6,6 +6,7 @@ import asyncio
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any
 
 from .models import (
@@ -32,6 +33,15 @@ STATUS_MESSAGE_KEYS = {
     "DehumidifierStatus": "dehumidifier",
 }
 THERMOSTAT_STATUS_MESSAGE_TYPE = "ThermostatStatus"
+_SETTINGS_ENVELOPE_KEYS = frozenset({"_type", "deviceId", "asOf"})
+
+
+class WriteOutcome(StrEnum):
+    """Authoritative outcome observed for an in-flight settings write."""
+
+    UNKNOWN = "unknown"
+    CONFIRMED = "confirmed"
+    REJECTED = "rejected"
 
 
 @dataclass(slots=True)
@@ -43,6 +53,11 @@ class DeviceWriteState:
     inflight_paths: tuple[str, ...] = ()
     inflight_expected: dict[str, Any] = field(default_factory=dict)
     inflight_command: DeviceCommand | None = None
+    inflight_baseline_version: StateVersion | None = None
+    inflight_baseline_settings: dict[str, Any] = field(default_factory=dict)
+    inflight_owner: object | None = None
+    inflight_outcome: WriteOutcome = WriteOutcome.UNKNOWN
+    active_writers: int = 0
     last_confirmed_settings: dict[str, Any] = field(default_factory=dict)
     inflight_event: asyncio.Event | None = None
 
@@ -138,6 +153,29 @@ def settings_match_payload(settings: dict[str, Any], payload: dict[str, Any]) ->
     """Return whether all leaf values from a payload match a settings payload."""
     return all(
         get_nested_value(settings, path) == value for path, value in iter_leaf_paths(payload)
+    )
+
+
+def settings_cover_payload(settings: dict[str, Any], payload: dict[str, Any]) -> bool:
+    """Return whether an observation includes every requested settings leaf."""
+    return all(
+        get_nested_value(settings, path) is not _MISSING
+        for path, _ in iter_leaf_paths(payload)
+    )
+
+
+def settings_changed_outside_payload(
+    baseline: dict[str, Any],
+    observation: dict[str, Any],
+    payload: dict[str, Any],
+) -> bool:
+    """Return whether an observation also changes a non-requested setting leaf."""
+    requested_paths = {path for path, _ in iter_leaf_paths(payload)}
+    return any(
+        path not in requested_paths
+        and path[0] not in _SETTINGS_ENVELOPE_KEYS
+        and get_nested_value(baseline, path) != value
+        for path, value in iter_leaf_paths(observation)
     )
 
 
