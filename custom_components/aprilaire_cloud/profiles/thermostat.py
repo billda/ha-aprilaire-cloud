@@ -380,7 +380,7 @@ def _has_confirmed_setpoint_contract(
     if (
         len(zones) != 1
         or _thermostat_model(record) not in _CONFIRMED_8920W_MODELS
-        or _display_temperature_unit(record)
+        or _display_temperature_unit(record, zones)
         != _CONFIRMED_8920W_DISPLAY_TEMPERATURE_UNIT
     ):
         return False
@@ -428,9 +428,32 @@ def _native_temperature_unit(
     return explicit_temperature_unit(settings, status)
 
 
-def _display_temperature_unit(record: DeviceRecord) -> str | None:
-    """Return only the thermostat's explicit display preference."""
-    return explicit_temperature_unit(record.device_setup)
+def _zone_display_scale(record: DeviceRecord, zone: str) -> str | None:
+    """Return an explicit C/F ``scale`` from authoritative zone settings."""
+    scale = _authoritative_zone_settings(record, zone).get("scale")
+    if not isinstance(scale, str):
+        return None
+    unit = scale.strip().upper()
+    return unit if unit in {"C", "F"} else None
+
+
+def _display_temperature_unit(
+    record: DeviceRecord,
+    zones: tuple[str, ...] = (),
+) -> str | None:
+    """Return only the thermostat's explicit display preference.
+
+    Device setup wins when it reports a unit. Some 8920W_GS devices omit it
+    there and instead report ``scale`` ("F"/"C") in ``thermostatPZn``
+    settings; accept that only when every zone agrees.
+    """
+    unit = explicit_temperature_unit(record.device_setup)
+    if unit is not None or not zones:
+        return unit
+    scales = {_zone_display_scale(record, zone) for zone in zones}
+    if len(scales) == 1:
+        return scales.pop()
+    return None
 
 
 def _fahrenheit_to_celsius(value: float) -> float:
