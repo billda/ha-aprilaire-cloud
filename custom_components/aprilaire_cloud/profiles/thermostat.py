@@ -79,8 +79,12 @@ _CONFIRMED_8920W_STEP_C = 5 / 9
 _TEMPERATURE_WIRE_DECIMALS = 2
 _TEMPERATURE_CONFIRM_ABS_TOLERANCE_C = 0.011
 _TEMPERATURE_WIRE_RANGE_TOLERANCE_F = 0.02
-_ACTIVE_HEATING_STATUSES = frozenset({"active", "heating", "on", "stage1"})
-_ACTIVE_COOLING_STATUSES = frozenset({"active", "cooling", "on", "stage1"})
+_ACTIVE_HEATING_STATUSES = frozenset(
+    {"active", "heating", "heat", "aux-heat", "emergency-heat", "on", "stage1", "stage2", "stage3", "stage4"}
+)
+_ACTIVE_COOLING_STATUSES = frozenset(
+    {"active", "cooling", "cool", "on", "stage1", "stage2", "stage3", "stage4"}
+)
 _INACTIVE_OPERATING_STATUSES = frozenset({"idle", "inactive", "off"})
 _OPERATING_STATE_BY_EQUIPMENT_STATUS = {
     "off": "off",
