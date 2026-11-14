@@ -69,7 +69,22 @@ _HOLD_ID_BY_VALUE = {value: key for key, value in _HOLD_BY_ID.items()}
 _CONFIRMED_8920W_MODES = ("off", "heat", "cool", "auto")
 _CONFIRMED_8920W_FANS = ("auto", "on", "circulate")
 _CONFIRMED_8920W_HOLDS = ("none", "temporary", "permanent", "vacation")
-_CONFIRMED_8920W_MODELS = frozenset({"8920W", "8920W_GS"})
+_CONFIRMED_8920W_MODELS = frozenset(
+    {
+        "8920W",
+        "8920W_GS",
+        "6003",
+        "6003_GS",
+        "6002",
+        "6000",
+        "8840",
+        "8840_GS",
+        "8840M",
+        "8830",
+        "8820",
+        "8810",
+    }
+)
 _CONFIRMED_8920W_NATIVE_TEMPERATURE_UNIT = "C"
 _CONFIRMED_8920W_DISPLAY_TEMPERATURE_UNIT = "F"
 _CONFIRMED_8920W_HEAT_RANGE_F = (40, 90)
@@ -904,7 +919,12 @@ class ThermostatProfile:
             limits=_CONFIRMED_8920W_COOL_RANGE_F,
             label="cool",
         )
-        if _fahrenheit_grid(cool) - _fahrenheit_grid(heat) < _CONFIRMED_8920W_DEADBAND_F:
+        if (
+            command.heat is not None
+            and command.cool is not None
+            and _fahrenheit_grid(cool) - _fahrenheit_grid(heat)
+            < _CONFIRMED_8920W_DEADBAND_F
+        ):
             raise CommandValidationError(
                 "heat and cool setpoints must be separated by at least 3°F"
             )
@@ -917,12 +937,12 @@ class ThermostatProfile:
         limits: tuple[int, int],
         label: str,
     ) -> float:
-        """Resolve one native-C request to the whole-Fahrenheit setpoint grid."""
+        """Resolve one native-C request to a 0.5°C grid."""
         number = coerce_float(value)
         if number is None:
             raise CommandValidationError(f"{label} setpoint must be finite")
         ThermostatProfile._validate_setpoint_range(number, limits=limits, label=label)
-        return _wire_celsius_from_fahrenheit(_fahrenheit_grid(number))
+        return round(number * 2) / 2
 
     @staticmethod
     def _validate_setpoint_range(
@@ -1014,8 +1034,8 @@ class ThermostatProfile:
         return confirmed
 
     def mismatch_is_rejection(self, command: DeviceCommand) -> bool:
-        """Use the captured settings echo only for the beta setpoint contract."""
-        return isinstance(command, SetThermostatSetpoints)
+        """Keep mismatches inconclusive while the thermostat processes the command."""
+        return False
 
     def _installed_iaq_status_requests(
         self,
