@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock
 
+import pytest
 from homeassistant import config_entries
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -29,6 +30,14 @@ from .common import (
     build_thermostat_settings,
     build_user,
 )
+
+
+@pytest.fixture(autouse=True)
+def isolate_runtime_setup(monkeypatch):
+    """Flow creation must not start real Cognito/WebSocket runtime work."""
+    monkeypatch.setattr(
+        "custom_components.aprilaire_cloud.async_setup_entry", AsyncMock(return_value=True)
+    )
 
 
 def _mock_supported_device_discovery(monkeypatch, *, messages=None) -> None:

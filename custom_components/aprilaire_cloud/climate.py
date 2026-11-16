@@ -201,8 +201,14 @@ class AprilaireThermostatClimateEntity(AprilaireCloudEntity, ClimateEntity):
         return (
             capability is not None
             and capability.writable
-            and self.coordinator.hass.config.units.temperature_unit
-            == UnitOfTemperature.FAHRENHEIT
+            and (
+                (
+                    self.device is not None
+                    and self.device.device_status.get("model") in {"6003", "6003_GS"}
+                )
+                or self.coordinator.hass.config.units.temperature_unit
+                == UnitOfTemperature.FAHRENHEIT
+            )
         )
 
     @property
@@ -232,7 +238,13 @@ class AprilaireThermostatClimateEntity(AprilaireCloudEntity, ClimateEntity):
     @property
     def target_temperature_step(self) -> float | None:
         """Return the captured grid in HA's configured Fahrenheit unit."""
-        return 1 if self._setpoints_writable_in_ha() else None
+        if not self._setpoints_writable_in_ha():
+            return None
+        return (
+            0.5
+            if self.coordinator.hass.config.units.temperature_unit == UnitOfTemperature.CELSIUS
+            else 1
+        )
 
     def _allowed_values(self, command_type: CommandType) -> tuple[str, ...]:
         """Return profile-confirmed enum values for this device."""
@@ -376,9 +388,7 @@ class AprilaireThermostatClimateEntity(AprilaireCloudEntity, ClimateEntity):
 
         if heat is None and cool is None:
             raise HomeAssistantError("No supported thermostat setpoint was provided")
-        await self._async_execute(
-            SetThermostatSetpoints(zone=self._zone_key, heat=heat, cool=cool)
-        )
+        await self._async_execute(SetThermostatSetpoints(zone=self._zone_key, heat=heat, cool=cool))
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
         """Set the thermostat fan mode."""
@@ -389,9 +399,7 @@ class AprilaireThermostatClimateEntity(AprilaireCloudEntity, ClimateEntity):
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         """Set the thermostat hold mode."""
         if preset_mode not in PRESET_MODES:
-            raise HomeAssistantError(
-                f"Unsupported AprilAire thermostat preset mode: {preset_mode}"
-            )
+            raise HomeAssistantError(f"Unsupported AprilAire thermostat preset mode: {preset_mode}")
         await self._async_execute(SetThermostatHold(zone=self._zone_key, hold=preset_mode))
 
     async def _async_execute(self, command: DeviceCommand) -> None:

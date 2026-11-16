@@ -142,9 +142,7 @@ class DehumidifierProfile:
         humidity_sensors = status.get("humSensors")
         temperature_sensors = status.get("tempSensors")
         humidity_sensors = humidity_sensors if isinstance(humidity_sensors, list) else []
-        temperature_sensors = (
-            temperature_sensors if isinstance(temperature_sensors, list) else []
-        )
+        temperature_sensors = temperature_sensors if isinstance(temperature_sensors, list) else []
 
         current_humidity = select_sensor_reading(humidity_sensors)
         current_temperature = select_sensor_reading(temperature_sensors)
@@ -174,9 +172,7 @@ class DehumidifierProfile:
             )
 
         alert_limits_value = settings.get("alertLimits")
-        alert_limits_value = (
-            alert_limits_value if isinstance(alert_limits_value, dict) else {}
-        )
+        alert_limits_value = alert_limits_value if isinstance(alert_limits_value, dict) else {}
         filter_service = status.get("filterService")
         filter_service = filter_service if isinstance(filter_service, dict) else {}
         return NormalizedDehumidifierState(
@@ -218,10 +214,7 @@ class DehumidifierProfile:
             and setup.get("scale") == DEHUMIDIFIER_SCALE
             and "drynessSetpoint" not in settings
         )
-        can_power = (
-            record.hierarchy.access == "manage"
-            and settings.get("mode") in {"on", "off"}
-        )
+        can_power = record.hierarchy.access == "manage" and settings.get("mode") in {"on", "off"}
         can_target = (
             record.hierarchy.access == "manage"
             and internal_percent
@@ -267,22 +260,14 @@ class DehumidifierProfile:
         )
         entities = ProfileEntitySet(
             humidifier_keys=("dehumidifier",) if can_power and can_target else (),
-            switch_keys=(
-                ("dehumidifier_power",)
-                if can_power and not can_target
-                else ()
-            ),
+            switch_keys=(("dehumidifier_power",) if can_power and not can_target else ()),
             sensor_keys=tuple(sensor_keys),
             dynamic_sensor_keys=tuple(
                 f"temperature_{probe.uid}"
                 for probe in self.normalize(record).extra_temperature_probes
             ),
             binary_sensor_keys=tuple(binary_keys),
-            number_keys=(
-                ("high_humidity",)
-                if can_alert
-                else ()
-            ),
+            number_keys=(("high_humidity",) if can_alert else ()),
         )
         commands = {
             CommandType.DEHUMIDIFIER_POWER: _capability(
@@ -342,9 +327,7 @@ class DehumidifierProfile:
             payload = {"dehumidifier": {"humiditySetpoint": command.humidity}}
         elif isinstance(command, SetHighHumidityAlert):
             self._validate_range(command.humidity, capability)
-            payload = {
-                "dehumidifier": {"alertLimits": {"highHum": command.humidity}}
-            }
+            payload = {"dehumidifier": {"alertLimits": {"highHum": command.humidity}}}
         else:
             raise CommandNotSupportedError("command belongs to another profile")
         return EncodedCommand(payload=payload, command=command)
@@ -364,7 +347,9 @@ class DehumidifierProfile:
             return state.high_humidity_alert_limit == command.humidity
         return False
 
-    def mismatch_is_rejection(self, command: DeviceCommand) -> bool:
+    def mismatch_is_rejection(
+        self, command: DeviceCommand, *, record: DeviceRecord | None = None
+    ) -> bool:
         """Keep mismatches inconclusive without dehumidifier negative-ack evidence."""
         return False
 
