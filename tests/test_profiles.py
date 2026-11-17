@@ -84,18 +84,25 @@ def _thermostat() -> DeviceRecord:
 def _thermostat_setpoint_contract(
     *,
     model: str = "8920W",
-    display_unit: str = "F",
+    display_unit: str | None = "F",
+    zone_scale: str | None = None,
 ) -> DeviceRecord:
     """Return the exact captured single-zone setpoint contract."""
     setup = build_thermostat_setup()
-    setup["thermostat"]["temperatureUnit"] = display_unit
+    if display_unit is None:
+        setup["thermostat"].pop("temperatureUnit", None)
+    else:
+        setup["thermostat"]["temperatureUnit"] = display_unit
+    settings = _fixture("thermostat_8920w_settings.json")
+    if zone_scale is not None:
+        settings["thermostatPZ1"]["scale"] = zone_scale
     return _record(
         build_thermostat_hierarchy(),
         THERMOSTAT_DEVICE_ID,
         [
             build_device_status(THERMOSTAT_DEVICE_ID, model=model),
             setup,
-            _fixture("thermostat_8920w_settings.json"),
+            settings,
             _fixture("thermostat_8920w_zone_status.json"),
         ],
     )
@@ -703,3 +710,38 @@ def test_ha_write_adapters_contain_no_vendor_patch_schema() -> None:
         "HoldType",
     ):
         assert vendor_key not in platform_source
+
+
+@pytest.mark.parametrize("zone_scale", ("F", " f "))
+def test_zone_settings_scale_confirms_fahrenheit_display(zone_scale: str) -> None:
+    """8920W_GS devices report display units as thermostatPZ1.scale."""
+    record = _thermostat_setpoint_contract(
+        model="8920W_GS", display_unit=None, zone_scale=zone_scale
+    )
+    profile = get_profile(record.profile_key)
+    assert profile is not None
+    capability = profile.capabilities(record).commands[
+        CommandType.THERMOSTAT_SETPOINTS
+    ]
+    assert capability.writable is True
+
+
+@pytest.mark.parametrize(
+    ("display_unit", "zone_scale"),
+    ((None, "C"), (None, "K"), (None, None), ("C", "F")),
+)
+def test_zone_scale_cannot_override_or_invent_fahrenheit(
+    display_unit: str | None,
+    zone_scale: str | None,
+) -> None:
+    """Celsius, unknown, or missing scale stays read-only; setup unit wins."""
+    record = _thermostat_setpoint_contract(
+        model="8920W_GS", display_unit=display_unit, zone_scale=zone_scale
+    )
+    profile = get_profile(record.profile_key)
+    assert profile is not None
+    capability = profile.capabilities(record).commands[
+        CommandType.THERMOSTAT_SETPOINTS
+    ]
+    assert capability.writable is False
+    assert capability.unavailable_reason == "temperature_patch_contract_unconfirmed"
