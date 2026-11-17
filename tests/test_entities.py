@@ -584,6 +584,73 @@ async def test_thermostat_action_uses_separate_status_fields_in_priority_order(
     assert entity.hvac_action is HVACAction.IDLE
 
 
+@pytest.mark.parametrize("raw_mode", ["auto", "cool"])
+async def test_staged_status_updates_keep_climate_and_equipment_sensor_in_sync(
+    hass,
+    enable_custom_integrations,
+    monkeypatch,
+    raw_mode,
+) -> None:
+    """Synthetic staged updates change activity without changing the requested mode."""
+    coordinator = await _bootstrap_thermostat_coordinator(hass, monkeypatch)
+    device_id = coordinator.data.supported_device_ids[0]
+    entity = AprilaireThermostatClimateEntity(coordinator, device_id, "thermostat_pz1")
+    equipment = AprilaireThermostatZoneSensor(
+        coordinator, device_id, "PZ1", "equipment_status", "thermostat_pz1_equipment_status"
+    )
+    await coordinator.async_process_messages(
+        LOCATION_ID,
+        [{
+            "_type": "DeviceSettings",
+            "deviceId": device_id,
+            "asOf": "2026-03-24T00:10:00.000Z",
+            "thermostatPZ1": {"mode": raw_mode},
+        }],
+    )
+    expected_mode = HVACMode.HEAT_COOL if raw_mode == "auto" else HVACMode.COOL
+    transitions = [
+        ("stage1", True, "cooling", HVACAction.COOLING),
+        ("stage2", True, "cooling", HVACAction.COOLING),
+        ("stage3", True, "cooling", HVACAction.COOLING),
+        ("stage4", True, "cooling", HVACAction.COOLING),
+        ("cool", True, "cooling", HVACAction.COOLING),
+        ("inactive", True, "fan", HVACAction.FAN),
+        ("inactive", False, "idle", HVACAction.IDLE),
+        ("vendor-unknown", False, None, None),
+        ("stage2", False, "cooling", HVACAction.COOLING),
+    ]
+    for minute, (cooling, fan_on, state, action) in enumerate(transitions, start=11):
+        await coordinator.async_process_messages(
+            LOCATION_ID,
+            [{
+                "_type": "ThermostatStatus",
+                "deviceId": device_id,
+                "zone": "PZ1",
+                "asOf": f"2026-03-24T00:{minute:02}:00.000Z",
+                "heatingStatus": "inactive",
+                "coolingStatus": cooling,
+                "isFanOn": fan_on,
+                "equipmentStatus": None,
+            }],
+        )
+        assert entity.hvac_mode is expected_mode
+        assert entity.hvac_action is action
+        assert equipment.native_value == state
+
+    await coordinator.async_process_messages(
+        LOCATION_ID,
+        [{
+            "_type": "DeviceSettings",
+            "deviceId": device_id,
+            "asOf": "2026-03-24T00:30:00.000Z",
+            "thermostatPZ1": {"mode": "off"},
+        }],
+    )
+    assert entity.hvac_mode is HVACMode.OFF
+    assert entity.hvac_action is HVACAction.OFF
+    assert equipment.native_value == "off"
+
+
 async def test_climate_adapter_rejects_invalid_services_and_handles_missing_zone(
     hass,
     enable_custom_integrations,

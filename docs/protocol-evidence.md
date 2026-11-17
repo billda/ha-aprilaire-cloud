@@ -4,7 +4,7 @@ This catalog records what the integration knows about the undocumented
 `aprilaire.io` protocol and why it enables or disables each behavior. It
 supersedes broad protocol claims in the March 2026 local research notes.
 
-Last reviewed: 2026-08-11.
+Last reviewed: 2026-11-16 (thermostat operating-status compatibility).
 
 ## Evidence levels
 
@@ -70,6 +70,30 @@ in the mobile app.
 
 These full/incremental rules are conservative compatibility rules. They are not
 a claim that the vendor has published a formal schema.
+
+### Additional thermostat operating-status values
+
+[PR 14](https://github.com/billda/ha-aprilaire-cloud/pull/14) extends the explicit
+active-status allowlists to recognize `stage2`, `stage3`, and `stage4` in both
+split status fields; `cool` in `coolingStatus`; and `heat`, `aux-heat`, and
+`emergency-heat` in `heatingStatus`. These additions are **inferred** read-only
+compatibility handling. The PR and its linked issue comment provide no raw
+capture or device/firmware confirmation for the added values. Their meanings
+are inferred from the documented `stage1` behavior and existing aggregate
+`equipmentStatus` aliases, not from a newly confirmed vendor contract.
+
+The regression cases in `tests/test_thermostat_status.py` and
+`tests/test_entities.py` use synthetic status values. They verify parsing,
+precedence, unknown-value handling, and agreement between the climate action
+and equipment-status sensor; they do not establish physical-device behavior.
+The existing `stage1` fixture and its provenance remain unchanged.
+
+Before these additions, unrecognized active values could produce fan-only
+activity, an aggregate equipment-status fallback, or unknown activity. The
+documented issue 8 `stage1` case was already addressed in v0.4.0b3. A sanitized
+status capture and before/after device check on a current integration version
+are still needed to confirm any remaining issue 8 failure involving these
+additional values. No command capabilities are enabled by this inference.
 
 ## Authentication evidence
 
