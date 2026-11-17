@@ -197,8 +197,7 @@ class AprilaireLocationWebSocket:
         self._stop_event.set()
         if self._ping_task is not None:
             self._ping_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._ping_task
+            await asyncio.gather(self._ping_task, return_exceptions=True)
             self._ping_task = None
         if self._runner_task is not None:
             self._runner_task.cancel()
@@ -227,9 +226,7 @@ class AprilaireLocationWebSocket:
             except asyncio.CancelledError:
                 raise
             except Exception as err:
-                LOGGER.warning(
-                    "AprilAire WebSocket disconnected (%s)", type(err).__name__
-                )
+                LOGGER.warning("AprilAire WebSocket disconnected (%s)", type(err).__name__)
                 await self._async_mark_disconnected(err)
                 if self._stop_event.is_set():
                     break
@@ -282,8 +279,7 @@ class AprilaireLocationWebSocket:
             finally:
                 if self._ping_task is not None:
                     self._ping_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await self._ping_task
+                    await asyncio.gather(self._ping_task, return_exceptions=True)
                     self._ping_task = None
                 self._transport_connected = False
                 if self._stop_event.is_set():
@@ -292,21 +288,27 @@ class AprilaireLocationWebSocket:
                     await self._publish_state()
 
     async def _async_ping_loop(self, ws) -> None:
+        """Reconnect if ping or token renewal fails while receiving is blocked."""
+        try:
+            await self._async_ping_messages(ws)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await ws.close()
+            raise
+
+    async def _async_ping_messages(self, ws) -> None:
         """Send AprilAire application-level ping frames."""
         await asyncio.sleep(WEBSOCKET_PING_INITIAL_DELAY_SECONDS)
         while not self._stop_event.is_set() and not ws.closed:
-            if await self._client.async_token_expires_within(
-                WEBSOCKET_PING_INTERVAL_SECONDS + 15
-            ):
+            if await self._client.async_token_expires_within(WEBSOCKET_PING_INTERVAL_SECONDS + 15):
                 token = await self._client.async_get_id_token(force_refresh=True)
                 await self._async_send_subscribe(ws, token)
 
             self._pong_event.clear()
             await ws.send_json({"action": "ping", "message": ""})
             try:
-                await asyncio.wait_for(
-                    self._pong_event.wait(), WEBSOCKET_PONG_TIMEOUT_SECONDS
-                )
+                await asyncio.wait_for(self._pong_event.wait(), WEBSOCKET_PONG_TIMEOUT_SECONDS)
             except TimeoutError:
                 LOGGER.warning("AprilAire WebSocket missed pong; reconnecting")
                 await ws.close()
@@ -332,9 +334,7 @@ class AprilaireLocationWebSocket:
                 await self._publish_state()
                 return
             if frame.kind is WebSocketFrameKind.PROTOCOL_ERROR:
-                raise AprilaireWebSocketProtocolError(
-                    frame.error_code or "protocol_error"
-                )
+                raise AprilaireWebSocketProtocolError(frame.error_code or "protocol_error")
             if frame.kind is WebSocketFrameKind.FORBIDDEN:
                 if self._resubscribed_after_forbidden:
                     raise AprilaireWebSocketProtocolError("repeated_forbidden")
