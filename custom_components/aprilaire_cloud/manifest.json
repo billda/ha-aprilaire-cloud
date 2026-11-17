@@ -1,13 +1,20 @@
 {
   "domain": "aprilaire_cloud",
   "name": "AprilAire Cloud",
-  "codeowners": ["@billda"],
+  "codeowners": [
+    "@billda"
+  ],
   "config_flow": true,
   "documentation": "https://github.com/billda/ha-aprilaire-cloud",
   "integration_type": "hub",
   "iot_class": "cloud_push",
   "issue_tracker": "https://github.com/billda/ha-aprilaire-cloud/issues",
-  "loggers": ["custom_components.aprilaire_cloud", "pycognito"],
-  "requirements": ["pycognito==2024.5.1"],
-  "version": "0.4.0b4"
+  "loggers": [
+    "custom_components.aprilaire_cloud",
+    "pycognito"
+  ],
+  "requirements": [
+    "pycognito==2024.5.1"
+  ],
+  "version": "0.4.0b5"
 }
