@@ -247,6 +247,8 @@ class DeviceProfile(Protocol):
         """Return whether confirmed normalized state matches a command."""
         ...
 
-    def mismatch_is_rejection(self, command: DeviceCommand) -> bool:
+    def mismatch_is_rejection(
+        self, command: DeviceCommand, *, record: DeviceRecord | None = None
+    ) -> bool:
         """Return whether a newer complete mismatch decisively rejects a command."""
         ...

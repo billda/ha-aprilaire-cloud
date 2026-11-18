@@ -390,7 +390,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         if profile.command_confirmed(record, write_state.inflight_command):
             write_state.inflight_outcome = WriteOutcome.CONFIRMED
         elif profile.mismatch_is_rejection(
-            write_state.inflight_command
+            write_state.inflight_command, record=record
         ) and not settings_changed_outside_payload(
             write_state.inflight_baseline_settings,
             record.device_settings,
@@ -411,11 +411,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         if record is None or not record.supported or record.health.offline:
             return False
         socket = self._socket_states.get(record.hierarchy.location_id)
-        if (
-            socket is not None
-            and socket.transport_connected
-            and socket.initial_sync_complete
-        ):
+        if socket is not None and socket.transport_connected and socket.initial_sync_complete:
             return True
         last_rest = record.health.last_rest_received_at
         return (
@@ -458,9 +454,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
                     raise AprilaireCloudWriteError("AprilAire device is unavailable")
                 profile = get_profile(record.profile_key)
                 if profile is None:
-                    raise AprilaireCloudWriteError(
-                        "AprilAire device profile is unavailable"
-                    )
+                    raise AprilaireCloudWriteError("AprilAire device profile is unavailable")
                 encoded = profile.encode_command(record, command)
                 payload = encoded.payload
                 payload_paths = format_leaf_paths(payload)
@@ -477,12 +471,8 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
                 write_state.inflight_expected = deepcopy(payload)
                 write_state.inflight_command = encoded.command
                 write_state.inflight_owner = owner
-                write_state.inflight_baseline_version = (
-                    record.versions.get("device_settings")
-                )
-                write_state.inflight_baseline_settings = deepcopy(
-                    record.device_settings
-                )
+                write_state.inflight_baseline_version = record.versions.get("device_settings")
+                write_state.inflight_baseline_settings = deepcopy(record.device_settings)
                 write_state.inflight_outcome = WriteOutcome.UNKNOWN
                 write_state.inflight_event = inflight_event
                 owns_inflight = True
@@ -540,13 +530,9 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
                         if not self._pending_payload_is_current(device_id, payload):
                             return
                         if attempt + 1 < POST_WRITE_RECONCILIATION_ATTEMPTS:
-                            await asyncio.sleep(
-                                POST_WRITE_RECONCILIATION_DELAY_SECONDS
-                            )
+                            await asyncio.sleep(POST_WRITE_RECONCILIATION_DELAY_SECONDS)
 
-                    LOGGER.debug(
-                        "Device write accepted but not yet observed; deferring checks"
-                    )
+                    LOGGER.debug("Device write accepted but not yet observed; deferring checks")
                     self._schedule_write_reconciliation(device_id, encoded)
                     return
         except asyncio.CancelledError:
@@ -580,9 +566,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         encoded: EncodedCommand,
     ) -> None:
         """Continue checking a 2xx-accepted write outside the HA service call."""
-        task = self.hass.async_create_task(
-            self._async_reconcile_accepted_write(device_id, encoded)
-        )
+        task = self.hass.async_create_task(self._async_reconcile_accepted_write(device_id, encoded))
         self._write_reconciliation_tasks.add(task)
         task.add_done_callback(self._write_reconciliation_tasks.discard)
 
@@ -899,8 +883,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         requests = [
             request
             for request in status_requests_for_record(record)
-            if self._optional_404_fingerprints.get((device_id, request.key))
-            != fingerprint
+            if self._optional_404_fingerprints.get((device_id, request.key)) != fingerprint
         ]
         optional_results = await asyncio.gather(
             *(
@@ -915,12 +898,15 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
                 for request in requests
             )
         )
-        progressed = self._apply_optional_rest_results(
-            device_id,
-            requests,
-            optional_results,
-            fingerprint,
-        ) or progressed
+        progressed = (
+            self._apply_optional_rest_results(
+                device_id,
+                requests,
+                optional_results,
+                fingerprint,
+            )
+            or progressed
+        )
         if progressed:
             self._mark_rest_progress(device_id)
         return device_id, progressed, critical_errors
@@ -1121,10 +1107,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
     @property
     def write_state_summaries(self) -> dict[str, dict]:
         """Return a diagnostics-friendly summary of write states."""
-        return {
-            device_id: state.summary
-            for device_id, state in self._write_states.items()
-        }
+        return {device_id: state.summary for device_id, state in self._write_states.items()}
 
     @property
     def unknown_device_message_counts(self) -> dict[str, int]:
@@ -1204,9 +1187,7 @@ class AprilaireCloudDataUpdateCoordinator(DataUpdateCoordinator[AprilaireSnapsho
         expired_device_ids = []
         for device_id, messages in self._unknown_device_messages.items():
             self._unknown_device_messages[device_id] = [
-                (timestamp, message)
-                for timestamp, message in messages
-                if timestamp >= cutoff
+                (timestamp, message) for timestamp, message in messages if timestamp >= cutoff
             ]
             if not self._unknown_device_messages[device_id]:
                 expired_device_ids.append(device_id)
