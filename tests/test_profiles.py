@@ -357,7 +357,7 @@ def test_8920w_fahrenheit_setpoint_contract_encodes_safe_atomic_pairs() -> None:
 
 
 def test_8920w_setpoint_contract_validates_side_limits_and_deadband() -> None:
-    """Captured F limits and the 3 F deadband reject locally without moving targets."""
+    """Captured F limits reject locally; both sides changed into the deadband is rejected."""
     record = _thermostat_setpoint_contract()
     profile = get_profile(record.profile_key)
     assert profile is not None
@@ -381,11 +381,31 @@ def test_8920w_setpoint_contract_validates_side_limits_and_deadband() -> None:
             heat=(69 - 32) * 5 / 9,
             cool=(71 - 32) * 5 / 9,
         ),
-        SetThermostatSetpoints(zone="PZ1", heat=(74 - 32) * 5 / 9),
     )
     for command in invalid_commands:
         with pytest.raises(CommandValidationError):
             profile.encode_command(record, command)
+
+
+def test_8920w_deadband_moves_the_unchanged_companion() -> None:
+    """One side changed into the 3 F deadband pushes the other, as the thermostat does.
+
+    Live 8920W capture in issue #8: a write leaving a 1 F gap was ignored by the
+    thermostat, while moving the companion (heat 69 F for cool 72 F) applied.
+    """
+    record = _thermostat_setpoint_contract()
+    profile = get_profile(record.profile_key)
+    assert profile is not None
+
+    # Fixture is heat 68 F / cool 75 F.
+    assert profile.encode_command(
+        record,
+        SetThermostatSetpoints(zone="PZ1", heat=(74 - 32) * 5 / 9),
+    ).payload == {"thermostatPZ1": {"heat": 23.33, "cool": 25.0}}
+    assert profile.encode_command(
+        record,
+        SetThermostatSetpoints(zone="PZ1", cool=(70 - 32) * 5 / 9),
+    ).payload == {"thermostatPZ1": {"heat": 19.44, "cool": 21.11}}
 
 
 @pytest.mark.parametrize(

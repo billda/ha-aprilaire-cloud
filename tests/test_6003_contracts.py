@@ -33,11 +33,52 @@ def test_unknown_model_cannot_gain_writes_from_numeric_json():
         )
 
 
-def test_partial_auto_update_checks_final_pair_deadband():
+def test_partial_auto_update_moves_companion_to_keep_deadband():
+    # Heat 21 -> 22 with cool at 22: cool moves to the nearest 0.5C grid value
+    # that keeps the 3F deadband (2.0C; 1.5C is only 2.7F).
+    result = ThermostatProfile().encode_command(
+        thermostat(mode="auto"), SetThermostatSetpoints("PZ1", heat=22)
+    )
+    assert result.payload == {"thermostatPZ1": {"heat": 22.0, "cool": 24.0}}
+
+
+def test_auto_cool_change_moves_heat_down():
+    result = ThermostatProfile().encode_command(
+        thermostat(mode="auto", heat=21, cool=24), SetThermostatSetpoints("PZ1", heat=21, cool=22)
+    )
+    assert result.payload == {"thermostatPZ1": {"heat": 20.0, "cool": 22.0}}
+
+
+def test_auto_both_sides_changed_into_deadband_is_rejected():
     with pytest.raises(CommandValidationError):
         ThermostatProfile().encode_command(
-            thermostat(mode="auto"), SetThermostatSetpoints("PZ1", heat=22)
+            thermostat(mode="auto", heat=20, cool=25),
+            SetThermostatSetpoints("PZ1", heat=22, cool=22.5),
         )
+
+
+def test_companion_cannot_be_pushed_past_its_limit():
+    # Heat 32C (89.6F) is valid, but cool would need 34C (93.2F), above 93F.
+    with pytest.raises(CommandValidationError, match="out of range"):
+        ThermostatProfile().encode_command(
+            thermostat(mode="auto", heat=30, cool=32.5), SetThermostatSetpoints("PZ1", heat=32)
+        )
+
+
+def test_8920w_boundaries_from_issue_8_capture():
+    # Live capture: heat 70F/cool 75F, stored as 21.11/23.88 (truncated).
+    record = replace(
+        thermostat("8920W", mode="auto", heat=21.11, cool=23.88),
+        device_setup={"type": "thermostat", "thermostat": {"temperatureUnit": "F"}},
+    )
+    # Heat 70 -> 73F: heat stays as requested, cool moves to 76F.
+    assert ThermostatProfile().encode_command(
+        record, SetThermostatSetpoints("PZ1", heat=22.78, cool=23.89)
+    ).payload == {"thermostatPZ1": {"heat": 22.78, "cool": 24.44}}
+    # Cool 75 -> 72F: heat moves to 69F (the pair the thermostat accepted).
+    assert ThermostatProfile().encode_command(
+        record, SetThermostatSetpoints("PZ1", heat=21.11, cool=22.22)
+    ).payload == {"thermostatPZ1": {"heat": 20.56, "cool": 22.22}}
 
 
 def test_single_heat_mode_preserves_crossed_inactive_setpoint():

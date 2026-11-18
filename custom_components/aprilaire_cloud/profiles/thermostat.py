@@ -78,6 +78,8 @@ _CONFIRMED_8920W_HEAT_RANGE_F = (40, 90)
 _CONFIRMED_8920W_COOL_RANGE_F = (50, 93)
 _CONFIRMED_8920W_DEADBAND_F = 3
 _CONFIRMED_8920W_STEP_C = 5 / 9
+# Smallest 0.5°C step that keeps the 3°F deadband (1.5°C is only 2.7°F).
+_HALF_DEGREE_DEADBAND_C = 2.0
 _TEMPERATURE_WIRE_DECIMALS = 2
 _TEMPERATURE_CONFIRM_ABS_TOLERANCE_C = 0.011
 _TEMPERATURE_WIRE_RANGE_TOLERANCE_F = 0.02
@@ -442,6 +444,23 @@ def _display_temperature_unit(record: DeviceRecord) -> str | None:
             return None
         scales.append(value)
     return scales[0] if scales and len(set(scales)) == 1 else None
+
+
+def _deadband_satisfied(heat: float, cool: float) -> bool:
+    """Return whether a native-C pair keeps the 3°F deadband."""
+    return (cool - heat) * 9 / 5 >= _CONFIRMED_8920W_DEADBAND_F - 0.02
+
+
+def _same_grid_value(requested: float, current: float, whole_fahrenheit: bool) -> bool:
+    """Compare a request with the current value on the model's setpoint grid.
+
+    The 8920W stores Celsius truncated to two decimals (75°F reads back as
+    23.88 although 23.89 was written), so values are compared on the
+    whole-Fahrenheit grid rather than as raw Celsius.
+    """
+    if whole_fahrenheit:
+        return _fahrenheit_grid(requested) == _fahrenheit_grid(current)
+    return round(requested * 2) == round(current * 2)
 
 
 def _fahrenheit_to_celsius(value: float) -> float:
@@ -907,14 +926,68 @@ class ThermostatProfile:
             limits=_CONFIRMED_8920W_COOL_RANGE_F,
             label="cool",
         )
+        whole_fahrenheit = _thermostat_model(record) in _CONFIRMED_8920W_MODELS
         if (
-            _thermostat_model(record) in _CONFIRMED_8920W_MODELS
+            whole_fahrenheit
             or _normalize_enum(first_present(settings, "mode", "ModeId"), _MODE_BY_ID) == "auto"
-        ) and (cool - heat) * 9 / 5 < _CONFIRMED_8920W_DEADBAND_F - 0.02:
+        ) and not _deadband_satisfied(heat, cool):
+            heat, cool = ThermostatProfile._keep_deadband(
+                heat,
+                cool,
+                heat_changed=not _same_grid_value(heat, current_heat, whole_fahrenheit),
+                cool_changed=not _same_grid_value(cool, current_cool, whole_fahrenheit),
+                whole_fahrenheit=whole_fahrenheit,
+            )
+        return {"heat": heat, "cool": cool}
+
+    @staticmethod
+    def _keep_deadband(
+        heat: float,
+        cool: float,
+        *,
+        heat_changed: bool,
+        cool_changed: bool,
+        whole_fahrenheit: bool,
+    ) -> tuple[float, float]:
+        """Move the unchanged setpoint away so the pair keeps the deadband.
+
+        This matches the thermostat's own behavior and the issue 8 capture:
+        raising heat into the deadband pushes cool up, and lowering cool
+        pushes heat down. A request that changes both sides into the
+        deadband, or that would push the other side past its range, is
+        rejected instead.
+        """
+        if heat_changed == cool_changed:
             raise CommandValidationError(
                 "heat and cool setpoints must be separated by at least 3°F"
             )
-        return {"heat": heat, "cool": cool}
+        if whole_fahrenheit:
+            if heat_changed:
+                cool = _wire_celsius_from_fahrenheit(
+                    _fahrenheit_grid(heat) + _CONFIRMED_8920W_DEADBAND_F
+                )
+            else:
+                heat = _wire_celsius_from_fahrenheit(
+                    _fahrenheit_grid(cool) - _CONFIRMED_8920W_DEADBAND_F
+                )
+        else:
+            gap = _HALF_DEGREE_DEADBAND_C
+            if heat_changed:
+                cool = heat + gap
+            else:
+                heat = cool - gap
+        try:
+            ThermostatProfile._validate_setpoint_range(
+                heat, limits=_CONFIRMED_8920W_HEAT_RANGE_F, label="heat"
+            )
+            ThermostatProfile._validate_setpoint_range(
+                cool, limits=_CONFIRMED_8920W_COOL_RANGE_F, label="cool"
+            )
+        except CommandValidationError as err:
+            raise CommandValidationError(
+                f"keeping the 3°F deadband would move the other setpoint out of range: {err}"
+            ) from err
+        return heat, cool
 
     @staticmethod
     def _requested_setpoint(
