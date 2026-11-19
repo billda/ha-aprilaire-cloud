@@ -334,3 +334,8 @@ If you have a model that is not yet confirmed, please open a compatibility repor
 This repository is installable today as a HACS custom repository.
 
 I do plan to submit it to the HACS default listings, but not immediately. The current goal is to get a first round of real-world testing and feedback first, especially from owners of AprilAire dehumidifier models other than the E100W.
+
+## Setup Notes
+
+- **Auto-created Home Assistant Areas**: Each discovered device uses its AprilAire room name as `suggested_area`. If that room name does not exactly match an existing Home Assistant area, Home Assistant will create a new area automatically. You can reassign or merge areas under `Settings > Areas, labels & zones`.
+- **Decommissioned or unused account devices**: Any device still registered under your AprilAire Cloud account will be discovered. If you have old or offline devices you no longer use, you can disable them in Home Assistant under `Settings > Devices & services > AprilAire Cloud > Devices`.
